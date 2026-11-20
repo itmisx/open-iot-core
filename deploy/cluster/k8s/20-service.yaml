@@ -1,0 +1,41 @@
+# 两个 Service，用途完全不同。
+
+---
+# 1) headless：给每个 Pod 一个稳定 DNS 名，复制组靠它互相拨号。
+#    clusterIP: None 是关键——有 ClusterIP 的话解析到的是负载均衡的
+#    虚拟地址，节点之间就没法点对点连接了。
+apiVersion: v1
+kind: Service
+metadata:
+  name: openiotd-peers
+  namespace: open-iot-core
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true # 选举期间 Pod 还没 ready，但必须能互相找到
+  selector:
+    app: openiotd
+  ports:
+    - name: repl
+      port: 7946
+
+---
+# 2) 客户端入口：设备与控制台走这里，由它在三个 Pod 间分发。
+#
+#    注意只有 leader 能接受元数据写入，但**不需要**在这里做 leader
+#    路由：跟随者会把写入转给 leader 并等它应用完再返回（CLU-071）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: openiotd
+  namespace: open-iot-core
+spec:
+  type: ClusterIP
+  selector:
+    app: openiotd
+  ports:
+    - name: mqtt-tls
+      port: 8883
+      targetPort: 8883
+    - name: admin
+      port: 9090
+      targetPort: 9090

@@ -1,0 +1,1747 @@
+<title>open-iot-core 架构契约与兼容性矩阵</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ground:#F6F7FA; --surface:#FFFFFF; --surface-2:#EFF2F7; --sunk:#E7EBF2;
+  --ink:#131926; --ink-2:#424E63; --ink-3:#6B7689; --rule:#D9E0EA; --rule-2:#C3CCDA;
+  --now:#2A54C8; --now-bg:#E7EDFC; --now-ink:#1C3C94;
+  --next:#0C7572; --next-bg:#E0F1F0; --next-ink:#08514F;
+  --over:#9A6400; --over-bg:#F8EEDA; --over-ink:#6E4800;
+  --never:#9B4258; --never-bg:#F8E7EB; --never-ink:#712C3E;
+  --hazard:#9B4258; --hazard-bg:#FBF0F2; --hazard-rule:#E7C3CD;
+  --accent:#2A54C8;
+  --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+  --body:"IBM Plex Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  --disp:"Archivo","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0C0F15; --surface:#13171F; --surface-2:#191E28; --sunk:#0A0D12;
+    --ink:#E4E9F1; --ink-2:#A9B4C4; --ink-3:#77839A; --rule:#242B38; --rule-2:#333C4D;
+    --now:#89A8FA; --now-bg:#17213B; --now-ink:#B2C6FD;
+    --next:#55C3BE; --next-bg:#0E2A29; --next-ink:#86D9D5;
+    --over:#E0A747; --over-bg:#2C2314; --over-ink:#EFC57E;
+    --never:#DF8FA2; --never-bg:#2D1A20; --never-ink:#EDB3C0;
+    --hazard:#DF8FA2; --hazard-bg:#1D1317; --hazard-rule:#44242D;
+    --accent:#89A8FA;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0C0F15; --surface:#13171F; --surface-2:#191E28; --sunk:#0A0D12;
+  --ink:#E4E9F1; --ink-2:#A9B4C4; --ink-3:#77839A; --rule:#242B38; --rule-2:#333C4D;
+  --now:#89A8FA; --now-bg:#17213B; --now-ink:#B2C6FD;
+  --next:#55C3BE; --next-bg:#0E2A29; --next-ink:#86D9D5;
+  --over:#E0A747; --over-bg:#2C2314; --over-ink:#EFC57E;
+  --never:#DF8FA2; --never-bg:#2D1A20; --never-ink:#EDB3C0;
+  --hazard:#DF8FA2; --hazard-bg:#1D1317; --hazard-rule:#44242D;
+  --accent:#89A8FA;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);
+  font-size:15px;line-height:1.65;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1140px;margin:0 auto;padding:0 28px 120px}
+
+/* ---------- masthead ---------- */
+.mast{padding:64px 0 36px;border-bottom:2px solid var(--ink)}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--ink-3);margin:0 0 18px}
+h1{font-family:var(--disp);font-weight:700;font-size:clamp(30px,4.6vw,50px);line-height:1.05;
+  letter-spacing:-.022em;margin:0 0 18px;text-wrap:balance}
+.thesis{font-size:18px;line-height:1.55;color:var(--ink-2);max-width:62ch;margin:0}
+.thesis strong{color:var(--ink);font-weight:600}
+.mast-meta{display:flex;flex-wrap:wrap;gap:10px 30px;margin-top:26px;
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+.mast-meta b{color:var(--ink-2);font-weight:500}
+
+/* ---------- generic section ---------- */
+.part{margin-top:76px}
+.part-head{display:flex;align-items:baseline;gap:16px;padding-bottom:12px;
+  border-bottom:1px solid var(--ink-2);margin-bottom:8px}
+.part-num{font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.1em;
+  color:var(--accent);flex:none}
+.part-head h2{font-family:var(--disp);font-weight:600;font-size:25px;letter-spacing:-.015em;
+  margin:0;flex:1}
+.part-sub{color:var(--ink-3);font-size:13.5px;margin:0 0 34px;max-width:70ch}
+
+.sec{margin-top:46px;scroll-margin-top:84px}
+.sec-head{display:flex;align-items:baseline;gap:13px;margin-bottom:6px}
+.sec-id{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-3);
+  border:1px solid var(--rule-2);border-radius:3px;padding:1px 6px;flex:none;letter-spacing:.06em}
+.sec-head h3{font-family:var(--disp);font-weight:600;font-size:18.5px;margin:0;letter-spacing:-.01em}
+.sec-note{color:var(--ink-3);font-size:13px;margin:0 0 16px;max-width:72ch}
+p{max-width:72ch}
+a{color:var(--accent)}
+
+/* ---------- tier chips ---------- */
+.chip{display:inline-block;font-family:var(--mono);font-size:10.5px;font-weight:600;
+  letter-spacing:.05em;padding:2px 7px;border-radius:3px;white-space:nowrap;line-height:1.5}
+.t-now{background:var(--now-bg);color:var(--now-ink);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--now) 32%,transparent)}
+.t-next{background:var(--next-bg);color:var(--next-ink);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--next) 32%,transparent)}
+.t-over{background:var(--over-bg);color:var(--over-ink);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--over) 32%,transparent)}
+.t-never{background:var(--never-bg);color:var(--never-ink);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--never) 32%,transparent)}
+
+/* ---------- legend / filter ---------- */
+.legend{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--ground) 92%,transparent);
+  backdrop-filter:blur(10px);border-bottom:1px solid var(--rule);
+  margin:0 -28px;padding:11px 28px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.legend-lab{font-family:var(--mono);font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--ink-3);margin-right:4px}
+.fbtn{font-family:var(--mono);font-size:11px;font-weight:600;padding:4px 10px;border-radius:4px;
+  border:1px solid var(--rule-2);background:var(--surface);color:var(--ink-2);cursor:pointer;
+  letter-spacing:.03em;transition:background .12s,color .12s,border-color .12s}
+.fbtn:hover{border-color:var(--ink-3)}
+.fbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.fbtn .n{opacity:.6;margin-left:5px;font-weight:400}
+.fbtn[aria-pressed="true"][data-f="now"]{background:var(--now-bg);color:var(--now-ink);border-color:var(--now)}
+.fbtn[aria-pressed="true"][data-f="next"]{background:var(--next-bg);color:var(--next-ink);border-color:var(--next)}
+.fbtn[aria-pressed="true"][data-f="over"]{background:var(--over-bg);color:var(--over-ink);border-color:var(--over)}
+.fbtn[aria-pressed="true"][data-f="never"]{background:var(--never-bg);color:var(--never-ink);border-color:var(--never)}
+.fbtn[aria-pressed="true"][data-f="all"]{background:var(--ink);color:var(--ground);border-color:var(--ink)}
+tr.dim{opacity:.17}
+
+/* ---------- tables ---------- */
+.tscroll{overflow-x:auto;border:1px solid var(--rule);border-radius:7px;background:var(--surface)}
+table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:720px}
+thead th{text-align:left;font-family:var(--mono);font-size:10.5px;font-weight:600;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--ink-3);
+  padding:9px 13px;border-bottom:1px solid var(--rule-2);background:var(--surface-2);
+  position:sticky;top:0;white-space:nowrap}
+tbody td{padding:9px 13px;border-bottom:1px solid var(--rule);vertical-align:top;line-height:1.5}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--surface-2)}
+td.cap{font-weight:500;color:var(--ink)}
+td.tier{white-space:nowrap}
+td.note{color:var(--ink-3);font-size:12.5px}
+td.aws{color:var(--ink-2);font-size:12.5px}
+.num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12.5px}
+code{font-family:var(--mono);font-size:.88em;background:var(--sunk);padding:1px 4px;
+  border-radius:3px;color:var(--ink);white-space:nowrap}
+td.note code,td.aws code{font-size:.9em}
+.no{color:var(--never);font-weight:600}
+.yes{color:var(--next);font-weight:600}
+
+/* ---------- code blocks ---------- */
+pre{margin:0;background:var(--sunk);border:1px solid var(--rule);border-radius:7px;
+  padding:15px 17px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.62;
+  color:var(--ink)}
+pre b{font-weight:600;color:var(--accent)}
+pre i{font-style:normal;color:var(--ink-3)}
+pre em{font-style:normal;color:var(--over)}
+
+/* ---------- contract cards ---------- */
+.ctr{border:1px solid var(--rule);border-radius:8px;background:var(--surface);
+  margin-top:20px;overflow:hidden}
+.ctr-top{display:flex;align-items:baseline;gap:12px;padding:13px 17px;
+  border-bottom:1px solid var(--rule);background:var(--surface-2);flex-wrap:wrap}
+.ctr-n{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent);flex:none}
+.ctr-top h4{font-family:var(--disp);font-size:16px;font-weight:600;margin:0;flex:1;min-width:200px}
+.ctr-body{padding:17px}
+.ctr-body > :first-child{margin-top:0}
+.ctr-body p{margin:0 0 13px;font-size:13.5px;color:var(--ink-2)}
+.impl{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1px;
+  background:var(--rule);border-top:1px solid var(--rule)}
+.impl div{background:var(--surface);padding:12px 17px}
+.impl dt{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-3);margin:0 0 5px}
+.impl dd{margin:0;font-size:13px;color:var(--ink-2)}
+.hz{border-left:3px solid var(--hazard);background:var(--hazard-bg);padding:11px 15px;
+  border-radius:0 5px 5px 0;margin:13px 0 0}
+.hz-lab{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--hazard);font-weight:600;display:block;margin-bottom:4px}
+.hz p{margin:0;font-size:13px;color:var(--ink-2);max-width:none}
+
+/* ---------- planes diagram ---------- */
+.planes{display:grid;gap:11px;margin:22px 0 8px}
+.plane{display:grid;grid-template-columns:auto 1fr;gap:0;border:1px solid var(--rule);
+  border-radius:8px;overflow:hidden;background:var(--surface)}
+.plane-k{padding:14px 15px;background:var(--surface-2);border-right:1px solid var(--rule);
+  display:flex;flex-direction:column;gap:3px;justify-content:center;min-width:152px}
+.plane-k b{font-family:var(--disp);font-size:14.5px;font-weight:600}
+.plane-k span{font-family:var(--mono);font-size:10px;letter-spacing:.08em;color:var(--ink-3);
+  text-transform:uppercase}
+.plane-v{padding:13px 16px;font-size:13.5px;color:var(--ink-2);display:flex;flex-direction:column;
+  gap:6px;justify-content:center}
+.plane-v em{font-style:normal;color:var(--ink);font-weight:500}
+
+/* ---------- misc blocks ---------- */
+.princ{display:grid;grid-template-columns:repeat(auto-fit,minmax(272px,1fr));gap:1px;
+  background:var(--rule);border:1px solid var(--rule);border-radius:8px;overflow:hidden;
+  margin-top:30px}
+.princ > div{background:var(--surface);padding:19px 20px}
+.princ h4{font-family:var(--disp);font-size:15px;font-weight:600;margin:0 0 7px;letter-spacing:-.005em}
+.princ p{margin:0;font-size:13px;color:var(--ink-2);max-width:none}
+.princ .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--ink-3);display:block;margin-bottom:9px}
+
+.toc{display:flex;flex-wrap:wrap;gap:7px;margin:26px 0 0}
+.toc a{font-family:var(--mono);font-size:11.5px;text-decoration:none;color:var(--ink-2);
+  border:1px solid var(--rule-2);border-radius:4px;padding:3px 9px;background:var(--surface)}
+.toc a:hover{border-color:var(--accent);color:var(--accent)}
+.toc a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+ul.tight{margin:0;padding-left:20px}
+ul.tight li{margin:0 0 6px;font-size:13.5px;color:var(--ink-2);max-width:72ch}
+ul.tight li b{color:var(--ink);font-weight:600}
+.safe{border:1px solid var(--rule);border-left:3px solid var(--next);border-radius:0 7px 7px 0;
+  background:var(--surface);padding:16px 19px;margin-top:20px}
+.safe h4{font-family:var(--disp);font-size:15px;margin:0 0 10px;font-weight:600}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+@media (max-width:620px){.wrap{padding:0 16px 80px}.legend{margin:0 -16px;padding:10px 16px}}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <p class="eyebrow">open-iot-core · 技术规格 · 修订 0</p>
+  <h1>架构契约与兼容性矩阵</h1>
+  <p class="thesis">一个 Go 实现的、与 AWS IoT Core 线路兼容的 MQTT broker 与设备管理平面。
+  本文定两件事：<strong>v0.1 就必须存在的集群接口契约</strong>（否则集群化等于重写），以及
+  <strong>兼容性边界</strong>（做什么、不做什么、哪里刻意不同）。</p>
+  <div class="mast-meta">
+    <span><b>协议基线</b> MQTT v3.1.1 / v5.0 (OASIS)</span>
+    <span><b>兼容基线</b> AWS IoT Core 文档核对于 2026-10-26</span>
+    <span><b>语言</b> Go</span>
+    <span><b>许可建议</b> Apache-2.0</span>
+  </div>
+  <nav class="toc">
+    <a href="#planes">四平面</a><a href="#contracts">Day-1 契约</a><a href="#raft">内嵌 Raft · 后端</a><a href="#defer">可延后</a>
+    <a href="#layout">包结构</a><a href="#mA">A 协议</a><a href="#mB">B 传输</a><a href="#mC">C 认证</a>
+    <a href="#mD">D 证书/CA</a><a href="#mE">E 注册</a><a href="#mF">F Shadow</a><a href="#mG">G Jobs</a>
+    <a href="#mH">H Rules</a><a href="#mI">I Registry</a><a href="#mJ">J API</a><a href="#mK">K 事件</a>
+    <a href="#mL">L 排除</a><a href="#mM">M 配额</a><a href="#console">控制台</a><a href="#gates">验收门槛</a>
+  </nav>
+</header>
+
+<div class="princ">
+  <div><span class="k">原则 01</span><h4>集群是接口，单机是实现</h4>
+    <p>所有跨节点关注点在 v0.1 就以接口形式落地，单机实现填充它。单机版不是"集群之前的版本"，
+    而是"节点数为 1 的集群"。两者共用同一条代码路径。</p></div>
+  <div><span class="k">原则 02</span><h4>连接路径不许有网络调用</h4>
+    <p>认证、鉴权、配额判定全部查本节点内存中的物化视图。元数据通过复制日志更新视图，
+    而不是让 CONNECT 去远端查库。这条决定了握手吞吐的上限。</p></div>
+  <div><span class="k">原则 03</span><h4>声明式取代回调</h4>
+    <p>策略、注册模板、规则都在进程内求值，不走 webhook / Lambda。
+    逃生口是 WASM 插件（进程内沙箱），而不是网络回调。</p></div>
+</div>
+
+<section class="part" id="planes">
+  <div class="part-head"><span class="part-num">PART I</span><h2>集群优先的架构契约</h2></div>
+  <p class="part-sub">broker 的集群化之所以几乎总是演变成重写，原因不在共识算法难，而在于单机实现会把
+  "本地"这个假设焊进会话结构、路由签名和认证路径。下面四个平面与十二条接口契约，
+  是为了让 v0.4 填的是实现而不是重构。</p>
+
+  <h3 style="font-family:var(--disp);font-size:17px;font-weight:600;margin:0 0 4px">四个平面，四种一致性</h3>
+  <p class="sec-note">把它们混成一个"集群模块"是第二个常见错误。四者的写入频率、一致性要求和失败后果完全不同，
+  必须分开选型。</p>
+
+  <div class="planes">
+    <div class="plane">
+      <div class="plane-k"><b>元数据平面</b><span>strong · 低写入</span></div>
+      <div class="plane-v">
+        <span><em>内容</em> Thing / Thing Group / 证书与状态 / 策略 / 注册模板 / Job 定义 / 规则</span>
+        <span><em>实现</em> 复制日志（Raft）+ <b>每节点全量内存物化视图</b>。读永不走网络。</span>
+        <span><em>失败后果</em> 写不可用（可接受）；读仍可用（视图略滞后）。</span>
+      </div>
+    </div>
+    <div class="plane">
+      <div class="plane-k"><b>会话与路由平面</b><span>fenced · 中写入</span></div>
+      <div class="plane-v">
+        <span><em>内容</em> clientId→节点归属、订阅兴趣、共享订阅组成员</span>
+        <span><em>实现</em> 归属用带 epoch 的租约；兴趣用 gossip 摘要（最终一致）。</span>
+        <span><em>失败后果</em> 短暂重复投递或漏投；<b>绝不允许同一 clientId 双活</b>。</span>
+      </div>
+    </div>
+    <div class="plane">
+      <div class="plane-k"><b>消息平面</b><span>none · 高吞吐</span></div>
+      <div class="plane-v">
+        <span><em>内容</em> 节点间 PUBLISH 转发</span>
+        <span><em>实现</em> 自有 mesh（长连接 + 批量 + 背压），不经共识。</span>
+        <span><em>失败后果</em> QoS 0 丢，QoS 1 由发送侧重试。</span>
+      </div>
+    </div>
+    <div class="plane">
+      <div class="plane-k"><b>持久队列平面</b><span>durable · 可插拔</span></div>
+      <div class="plane-v">
+        <span><em>内容</em> 离线 QoS 1 队列、retained、共享订阅积压</span>
+        <span><em>实现</em> 可插拔。默认 pinned-to-node（节点故障丢失，<b>明确声明</b>）；可选复制后端。</span>
+        <span><em>失败后果</em> 取决于后端。不要在 v1.0 承诺跨节点零丢失。</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="part" id="contracts">
+  <div class="part-head"><span class="part-num">PART I · 契约</span><h2>十二条 Day-1 接口契约</h2></div>
+  <p class="part-sub">每条都给出：接口形态、单机实现、集群实现、以及
+  <span style="color:var(--hazard);font-weight:600">延后到 v0.4 才做会付的重构代价</span>。
+  判据很简单——凡是会改变函数签名或数据结构形状的，必须现在做；凡是只换实现体的，可以延后。</p>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">01</span><h4>会话归属与抢占围栏</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>MQTT 要求同 clientId 后连接踢掉前连接。单机下这是一个 map 操作；集群下这是分布式互斥，
+      且必须防止网络分区造成双活。<code>Epoch</code> 是唯一的解法，而它必须贯穿整个会话层。</p>
+<pre><i>// Epoch 对每个 clientID 单调递增，跨节点全局有效。</i>
+<b>type</b> Epoch uint64
+
+<b>type</b> SessionOwnership <b>interface</b> {
+    <i>// Claim 抢占所有权并返回新 epoch。若当前由他节点持有，
+    // 实现必须保证旧持有者会收到 Eviction（无论是主动通知还是租约过期）。</i>
+    Claim(ctx context.Context, clientID string, node NodeID) (Epoch, error)
+    Release(ctx context.Context, clientID string, e Epoch) error
+    Lookup(ctx context.Context, clientID string) (NodeID, Epoch, bool)
+    Evictions() &lt;-chan Eviction
+}
+
+<i>// 所有改变会话状态的操作都必须带 epoch 并校验，包括本地操作。</i>
+<b>func</b> (s *SessionRuntime) Deliver(e Epoch, m *Message) <b>error</b> <i>// epoch 不匹配 → ErrStaleEpoch</i></pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>内存 map + 本地原子计数器。<code>Evictions()</code> 走进程内 channel。</dd></div>
+      <div><dt>集群实现</dt><dd>按 clientID 哈希分片的租约（Raft 组或分片 leader）。epoch = 分片内单调序号。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>会话层所有方法签名都要加 epoch 参数，调用点遍布协议状态机、投递路径、持久化。
+      实测这是会话模块的全量重写。<b>epoch 字段的成本现在是零，事后是整个模块。</b></p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">02</span><h4>路由返回本地与远端两份目标</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>这是最廉价也最关键的一条。单机 broker 几乎都写成 <code>Route(topic) []*Session</code>，
+      于是投递路径直接拿到了会话对象。集群化时必须在中间插入"序列化 + 转发"，
+      而整条路径已经假设了目标是本地指针。</p>
+<pre><i>// 从 v0.1 起就是两份返回值。单机下 remote 恒为 nil。</i>
+<b>type</b> Router <b>interface</b> {
+    Subscribe(sub Subscription) <b>error</b>
+    Unsubscribe(clientID, filter string) <b>error</b>
+    Route(topic string) (local []SubRef, remote []NodeID)
+    <i>// 共享订阅单独走，因为选一个订阅者的逻辑是全局的</i>
+    RouteShared(topic string) (groups []SharedGroupTarget)
+}
+
+<i>// 投递器从 v0.1 就有两条分支。</i>
+<b>func</b> (d *Dispatcher) Publish(m *Message) {
+    local, remote := d.router.Route(m.Topic)
+    d.deliverLocal(local, m)
+    <b>if</b> len(remote) &gt; 0 { d.transport.Forward(remote, m) } <em>// 单机永不进入</em>
+}</pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>本地订阅树；<code>remote</code> 恒 nil；<code>Transport</code> 为 loopback 空实现。</dd></div>
+      <div><dt>集群实现</dt><dd>本地树 + 远端兴趣集（契约 03）；<code>remote</code> 去重后批量转发。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>投递路径、retained 下发、LWT、共享订阅、Shadow/Jobs 回包全部要改。
+      而且这些路径上通常已经写了"拿到 session 就直接写它的 writeCh"，改动会牵出并发模型。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">03</span><h4>主题分类：设备域 vs 通配符域</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>IoT 场景的结构性简化，是本项目相对通用 broker 的最大性能杠杆：<b>设备只订阅自己的主题</b>
+      （<code>$aws/things/{自己}/shadow/...</code>），只有后端应用订阅通配符，而后端连接数是几十不是几百万。
+      因此设备域主题的路由可以纯靠哈希算出，<b>完全不需要进入全局订阅表</b>——只有通配符订阅需要全局复制。</p>
+<pre><b>type</b> TopicClass uint8
+<b>const</b> (
+    <i>// $aws/things/{thing}/... —— 归属节点可由 thingName 直接算出，
+    // 不占用全局订阅表。这是百万级 filter 下唯一可扩展的做法。</i>
+    ClassDeviceScoped TopicClass = <b>iota</b>
+    <i>// 保留主题中只可能被精确订阅命中的</i>
+    ClassReservedExact
+    <i>// 普通业务主题，需要兴趣传播</i>
+    ClassGeneral
+)
+
+<b>func</b> Classify(topic string) (TopicClass, ScopeKey)  <i>// ScopeKey = thingName</i></pre>
+      <p style="margin-bottom:0">EMQX 的做法是把整棵订阅树全局复制（Mnesia），在百万级不同 filter 下会崩。
+      我们从一开始就不付这个代价。</p>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>分类函数照常调用，结果用于选择本地子树，顺带获得更好的缓存局部性。</dd></div>
+      <div><dt>集群实现</dt><dd>设备域 → <code>Partitioner.Owner(thingName)</code>；通用域 → 兴趣集匹配。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>不致命，但事后补会发现订阅树已经按"一视同仁"组织，要重建索引结构与兴趣摘要格式。
+      更麻烦的是届时已有的性能基线会倒退，难以说明原因。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">04</span><h4>会话状态与会话运行时分离</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p><b>本清单里事后代价最高的一条。</b>绝大多数单机 broker 把 <code>net.Conn</code>、
+      <code>chan</code>、<code>sync.Mutex</code> 直接塞进 session 结构体。一旦如此，
+      持久会话落盘、会话迁移、跨节点接管、控制台的会话快照——全部无从下手。</p>
+<pre><i>// 纯数据。可序列化、可复制、可跨节点搬运。
+// 禁止出现：net.Conn / chan / func / sync.* / unsafe.Pointer</i>
+<b>type</b> SessionState <b>struct</b> {
+    ClientID       string
+    Epoch          Epoch
+    Owner          NodeID
+    ProtoVer       byte          <i>// 4 = 3.1.1, 5 = 5.0</i>
+    ExpiryInterval uint32
+    Subscriptions  []Subscription
+    Inflight       []InflightMsg <i>// 出站未确认 QoS1</i>
+    Queued         []QueuedMsg   <i>// 离线队列</i>
+    Will           *WillMsg
+    Props          SessionProps  <i>// MQTT5: receive max, topic alias map, ...</i>
+}
+
+<i>// 运行时：持有连接与 goroutine，不可序列化，生命周期短于 State。</i>
+<b>type</b> SessionRuntime <b>struct</b> {
+    state  *SessionState
+    conn   net.Conn
+    out    chan *Message
+    ...
+}</pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>State 存内存，Runtime 一一对应。持久会话时 State 序列化落本地 WAL。</dd></div>
+      <div><dt>集群实现</dt><dd>State 可落复制存储、可在接管时从旧节点或存储恢复，Runtime 在新节点重建。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>会话结构体是整个 broker 引用最密集的类型。拆分它意味着协议状态机、投递、
+      保活、流控、持久化、指标采集全部改一遍，且极易引入并发竞态。
+      <b>这条如果省了，基本等于重写 broker。</b></p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">05</span><h4>元数据：复制日志 + 本地全量物化视图</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>认证鉴权在 CONNECT 路径上，是吞吐最敏感的位置。契约的核心是
+      <b><code>View()</code> 的签名里没有 <code>ctx</code>、没有 <code>error</code></b>——
+      它在类型层面承诺"本地内存、不会失败、不会阻塞"。这个承诺一旦写进签名，
+      后面任何人都不可能在连接路径上偷偷加一发 RPC。</p>
+<pre><b>type</b> MetaStore <b>interface</b> {
+    Apply(ctx context.Context, cmd Command) <b>error</b> <i>// 写：走复制日志</i>
+    View() *MetaView                                 <i>// 读：本地内存快照</i>
+}
+
+<i>// 签名即契约：无 ctx、无 error → 不可能是远程调用。</i>
+<b>type</b> MetaView <b>struct</b>{ ... }
+<b>func</b> (v *MetaView) Thing(name string) (*Thing, bool)
+<b>func</b> (v *MetaView) CertStatus(fp CertFingerprint) (CertStatus, bool)
+<b>func</b> (v *MetaView) PoliciesFor(p Principal) []*Policy
+<b>func</b> (v *MetaView) Revision() uint64</pre>
+      <p style="margin-bottom:0">元数据量级很小——百万设备的 Thing + 证书 + 策略在内存里是 GB 以内，
+      全量驻留每个节点完全可行。写入频率低（注册、吊销、策略变更），Raft 完全够用。</p>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>日志写本地 WAL（pebble/bbolt），视图是内存结构。<b>与集群完全同一套读路径。</b></dd></div>
+      <div><dt>集群实现</dt><dd>日志走 Raft，视图由 apply 循环更新。可选外置 etcd。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>若 v0.1 写成 <code>store.GetThing(ctx) (*Thing, error)</code> 并在 CONNECT 里调用，
+      集群化时每次连接一发 RPC，握手吞吐崩塌；届时被迫重写整条认证路径并补缓存与失效机制——
+      而缓存失效的正确性问题比一开始就做物化视图难得多。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">06</span><h4>分区单写者（Shadow / Jobs）</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>Shadow 的 <code>version</code> 自增、delta 计算、409 冲突判定，要求 per-thing 的单写者语义。
+      Jobs 的 execution 状态机同理。集群下这意味着按 <code>thingName</code> 分区，并把请求路由到 owner。</p>
+<pre><b>type</b> Partitioner <b>interface</b> {
+    Owner(key string) NodeID   <i>// key = thingName</i>
+    IsLocal(key string) bool
+    Count() int
+}
+
+<b>func</b> (s *ShadowSvc) Update(thing string, req *UpdateReq) (*Resp, <b>error</b>) {
+    <b>if</b> !s.part.IsLocal(thing) {
+        <b>return</b> s.forwardToOwner(thing, req) <em>// 单机：unreachable，但分支必须在</em>
+    }
+    <b>return</b> s.applyLocal(thing, req)         <i>// 单写者，version++ 安全</i>
+}</pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd><code>IsLocal</code> 恒 true，<code>Count()</code> 返回 1，转发分支返回内部错误。</dd></div>
+      <div><dt>集群实现</dt><dd>一致性哈希或固定槽位；owner 变更时交接（drain + 转移）。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>Shadow 与 Jobs 服务要从"直接操作存储"改成"先判归属再决定本地或转发"，
+      同时所有版本自增点要重新审计并发安全性。两个服务级别的重写。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">07</span><h4>节点间消息传输</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>接口要在，实现可以是空的。重点是<b>批量与背压从一开始就在签名里</b>——
+      事后把单条接口改成批量接口会牵动所有调用点和流控逻辑。</p>
+<pre><b>type</b> Transport <b>interface</b> {
+    <i>// 批量，且返回 error 以支持背压与重试决策</i>
+    Forward(ctx context.Context, to []NodeID, batch []*Message) <b>error</b>
+    OnReceive(fn <b>func</b>(from NodeID, batch []*Message))
+    <i>// Admin 扇出（契约 12 需要）</i>
+    Query(ctx context.Context, to []NodeID, q AdminQuery) ([]AdminResult, <b>error</b>)
+}</pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>loopback：<code>Forward</code> 直接返回 nil；<code>Query</code> 只查本地。</dd></div>
+      <div><dt>集群实现</dt><dd>全网状长连接（gRPC 流或自有 TCP 帧），批量 + 背压 + 连接级重连。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>中等。主要风险是单条接口改批量时，上游已经按"一条一调用"写死，
+      吞吐优化要重做一遍。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">08</span><h4>禁用墙上时钟做排序与版本</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>单机下 <code>time.Now()</code> 用作版本号或排序键不会出错，集群下会。
+      这类代码散落在各处，事后排查极其痛苦，而且故障是偶发的。
+      立一条 lint 规则：<b>核心包禁止直接调用 <code>time.Now()</code></b>，只能通过注入的时钟接口，
+      且时钟只用于超时、TTL、展示，<b>绝不用于比较先后</b>。</p>
+<pre><i>// 各类"顺序"各有专门的来源，互不混用</i>
+Shadow 版本   → 分区单写者的单调计数器
+消息序号      → (NodeID, LocalSeq) 二元组
+元数据版本    → 复制日志 index
+会话代次      → Epoch（契约 01）
+证书状态版本  → 元数据 Revision
+
+<i>// 允许：超时、TTL、过期、时间戳展示</i>
+<i>// 禁止：if a.Timestamp.After(b.Timestamp) { ... } 作为正确性依据</i></pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>完全一样。单机下这些计数器都是本地变量，零额外成本。</dd></div>
+      <div><dt>集群实现</dt><dd>计数器来源变为分区 leader / Raft index，比较逻辑不变。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>需要全量审计所有时间比较点并逐一替换语义。遗漏的那几处会变成生产环境里
+      "偶尔 shadow 版本回退""偶尔旧消息覆盖新消息"的幽灵 bug。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">09</span><h4>配额的作用域必须显式</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>AWS 的配额分两类：per-connection（本地可判）与 per-account（全局）。
+      集群下全局配额只能"本地额度分摊 + 周期再均衡"，是近似的。
+      每个配额在 v0.1 就要选定走哪个方法——这个分类本身就是设计决策，不能含糊。</p>
+<pre><b>type</b> Limiter <b>interface</b> {
+    <i>// 每连接 / 每节点：精确，无网络</i>
+    AllowLocal(key string, n int) bool
+    <i>// 每账户 / 全集群：近似，基于分摊额度；超出额度时才协商</i>
+    AllowGlobal(ctx context.Context, key string, n int) bool
+}
+
+<i>// 走 Local：每连接发布速率、每连接订阅数、每连接吞吐、单包大小
+// 走 Global：账户并发连接数、账户入站/出站速率、retained 总数、
+//           共享订阅组积压、证书注册速率</i></pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd><code>AllowGlobal</code> 就是本地精确计数（节点数 1，分摊即全额）。</dd></div>
+      <div><dt>集群实现</dt><dd>额度按节点分摊，定期向协调者汇报与再均衡；突发时允许短时超限。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>较低但有坑：事后才区分，会发现有些限流点语义上本该全局却只在本地判，
+      集群下配额直接放大 N 倍，而这类问题只在压测或线上才暴露。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">10</span><h4>Retained 与共享订阅组是全局状态</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>两者都不是"某个连接的状态"，而是集群级状态，必须从一开始就放在接口后面，
+      不能直接操作本地数据结构。</p>
+<pre><b>type</b> RetainedStore <b>interface</b> {
+    Set(topic string, m *Message, v Version) <b>error</b> <i>// LWW by Version，非时间戳</i>
+    Delete(topic string, v Version) <b>error</b>
+    Match(filter string) []*Message
+}
+
+<b>type</b> SharedGroups <b>interface</b> {
+    Join(group, filter, clientID string, node NodeID, persistent bool) <b>error</b>
+    Leave(group, filter, clientID string) <b>error</b>
+    <i>// 选一个在线成员；集群下优先本节点成员以省一跳</i>
+    Pick(group, filter string) (SubRef, NodeID, bool)
+    Members(group, filter string) []Member
+}</pre>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>本地 trie / map。<code>Pick</code> 恒返回本地成员。</dd></div>
+      <div><dt>集群实现</dt><dd>Retained 走复制存储（量小）；组成员走兴趣传播 + 本地优先选择。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>中等。共享订阅的"选一个订阅者"若 v0.1 写成遍历本地 map，
+      集群下的本地优先策略、离线成员排队、组内再均衡都要重做。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">11</span><h4>结构化事件总线：可观测事实即事件</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>这条是管理控制台的地基，也是最容易被忽略的"不可事后加"项。
+      <b>如果 broker 核心不吐出结构化事件，控制台永远无法展示断连原因、
+      认证失败细节、策略判定过程——因为那些信息在产生点之后就被丢弃了。</b>
+      AWS 控制台在这方面很弱（只能去 CloudWatch 翻晦涩日志），这正是我们可以明显做得更好的地方。</p>
+<pre><i>// 一个事件源，四个消费者：$aws/events 保留主题、控制台实时流、
+// 审计日志、指标聚合。绝不为每个消费者各埋一次点。</i>
+<b>type</b> Event <b>interface</b> { Kind() EventKind; Node() NodeID; Seq() uint64 }
+
+<b>type</b> ConnEvent <b>struct</b> {
+    ClientID    string
+    Epoch       Epoch
+    Thing       string
+    Result      ConnResult      <i>// Accepted / AuthFailed / Throttled / Evicted / ...</i>
+    ReasonCode  byte            <i>// MQTT5 reason code</i>
+    ReasonText  string          <i>// 人类可读，控制台直接展示</i>
+    CertFP      CertFingerprint
+    CertSubject string
+    AuthMethod  AuthMethod      <i>// mTLS / SigV4 / WASM / ...</i>
+    ProtoVer    byte
+    RemoteAddr  netip.AddrPort
+    TLSVersion  uint16
+    ALPN        string
+    Duration    time.Duration   <i>// 握手耗时，用于定位 TLS 瓶颈</i>
+}
+
+<b>type</b> AuthzEvent <b>struct</b> {
+    ClientID   string
+    Action     Action           <i>// Connect/Publish/Subscribe/Receive/RetainPublish</i>
+    Resource   string
+    Decision   Decision         <i>// Allow / ExplicitDeny / ImplicitDeny</i>
+    PolicyName string           <i>// 命中的策略</i>
+    StatementI int              <i>// 命中的语句下标</i>
+    Vars       map[string]string <i>// ${iot:...} 求值结果 —— 策略调试的关键</i>
+}
+
+<b>type</b> EventBus <b>interface</b> {
+    Emit(e Event)
+    Subscribe(filter EventFilter) (&lt;-chan Event, <b>func</b>())
+}</pre>
+      <p style="margin-bottom:0"><code>AuthzEvent.Vars</code> 这一个字段，就是后面"策略调试器"能存在的原因。
+      策略变量求值结果如果不在判定时捕获，事后无法重建。</p>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>进程内 ring buffer + fan-out channel。采样率可配，默认全量 Conn/Authz-deny。</dd></div>
+      <div><dt>集群实现</dt><dd>本地总线不变；控制台订阅时由 Admin 层扇出到各节点合并（契约 12）。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>埋点位置分布在协议状态机、TLS 握手回调、策略求值器内部——都是热路径与深层函数。
+      事后补要重新穿透多层调用传递上下文，且<b>很多信息（如策略变量求值中间结果）
+      在原实现里根本没有保留，等于要重写策略求值器</b>。</p></div>
+  </div>
+
+  <div class="ctr">
+    <div class="ctr-top"><span class="ctr-n">12</span><h4>双 API 平面与 Admin 扇出</h4><span class="chip t-now">DAY-1</span></div>
+    <div class="ctr-body">
+      <p>两个 API 面必须从一开始就分开：AWS 兼容面是<b>冻结契约</b>（为了 SDK/CLI 原样可用，
+      不能为了控制台的需要往里加字段）；Admin 面是<b>我们自己的</b>，可以自由演进、可以有流式接口。
+      把控制台建在 AWS 兼容面上是个单向的错误决定——之后要么污染兼容性，要么推翻重做。</p>
+<pre>/api/aws/...        <i>AWS 兼容面：SigV4 验签、REST-JSON、错误形状对齐，契约冻结</i>
+/api/admin/v1/...   <i>自有面：REST + SSE/WebSocket，RBAC，自由演进</i>
+
+<i>// 控制台的查询天然是全集群的："列出所有在线连接"要跨节点聚合。
+// 这个扇出抽象 v0.1 就要在，否则控制台会写成只认本地。</i>
+<b>type</b> AdminQuery <b>interface</b> { Scope() QueryScope } <i>// LocalOnly | AllNodes</i>
+
+<b>type</b> AdminAPI <b>interface</b> {
+    <i>// 扇出 + 合并 + 分页游标（游标必须编码每节点的位置）</i>
+    ListConnections(ctx context.Context, f ConnFilter, cur Cursor) (*Page[Conn], <b>error</b>)
+    <i>// 实时流：合并各节点事件总线</i>
+    StreamEvents(ctx context.Context, f EventFilter) (&lt;-chan Event, <b>error</b>)
+    <i>// 定向到某节点或某 clientID 的 owner</i>
+    KickClient(ctx context.Context, clientID string, reason byte) <b>error</b>
+}</pre>
+      <p style="margin-bottom:0"><b>分页游标</b>是这里的隐藏陷阱：跨节点合并分页的游标必须编码
+      "每个节点各读到哪"，不能是单一 offset。这个数据结构事后改要动所有列表接口。</p>
+    </div>
+    <div class="impl">
+      <div><dt>单机实现</dt><dd>扇出目标只有自己；游标仍是 map 形式（只有一个条目）。</dd></div>
+      <div><dt>集群实现</dt><dd>scatter-gather + 超时降级（标注"部分节点未响应"而非整体失败）。</dd></div>
+    </div>
+    <div class="hz"><span class="hz-lab">延后代价</span>
+      <p>控制台所有列表与流式接口要重写，游标格式变更会破坏前端分页。
+      若控制台已经建在 AWS 兼容面上，则要么破坏兼容性，要么整层推翻。</p></div>
+  </div>
+</section>
+
+<section class="part" id="raft">
+  <div class="part-head"><span class="part-num">PART I · 共识</span><h2>内嵌 Raft 的拓扑与元数据后端</h2></div>
+  <p class="part-sub">决定：<b>内嵌 Raft，不依赖外部 etcd / ZooKeeper / 数据库</b>。
+  交付物是单个静态二进制。这不只是部署便利——它是相对 EMQX（需要 Erlang 集群）、
+  ThingsBoard（需要 JVM + Postgres + Kafka + Redis）最直接的定位优势，
+  也让边缘单机部署和中心集群部署共用同一个制品。</p>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">I-1</span><h3>库选型</h3></div>
+    <p class="sec-note">我们需要 <b>multi-raft</b>（几十个分区组），这一条直接决定了选型。</p>
+    <div class="tscroll"><table>
+      <thead><tr><th style="width:17%">库</th><th style="width:9%">许可</th><th style="width:15%">多组支持</th><th>评估</th><th style="width:9%">结论</th></tr></thead>
+      <tbody>
+        <tr><td class="cap">lni/dragonboat</td><td class="aws">Apache-2.0</td><td class="aws">原生 multi-raft</td>
+          <td class="note">唯一自带多组调度、共享传输层与心跳、Pebble 日志后端的 Go 实现。支持 on-disk 状态机、
+          observer（非投票副本）、witness、成员变更、快照。吞吐足够（我们的元数据写入本就稀疏）。</td>
+          <td class="tier"><span class="chip t-now">采用</span></td></tr>
+        <tr><td class="cap">go.etcd.io/raft</td><td class="aws">Apache-2.0</td><td class="aws">需自建</td>
+          <td class="note">只提供共识核心，传输、存储、快照、多组复用全部自己写。控制力最强，
+          但这是 CockroachDB 投入数月的工作量。不值得在 v0.1 付。</td>
+          <td class="tier"><span class="chip t-never">不用</span></td></tr>
+        <tr><td class="cap">hashicorp/raft</td><td class="aws">MPL-2.0</td><td class="aws">单组为主</td>
+          <td class="note">成熟稳定、API 简洁（Consul/Nomad/Vault 在用），但多组要起 N 个独立实例、
+          N 套传输与心跳，浪费且无法共享批量。<b>作为后备方案保留</b>：若只保留元数据组、
+          放弃分区组，它完全够用。</td>
+          <td class="tier"><span class="chip t-next">后备</span></td></tr>
+      </tbody>
+    </table></div>
+    <div class="hz" style="margin-top:18px"><span class="hz-lab">诚实的风险</span>
+      <p>dragonboat 的维护集中在单一作者，bus factor 是真实风险。规避方式已经在架构里了：
+      它只出现在 <code>MetaStore</code>（契约 05）和 <code>ShardStore</code>（契约 06）的实现体内，
+      上层零感知，替换成 hashicorp/raft 或 etcd/raft 是模块级而非系统级改动。
+      <b>另外必须锁定 Pebble 作为日志后端以保持 CGO-free</b>——交叉编译到 ARM 边缘设备是本项目的核心场景，
+      一旦引入 RocksDB 就失去了。</p></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">I-2</span><h3>组的划分</h3></div>
+    <p class="sec-note">三类状态，三种处理方式。<b>最重要的一条是第三类：连接路径上不写 Raft。</b></p>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">组 1</span><h4>元数据组 · 单组 · 所有节点持有全量</h4></div>
+      <div class="ctr-body">
+        <p>内容：Thing、Thing Group / Type、证书与状态、策略、注册模板、规则定义、Job 定义。
+        写入稀疏（注册、吊销、策略变更），读取极热（每次 CONNECT）。</p>
+<pre><i>// 关键拓扑：小 quorum + 全量副本。两者不矛盾。</i>
+投票成员 (voter)    3 或 5 个节点     → quorum 小，写延迟低
+非投票成员 (learner) 其余所有 broker 节点 → 每个节点都有全量物化视图
+
+<i>// 于是契约 05 的承诺成立：View() 是本地内存读，无网络、不会失败。</i></pre>
+        <p style="margin-bottom:0">节点数超过 5 时不要继续加 voter——quorum 变大只会让写变慢，
+        而我们需要的是"人人有全量数据"，learner 就能满足。</p>
+      </div>
+      <div class="impl">
+        <div><dt>这带来的可用性优势</dt><dd>丢失 Raft quorum 时，<b>设备仍可连接、订阅、收发消息</b>——
+        因为认证鉴权只读本地视图。只有注册、吊销、策略变更这类写操作失败。
+        "连接时查库"的设计在同样故障下会全面拒连。</dd></div>
+      </div>
+    </div>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">组 2</span><h4>分区组 · 默认 64 组 · 按 key 哈希</h4></div>
+      <div class="ctr-body">
+        <p>内容：Shadow 文档、Job execution 状态、Retained 消息。这些是<b>有状态、需持久、需单写者</b>的数据。</p>
+<pre>Shadow / JobExecution  分区键 = thingName
+Retained               分区键 = topic
+
+<i>// 三件事在这里合一，这是本设计最省事的地方：</i>
+分区 Raft leader  ==  契约 06 的单写者  ==  契约 08 的版本号来源
+
+<b>func</b> (s *shardFSM) Update(thing string, patch Patch) (Version, <b>error</b>) {
+    <i>// 由 Raft 保证本组内串行 apply，version 直接取 log index 派生，
+    // 天然单调、天然跨 leader 变更安全。无需额外时钟或计数器。</i>
+    v := Version(s.lastIndex)
+    ...
+}</pre>
+        <p style="margin-bottom:0">Shadow 的 <code>version</code> 乐观并发与 409 冲突判定，
+        因此是"免费"正确的——不需要额外设计，Raft 的串行 apply 已经给了。</p>
+      </div>
+      <div class="impl">
+        <div><dt>组数选择</dt><dd>默认 64，可在集群初始化时设定且<b>之后不可更改</b>（改变哈希环需要数据迁移）。
+        64 组在 3–20 节点区间都合理；超大规模再考虑支持扩容重分片。</dd></div>
+        <div><dt>副本数</dt><dd>每组 3 副本，分散在不同节点。节点数 &lt; 3 时自动降为节点数。</dd></div>
+      </div>
+    </div>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">组 3</span><h4>会话归属 · 不写 Raft · term 围栏内存租约</h4><span class="chip t-over">关键取舍</span></div>
+      <div class="ctr-body">
+        <p>连接速率可达数千每秒，若每次 CONNECT 都写一条 Raft 日志，吞吐会被 fsync 钉死。
+        所以会话归属<b>不进日志</b>，而是由分区 leader 在内存中维护，用 Raft 的 <code>term</code> 做围栏。
+        这是 Kafka / HDFS 的经典做法。</p>
+<pre><i>// epoch 的高位是 Raft term，低位是 leader 本地递增序号。</i>
+epoch := Epoch(term)&lt;&lt;32 | Epoch(leaderLocalSeq)
+
+<i>// 正确性论证：
+// 1. 同一 term 内，序号由单一 leader 递增 → 单调。
+// 2. leader 切换后 term 严格增大，即使新 leader 从 0 开始计序号，
+//    epoch 仍严格大于旧 term 的任何 epoch → 全局单调。
+// 3. 旧 leader 若因网络分区仍自认 leader 并发放 epoch，其 term 较低，
+//    这些 epoch 在契约 01 的校验中被拒 → 不可能双活授权。</i>
+
+<i>// leader 故障转移后，新 leader 的归属表是空的：
+// 处理方式是「未知即允许抢占」。这是安全的——旧持有者的 epoch 来自更低的
+// term，它在下一次 epoch 校验时即被围栏淘汰。
+// 代价是一个很短的窗口内可能重复投递，不会出现双重授权。</i></pre>
+      </div>
+      <div class="impl">
+        <div><dt>性能结果</dt><dd>CONNECT 路径上的分布式操作只有一次到分区 leader 的 RPC（可批量、可与同节点合并），
+        <b>零日志写入、零 fsync</b>。</dd></div>
+        <div><dt>会话重注册</dt><dd>leader 变更后，各 broker 节点异步向新 leader 重新登记本地活跃会话，
+        用于加速踢出通知；正确性不依赖它。</dd></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">I-3</span><h3>单机即单副本</h3></div>
+    <p class="sec-note">原则 01 在这里落地：单机模式不是旁路，而是副本数为 1 的 Raft 组。</p>
+<pre>节点数 1  → 元数据组 1 voter；分区组各 1 副本；归属 leader 即本机
+节点数 3  → 元数据组 3 voter；分区组 3 副本
+节点数 10 → 元数据组 3 voter + 7 learner；分区组 3 副本分散
+
+<i>// 单副本 Raft 组的开销本质上就是一个 WAL，与"直接写 WAL"相当。
+// 换来的是：集群与单机共用同一条读写路径，不存在两套实现的分歧风险。</i></pre>
+    <p>这也意味着集群功能在 v0.1 就是<b>被持续测试的</b>——单机 CI 跑的就是集群代码路径，
+    而不是等到 v0.4 才第一次让这些代码运行。这是"接口先行"之外，避免重构的第二层保险。</p>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">I-4</span><h3>运维与失败模式</h3></div>
+    <p class="sec-note">这些必须在 v0.1 就定义清楚语义（即便实现在 v0.4），因为它们决定了控制台要展示什么。</p>
+    <div class="tscroll"><table>
+      <thead><tr><th style="width:24%">场景</th><th style="width:38%">行为</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td class="cap">元数据组失去 quorum</td>
+          <td class="aws">设备连接、订阅、收发<span class="yes"> 正常</span>；注册 / 吊销 / 策略变更<span class="no"> 拒绝</span></td>
+          <td class="note">本地物化视图继续服务。控制台明确标注"元数据只读，视图版本 N"。</td></tr>
+        <tr><td class="cap">分区组失去 quorum</td>
+          <td class="aws">受影响 thing 的 Shadow / Jobs 写<span class="no"> 拒绝</span>；消息收发<span class="yes"> 正常</span></td>
+          <td class="note">故障域限制在 1/64 的 key 空间。控制台需按分区展示健康度。</td></tr>
+        <tr><td class="cap">节点故障</td>
+          <td class="aws">其上连接断开，设备重连到其他节点；pinned 的离线队列丢失</td>
+          <td class="note">默认后端下离线队列不跨节点保留，<b>必须在文档首屏声明</b>，不要含糊。</td></tr>
+        <tr><td class="cap">滚动升级 / 腾空节点</td>
+          <td class="aws">MQTT5 <code>server redirect</code>（0x9C/0x9D）优雅迁移，MQTT3 客户端走限速断开</td>
+          <td class="note">AWS 不支持此特性，我们是超集。这是唯一优雅的再均衡手段，<b>协议支持属 Day-1</b>。</td></tr>
+        <tr><td class="cap">偶数节点集群</td>
+          <td class="aws">引入 witness（只投票不存数据）避免 quorum 浪费</td>
+          <td class="note">dragonboat 原生支持。</td></tr>
+        <tr><td class="cap">脑裂</td>
+          <td class="aws">少数派无法写入；会话归属由 term 围栏保证不双活</td>
+          <td class="note">少数派上的设备仍可收发本地消息——需在文档中明确这是<b>有意的可用性取舍</b>。</td></tr>
+        <tr><td class="cap">新节点加入</td>
+          <td class="aws">先作为 learner 同步元数据快照，追平后才接受设备连接</td>
+          <td class="note">避免半空视图导致误拒连。健康检查需包含"视图已追平"。</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">I-5</span><h3>元数据后端：可插拔，但读路径不可插拔</h3></div>
+    <p class="sec-note">证书吊销状态这类元数据，<b>存在哪里是可选的，怎么读是不可选的</b>。
+    这个区分是本节的全部要点。</p>
+
+    <div class="hz" style="margin-top:0;border-left-color:var(--over);background:var(--over-bg)">
+      <span class="hz-lab" style="color:var(--over-ink)">为什么读路径不能是 SQL</span>
+      <p>吊销状态不是"偶尔查一次"的数据：<b>每次 CONNECT 要查，每条 PUBLISH / SUBSCRIBE 鉴权也要查</b>。
+      按配额对齐表，这是 2 万次/秒量级的查询。任何 SQL 后端（Postgres、MySQL）
+      在这个位置都是错的——不是性能调优问题，是数量级不匹配。
+      <b>所以契约 05 的内存物化视图不随后端变化，它是地基。</b>后端只是 system-of-record。</p>
+    </div>
+
+    <p>于是元数据层分成两件可以独立选择的事：</p>
+<pre><b>system-of-record</b>   持久化真相。写入稀疏（注册、吊销、策略变更）。<em>可插拔</em>
+       ↓ 变更传播
+<b>materialized view</b>  每节点全量内存视图。读取极热。<em>不可插拔，始终内存</em></pre>
+
+    <div class="tscroll" style="margin-top:20px"><table>
+      <thead><tr><th style="width:15%">后端</th><th style="width:11%">进程</th><th style="width:14%">单条写吞吐</th><th style="width:16%">变更传播</th><th>评估</th></tr></thead>
+      <tbody>
+        <tr data-t="now"><td class="cap">内嵌 Raft<br><span style="font-size:11.5px;color:var(--ink-3)">dragonboat</span></td>
+          <td class="aws">0（同进程）</td><td class="num">数千 /s</td>
+          <td class="aws">tail 复制日志<br><span style="font-size:11.5px;color:var(--ink-3)">推送，亚毫秒</span></td>
+          <td class="note">零外部依赖，延迟最低，apply 循环天然驱动视图更新。
+          缺点是元数据不能用 SQL 直接查——但这一点有解（见下）。</td></tr>
+        <tr data-t="next"><td class="cap">PostgreSQL</td>
+          <td class="aws">外部</td><td class="num">数千–数万 /s</td>
+          <td class="aws">LISTEN / NOTIFY<br><span style="font-size:11.5px;color:var(--ink-3)">或逻辑复制</span></td>
+          <td class="note">若要选一个"外部 SQL 后端"的首选，是它：写吞吐高一到两个数量级，
+          变更推送是原生能力，企业已有 DBA 运维体系。代价是 HA 要自己搭。</td></tr>
+        <tr data-t="next"><td class="cap">MySQL</td>
+          <td class="aws">外部</td><td class="num">数千–数万 /s</td>
+          <td class="aws">binlog 订阅</td>
+          <td class="note">能力接近 Postgres，变更订阅实现稍重。为已标准化到 MySQL 的组织提供。</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">约束 1</span><h4>分区状态绝不进 SQL 后端</h4></div>
+      <div class="ctr-body">
+        <p>Shadow、Job execution、Retained 是<b>高写入</b>状态：单 thing 的 Shadow 配额就是 20 req/s，
+        上万活跃设备即数万写/秒，远超外部 SQL 后端经单条事务能承受的量级——会立刻成为系统瓶颈。</p>
+<pre><i>// 后端选择只作用于元数据组。分区组（I-2 组 2）始终内嵌。</i>
+元数据 (Thing/Cert/Policy/Template/Rule)  → 可插拔后端
+分区状态 (Shadow/JobExec/Retained)        → <em>始终内嵌分区存储</em>
+
+<i>// 推论：选择外部 SQL 后端时，系统里会同时存在外部数据库与内嵌存储。
+// 这是外部后端的真实成本，必须在文档中说清楚，不要让用户以为
+// 「配了 Postgres 就不需要本地状态了」。</i></pre>
+      </div>
+    </div>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">约束 2</span><h4>会话归属的围栏世代从哪来</h4></div>
+      <div class="ctr-body">
+        <p>内嵌 Raft 方案里，epoch 的高位取自 Raft <code>term</code>（见 I-2 组 3）。
+        换成 SQL 后端后没有 term 可用，需要等价替代——用<b>租约表 + 条件更新</b>做分区选举，
+        与 Kubernetes 的 lease 选举同款。</p>
+<pre><i>// 每个分区一行租约。续约频率是每几秒一次，不是每连接一次，
+// 因此即便后端的写吞吐只有数百/秒也完全够用。</i>
+CREATE TABLE shard_lease (
+  shard_id    INTEGER PRIMARY KEY,
+  holder      TEXT    NOT NULL,
+  generation  INTEGER NOT NULL,   <i>-- 取代 Raft term</i>
+  expires_at  INTEGER NOT NULL
+);
+
+<i>// 抢占：条件更新，仅在租约过期时成功，并递增 generation</i>
+UPDATE shard_lease SET holder=?, generation=generation+1, expires_at=?
+ WHERE shard_id=? AND expires_at &lt; ?;
+
+epoch := Epoch(generation)&lt;&lt;32 | Epoch(leaderLocalSeq)</pre>
+        <p style="margin-bottom:0">围栏正确性论证与 I-2 组 3 完全一致：<code>generation</code> 严格递增，
+        旧持有者发放的 epoch 必然更小，在契约 01 的校验中被拒。
+        <b>前提是后端提供强一致的条件更新</b>——Postgres 与 MySQL 都满足。</p>
+      </div>
+    </div>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">约束 3</span><h4>变更传播要幂等且带版本</h4></div>
+      <div class="ctr-body">
+        <p>外部 SQL 后端的变更订阅（Postgres 的 LISTEN/NOTIFY 或逻辑复制、MySQL 的 binlog）
+        通常是<b>至少一次</b>语义。这决定了两件实现细节。</p>
+<pre><i>// 1. 视图 apply 必须幂等 —— 至少一次意味着会重复投递。
+//    每条变更携带单调 revision，视图只接受 revision 更大的更新。</i>
+
+<i>// 2. 变更订阅通常只在一处接入，但我们有 N 个 broker 节点都需要刷新视图。
+//    所以：变更流 → 任一节点的内部端点 → 经自有事件总线（契约 11）扇出到全集群。
+//    这条扇出链路同时服务「吊销后立即踢连接」，两者共用。</i>
+
+变更流 ──→ /internal/meta-change ──→ EventBus ──→ 各节点刷新视图 + 踢连接
+
+<i>// 3. 必须有兜底：定期按 revision 做一次全量校验与补齐，
+//    防止变更流中断导致视图静默过期。吊销状态过期是安全问题，不能只依赖推送。</i></pre>
+      </div>
+    </div>
+
+    <div class="hz" style="border-left-color:var(--now);background:var(--now-bg)">
+      <span class="hz-lab" style="color:var(--now-ink)">关于默认值的建议</span>
+      <p><b>默认且唯一的内置后端是内嵌 Raft</b>，Postgres 与 MySQL 作为可选外部后端。
+      定这个默认的理由：<b>默认配置决定了项目的第一次上手体验</b>——
+      <code>./openiotd</code> 直接能跑，和"先装并配置一个外部存储再跑"，对开源项目的采用率影响很大；
+      而且"单静态二进制、零外部依赖"是我们相对 EMQX（需 Erlang 集群）、
+      ThingsBoard（需 JVM + Postgres + Kafka + Redis）最直接的定位优势，默认引入外部进程就放弃了它。</p>
+      <p style="margin-top:9px">外部 SQL 后端唯一的独特价值是"元数据可以用 SQL 直接查"。
+      而这个价值<b>不必靠外部进程换取</b>：内嵌模式下，物化视图可以同时落一份<b>本地只读 SQLite 文件</b>，
+      运维直接 <code>sqlite3</code> 查询即可，单进程与 SQL 可查询性兼得。</p>
+      <p style="margin-top:9px">因此外部后端只为一种情形保留——组织已有 DBA 运维体系并要求元数据落在其统管的数据库里。
+      这种情形下首选 Postgres：写吞吐比任何嵌入式 SQL 方案高一到两个数量级，LISTEN/NOTIFY 是原生变更推送。
+      <b>三种选择下 <code>MetaStore</code> 接口与上面三条约束都不变</b>，改后端是改配置，不是改架构。
+      内嵌方案的完整机制见 I-6。</p>
+    </div>
+
+<pre><i># 配置形态：后端可换，读路径与接口不变</i>
+meta:
+  backend: embedded        <i># 默认。可选 postgres | mysql</i>
+  embedded:
+    voters: 3              <i># 其余节点自动成为 learner</i>
+    sqlite_view: ./meta.db <i># 可选：导出只读 SQLite 供 SQL 直查</i>
+  postgres:
+    dsn: ...
+    read_consistency: primary <i># 仅用于 system-of-record 读，热路径永不经过</i>
+    change_feed: listen_notify
+  mysql:
+    dsn: ...
+    change_feed: binlog
+view:
+  resync_interval: 30s     <i># CDC 中断时的兜底全量校验</i></pre>
+  </div>
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">I-6</span><h3>零外部依赖下的跨节点证书一致性</h3></div>
+    <p class="sec-note">以"吊销一张证书"为例，走完内嵌方案的端到端链路。
+    这一节是 I-5 表格里"内嵌 Raft"那一行的展开。</p>
+
+    <div class="hz" style="margin-top:0;border-left-color:var(--next);background:var(--next-bg)">
+      <span class="hz-lab" style="color:var(--next-ink)">关键认识</span>
+      <p><b>Raft 日志本身就是全序广播通道。</b>每个节点（含 learner）独立 apply 同一条有序日志，
+      因此吊销命令抵达时，<b>各节点各自踢掉自己持有的连接，不需要任何额外的失效通知机制</b>。
+      外部存储方案反而要在上面再搭一层扇出（CDC webhook → 自建转发 → 各节点），
+      多一个组件、多一处可能静默失效的环节。</p>
+    </div>
+
+    <h4 style="font-family:var(--disp);font-size:15.5px;font-weight:600;margin:26px 0 8px">吊销的端到端流程</h4>
+<pre><b>1.</b> 运维在<em>任意节点</em>调用 UpdateCertificate(fp, REVOKED)
+<b>2.</b> 该节点若非 meta leader，把提案转发给 leader（并代持响应）
+<b>3.</b> leader 追加一条命令进 meta Raft 日志：
+       Cmd{Op: OpSetCertStatus, Fingerprint: fp, Status: REVOKED, Reason: ...}
+<b>4.</b> 多数派 fsync 提交   <i>本地 NVMe ~1–5ms；跨可用区 ~10–30ms</i>
+<b>5.</b> <em>每个节点</em>（voter 与 learner 一致）在自己的 apply 循环里执行：
+         ├─ 更新热内存视图，revision = 该条日志的 index
+         ├─ 写入 Pebble 冷存（持久真相）
+         └─ 向本地 EventBus 发出 MetaChange 事件
+<b>6.</b> 各节点的吊销处理器消费本地事件 → 遍历本节点连接，
+       踢掉所有使用该指纹的会话，DISCONNECT reason = 0x87 Not authorized
+
+<i>// 全程没有节点间的额外消息。广播由第 4、5 步的日志复制完成。</i></pre>
+
+    <h4 style="font-family:var(--disp);font-size:15.5px;font-weight:600;margin:28px 0 8px">为什么"每节点全量"在内存上是可行的</h4>
+    <p>容易被误判的一点是"全量元数据驻留每节点会吃光内存"。实际上<b>热路径只需要元数据的一个极小子集</b>——
+    鉴权要的是指纹到状态、指纹到策略集、以及策略变量用到的那几个字段，<b>不是完整的 Thing 记录</b>。
+    于是分成两层：</p>
+<pre><i>// 热层：内存，紧凑，鉴权路径只碰这里</i>
+certStatus    map[[32]byte]CertState        <i>// 指纹 → 状态；百万证书 &lt; 100MB</i>
+certToPolicy  map[[32]byte]policySetID      <i>// 策略集去重后通常只有数十到数千个</i>
+policySets    []*CompiledPolicySet          <i>// <em>apply 时预编译</em>，不在消息路径上解析 JSON</i>
+thingHot      map[string]*HotAttrs          <i>// 仅策略变量实际引用的字段</i>
+
+<i>// 冷层：Pebble，按需读取，不在热路径上</i>
+完整 Thing 记录 / 证书元数据 / 开通模板 / 规则定义 / 分组层级 / 审计
+
+<i>// 量级：百万设备约 100MB 级，千万设备约 1GB 级 —— 全量驻留可行。
+// 超出这个量级再考虑按分区裁剪视图（设备域主题已按 thingName 哈希分区，
+// 天然可以只保留本节点可能服务的设备），但这不是 v0.1 的问题。</i></pre>
+    <p style="margin-bottom:0"><b>策略预编译是这里的隐藏收益</b>：策略在 apply 时一次性编译成匹配器，
+    而不是每条 PUBLISH 去解析 JSON 文档。这件事只有在"apply 循环拥有策略变更"的架构下才自然成立。</p>
+
+    <h4 style="font-family:var(--disp);font-size:15.5px;font-weight:600;margin:28px 0 8px">读路径</h4>
+<pre><b>func</b> (a *Authenticator) OnConnect(c *tls.ConnectionState) <b>error</b> {
+    v := a.store.View()                     <i>// atomic 指针读，无锁</i>
+    st, ok := v.CertStatus(fingerprint(c))  <i>// 分片 map 查找，~50ns</i>
+    <b>if</b> !ok || st != CertActive {
+        <b>return</b> ErrCertNotActive          <i>// 不触网、不触盘、不会失败</i>
+    }
+    ...
+}
+
+<i>// 视图实现：256 个分片，每片独立 RWMutex。读 RLock 单片，随核心数线性扩展。
+// 写入稀疏，分片锁的代价可忽略。若 profiling 显示尾延迟不达标，
+// 可换成不可变 HAMT 实现无锁读 —— MetaView 接口不变。</i></pre>
+
+    <h4 style="font-family:var(--disp);font-size:15.5px;font-weight:600;margin:28px 0 8px">磁盘布局 · 单节点全部家当</h4>
+<pre>data/
+  meta/          <i>元数据组的 Raft 日志与快照（Pebble，纯 Go，无 CGO）</i>
+  shards/0000…0063/  <i>分区组：Shadow / JobExec / Retained</i>
+  view.db        <i>可选：物化视图导出为只读 SQLite，供 sqlite3 直查</i>
+  ca/            <i>签发者角色节点才有（见下）</i>
+
+<i># 没有 etcd、没有 ZooKeeper、没有数据库。整个集群就是 N 份这个目录。</i>
+openiotd init --bootstrap          <i># 第一个节点，同时即单机模式</i>
+openiotd join  --peers=n1:7946,…   <i># 后续节点，自动成为 learner</i>
+openiotctl cluster members | promote | transfer-leadership | backup</pre>
+    <p style="margin-bottom:0">元数据量大时（百万级 Thing），用 dragonboat 的 <code>IOnDiskStateMachine</code>——
+    快照退化为 Pebble 的 SST checkpoint，不需要把 GB 级状态序列化一遍。
+    <b>这个选择要在 v0.1 做</b>，事后从内存状态机换到磁盘状态机要重写 FSM 与快照逻辑。</p>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">安全要点</span><h4>陈旧视图必须 fail-closed</h4><span class="chip t-over">超集</span></div>
+      <div class="ctr-body">
+        <p>这是自建场景独有、而 AWS 不存在的问题：<b>网络分区中的少数派节点，其视图冻结在最后提交的 index 上，
+        可能仍然接受一张在多数派侧已被吊销的证书。</b>托管服务只有一个控制面，不会有这个问题。</p>
+<pre><i>// 吊销是安全语义，不能无限期容忍陈旧。
+// 热视图记录「最后一次确认追平的时间」，超过阈值即对<em>新连接</em>关闭。</i>
+
+<b>if</b> time.Since(v.LastConfirmedAt()) &gt; cfg.MaxViewStaleness {
+    <i>// 拒绝新连接（fail-closed），但<em>不</em>断开已有连接 ——
+    // 否则一次控制面故障会放大成全网设备掉线。</i>
+    <b>return</b> ErrViewStale
+}</pre>
+        <p style="margin-bottom:0">默认阈值建议 30s，可配。这条取舍要在文档里明确写出来：
+        <b>吊销的传播上界等于这个阈值</b>，而不是"立即"。诚实声明边界比含糊的"实时吊销"更可信。</p>
+      </div>
+      <div class="impl">
+        <div><dt>为什么不断已有连接</dt><dd>控制面故障不应该放大成数据面全网掉线。
+        已连接设备继续工作，新连接 fail-closed，是正确的失败方向。</dd></div>
+        <div><dt>配套</dt><dd>视图陈旧度作为节点健康检查的一部分；控制台在集群视图里直接展示各节点的视图版本偏差。</dd></div>
+      </div>
+    </div>
+
+    <div class="ctr">
+      <div class="ctr-top"><span class="ctr-n">安全要点</span><h4>CA 私钥绝不进 Raft</h4></div>
+      <div class="ctr-body">
+        <p>跨节点证书管理里最容易踩的坑：把签发用的 CA 私钥放进复制状态，
+        等于<b>把私钥明文写进每个节点的磁盘日志，并且永久留在日志历史里</b>。</p>
+<pre><i>// 进 Raft 的只有公开数据</i>
+✓ 已签发证书（公钥部分）、证书状态、绑定关系、策略
+✗ <em>CA 私钥</em>、设备私钥、claim 证书私钥
+
+<i>// 签发是一个<em>特权角色</em>，不是所有节点都有的能力</i>
+openiotd --role=broker          <i># 不持有签发密钥，收到 CSR 转发给 signer</i>
+openiotd --role=broker,signer   <i># 持有签发密钥</i>
+
+keystore:
+  backend: file | pkcs11 | kms   <i># file 需口令加密；生产建议 pkcs11/kms</i></pre>
+        <p style="margin-bottom:0">签发请求（含 Fleet Provisioning 的 MQTT 接口）由任意节点接收后转发到 signer 节点，
+        签发结果作为普通元数据写入 Raft。<b>这样即使某个 broker 节点被攻破，攻击者也拿不到签发能力。</b></p>
+      </div>
+    </div>
+
+    <h4 style="font-family:var(--disp);font-size:15.5px;font-weight:600;margin:28px 0 8px">失败模式</h4>
+    <div class="tscroll"><table>
+      <thead><tr><th style="width:22%">场景</th><th style="width:30%">证书管理</th><th>设备数据面</th></tr></thead>
+      <tbody>
+        <tr><td class="cap">leader 故障</td><td class="aws">写阻塞约 1 秒（选举超时）</td><td class="note"><span class="yes">无影响</span>——视图是本地的</td></tr>
+        <tr><td class="cap">丢失多数派</td><td class="aws"><span class="no">无法签发、无法吊销</span></td><td class="note"><span class="yes">连接与收发正常</span>，直到触及陈旧度阈值后新连接 fail-closed</td></tr>
+        <tr><td class="cap">少数派分区</td><td class="aws">视图冻结，吊销不可见</td><td class="note">现有连接正常；<b>超过 <code>MaxViewStaleness</code> 后拒绝新连接</b></td></tr>
+        <tr><td class="cap">节点磁盘损坏</td><td class="aws">该节点移出成员后重新加入，重新拉快照</td><td class="note">其上连接断开，设备重连到其他节点</td></tr>
+        <tr><td class="cap">新节点加入</td><td class="aws">以 learner 拉快照 + 追日志</td><td class="note"><b>追平前不接受设备连接</b>，避免半空视图误拒或误放</td></tr>
+        <tr><td class="cap">signer 节点全部不可用</td><td class="aws"><span class="no">无法签发新证书</span></td><td class="note"><span class="yes">无影响</span>；吊销仍可进行（不需要私钥）</td></tr>
+      </tbody>
+    </table></div>
+    <p style="margin:16px 0 0"><b>这张表里唯一真正的代价是"丢失多数派时无法吊销"。</b>
+    这是内嵌共识的固有取舍，外部数据库方案同样存在（数据库挂了也写不了），
+    区别只在于故障域从"自己的 3 个节点"变成"别人运维的数据库集群"。</p>
+  </div>
+
+
+</section>
+
+<section class="part" id="defer">
+  <div class="part-head"><span class="part-num">PART I · 边界</span><h2>可以安全延后的部分</h2></div>
+  <p class="part-sub">同样重要的是说清楚什么<b>不</b>必现在做。以下都只是"换实现体"，不改签名、不改数据结构形状，
+  延后到 v0.4 的成本接近于零。把精力花在这些上面是 v0.1 的主要浪费来源。</p>
+  <div class="safe">
+    <h4>延后不产生重构</h4>
+    <ul class="tight">
+      <li><b>共识库选型</b>（dragonboat / etcd-raft / hashicorp-raft / 外置 etcd）—— 藏在 <code>MetaStore.Apply</code> 后面。</li>
+      <li><b>节点发现与成员管理</b>（静态列表 / gossip / Kubernetes API / DNS SRV）—— 独立模块，无上游依赖。</li>
+      <li><b>durable session 的具体后端</b>（本地 WAL / 复制日志 / 外置 NATS、Redis、Kafka、FoundationDB）。</li>
+      <li><b>兴趣传播的具体编码</b>（全量 filter 列表 / bloom / cuckoo 摘要）—— 只要 <code>Match</code> 签名不变。</li>
+      <li><b>跨节点共享订阅的负载均衡算法</b>（随机 / 轮转 / 最少积压 / 粘性）—— <code>Pick</code> 的实现细节。</li>
+      <li><b>再均衡策略</b>（何时用 MQTT5 server redirect 迁移连接）—— 但 <b>0x9C/0x9D 的协议支持本身属于 Day-1</b>。</li>
+      <li><b>多可用区 / 多地域拓扑</b>、跨集群桥接（bridge / MQTT over MQTT）。</li>
+      <li><b>控制台的图表与交互细节</b> —— 只要契约 11、12 的数据面在，前端可以独立迭代。</li>
+    </ul>
+  </div>
+</section>
+
+<section class="part" id="layout">
+  <div class="part-head"><span class="part-num">PART I · 落地</span><h2>包结构与契约的机械保障</h2></div>
+  <p class="part-sub">接口写下来不等于守得住。真正让契约不被侵蚀的是 CI 里的静态检查——
+  人会在赶进度时在 CONNECT 路径上加一发数据库查询，lint 不会。</p>
+<pre>cmd/
+  openiotd/              <i>单一静态二进制：broker + 控制面 + 控制台 + 内嵌 Raft</i>
+  openiotctl/            <i>本地运维 CLI（不替代 aws cli，后者走兼容面）</i>
+internal/
+  mqtt/                  <i>纯协议。零业务依赖，可独立 fuzz 与开源复用</i>
+    packet/              <i>3.1.1 + 5.0 编解码，零分配热路径</i>
+    reason/              <i>reason code 表</i>
+    topic/               <i>校验、trie、通配符匹配、TopicClass 分类（契约 03）</i>
+  session/
+    state.go             <i>SessionState —— 纯数据（契约 04）</i>
+    runtime.go           <i>SessionRuntime —— 持 conn 与 goroutine</i>
+    epoch.go             <i>Epoch 校验（契约 01）</i>
+  router/
+    local.go             <i>本地订阅树</i>
+    interest.go          <i>远端兴趣集</i>
+    route.go             <i>Route() → (local, remote)（契约 02）</i>
+    shared.go retained.go <i>全局状态（契约 10）</i>
+  cluster/
+    ownership.go         <i>SessionOwnership（契约 01）</i>
+    partition.go         <i>Partitioner（契约 06）</i>
+    transport.go         <i>Transport + Admin Query（契约 07）</i>
+    raft/                <i>dragonboat 封装：meta 组、shard 组、成员变更</i>
+    discovery/           <i>静态列表 / DNS SRV / Kubernetes</i>
+  meta/
+    view.go              <i>MetaView —— 无 ctx 无 error（契约 05）</i>
+    log.go model/        <i>复制日志命令 + 领域模型</i>
+  authn/                 <i>mtls · sigv4 · wasm · jitp</i>
+  authz/
+    policy.go            <i>IoT policy 求值 —— 纯函数</i>
+    vars.go              <i>${iot:...} 求值，产出 AuthzEvent.Vars（契约 11）</i>
+  pki/                   <i>ca · issue · revoke · crl · keystore{file,pkcs11,kms}</i>
+  shadow/ jobs/ rules/ provisioning/
+  events/
+    bus.go               <i>EventBus（契约 11）</i>
+    aws.go audit.go      <i>→ $aws/events 保留主题 / 审计落盘</i>
+  quota/                 <i>Limiter：Local vs Global（契约 09）</i>
+  api/
+    awscompat/           <i>/api/aws/*  —— SigV4 + REST-JSON，<em>契约冻结</em></i>
+    admin/               <i>/api/admin/v1/*  —— REST + SSE/WS + RBAC（契约 12）</i>
+      fanout.go          <i>scatter-gather + 跨节点分页游标</i>
+  console/embed.go       <i>go:embed 前端构建产物</i>
+  obs/                   <i>metrics · tracing · logging</i>
+  clock/                 <i>注入时钟（契约 08）</i>
+web/                     <i>控制台前端源码，独立构建后嵌入</i>
+test/
+  conformance/           <i>官方 AWS Device SDK 对照套件 —— 验收门槛</i>
+  interop/               <i>paho / mosquitto / emqtt-bench 互操作</i>
+  fuzz/                  <i>packet 解码 fuzz 语料库</i>
+  cluster/               <i>多节点集成：故障注入、脑裂、滚动升级</i>
+pkg/mqttcodec/           <i>可对外开放的编解码库</i></pre>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">I-7</span><h3>CI 强制的六条规则</h3></div>
+    <p class="sec-note">每条都对应上面一个契约，都可以用 <code>go vet</code> 自定义分析器、
+    <code>depguard</code> 或 <code>forbidigo</code> 机械检查。这是契约不腐化的唯一可靠手段。</p>
+    <div class="tscroll"><table>
+      <thead><tr><th style="width:30%">规则</th><th style="width:14%">守护</th><th>实现方式</th></tr></thead>
+      <tbody>
+        <tr><td class="cap"><code>internal/mqtt/</code> 不得 import 任何其他 internal 包</td>
+          <td class="tier"><span class="chip t-now">协议纯度</span></td>
+          <td class="note"><code>depguard</code>。保证协议层可独立 fuzz、可作为库开源。</td></tr>
+        <tr><td class="cap"><code>SessionState</code> 字段类型白名单</td>
+          <td class="tier"><span class="chip t-now">契约 04</span></td>
+          <td class="note">自定义分析器：禁止 <code>net.Conn</code> / <code>chan</code> / <code>func</code> /
+          <code>sync.*</code> / 指针环。<b>这条是整份清单里最值钱的一条 lint。</b></td></tr>
+        <tr><td class="cap"><code>MetaView</code> 方法签名不得含 <code>ctx</code> 或 <code>error</code></td>
+          <td class="tier"><span class="chip t-now">契约 05</span></td>
+          <td class="note">自定义分析器。在类型层面杜绝"在连接路径上偷偷加 RPC"。</td></tr>
+        <tr><td class="cap">核心包禁止直接调用 <code>time.Now()</code></td>
+          <td class="tier"><span class="chip t-now">契约 08</span></td>
+          <td class="note"><code>forbidigo</code> + 注入时钟。例外需显式注释豁免并说明用途（超时/展示）。</td></tr>
+        <tr><td class="cap"><code>api/awscompat</code> 响应结构变更需 golden diff 审批</td>
+          <td class="tier"><span class="chip t-now">契约 12</span></td>
+          <td class="note">golden 文件 + CI 强制人工确认。防止为了控制台需求污染冻结契约。</td></tr>
+        <tr><td class="cap">单机 CI 必须跑集群代码路径</td>
+          <td class="tier"><span class="chip t-now">原则 01</span></td>
+          <td class="note">默认测试配置即"1 副本 Raft 组"，禁止旁路实现。另设 3 节点集成作业。</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<section class="part">
+  <div class="part-head"><span class="part-num">PART II</span><h2>兼容性矩阵</h2></div>
+  <p class="part-sub">边界必须公开且精确——含糊的兼容性声明会反噬口碑。
+  其中一类值得特别注意：<b>AWS 自身偏离 MQTT 规范的地方</b>。这些点上我们默认遵循规范，
+  并提供 <code>aws_strict</code> 开关退化为 AWS 行为。</p>
+</section>
+
+<div class="legend" role="group" aria-label="按档位筛选">
+  <span class="legend-lab">筛选</span>
+  <button class="fbtn" data-f="all" aria-pressed="true">全部</button>
+  <button class="fbtn" data-f="now" aria-pressed="true">v0.1 必做<span class="n"></span></button>
+  <button class="fbtn" data-f="next" aria-pressed="true">路线图<span class="n"></span></button>
+  <button class="fbtn" data-f="over" aria-pressed="true">超集 / 刻意不同<span class="n"></span></button>
+  <button class="fbtn" data-f="never" aria-pressed="true">不做<span class="n"></span></button>
+</div>
+
+<section class="sec" id="mA">
+  <div class="sec-head"><span class="sec-id">A</span><h3>MQTT 协议层</h3></div>
+  <p class="sec-note">broker 的线路行为。AWS 在此处有若干明确偏离 OASIS 规范之处，逐条标注。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:23%">能力</th><th style="width:30%">AWS IoT Core 行为</th><th style="width:11%">档位</th><th>工程备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">MQTT 3.1.1</td><td class="aws">支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"></td></tr>
+      <tr data-t="now"><td class="cap">MQTT 5.0</td><td class="aws">支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"></td></tr>
+      <tr data-t="now"><td class="cap">跨版本互通</td><td class="aws">3 发布 → 5 订阅，双向</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">属性映射与降级规则需逐条单测，是互通 bug 高发区。</td></tr>
+      <tr data-t="now"><td class="cap">QoS 0 / 1</td><td class="aws">支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"></td></tr>
+      <tr data-t="over"><td class="cap">QoS 2</td><td class="aws"><span class="no">不支持</span>。无 PUBREC/PUBREL/PUBCOMP；请求 QoS 2 时<b>不回</b> PUBACK/SUBACK</td><td class="tier"><span class="chip t-over">超集</span></td><td class="note">我们完整实现。<code>aws_strict</code> 下退化为 AWS 行为（含"静默不回 ACK"这个反直觉表现）。</td></tr>
+      <tr data-t="over"><td class="cap">AUTH 包 / 增强认证</td><td class="aws"><span class="no">不支持</span></td><td class="tier"><span class="chip t-over">超集 v0.3</span></td><td class="note">SCRAM-SHA-256，为无证书场景提供强认证。</td></tr>
+      <tr data-t="over"><td class="cap">Server redirect 0x9C / 0x9D</td><td class="aws"><span class="no">不支持</span></td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note"><b>协议支持属 Day-1</b>：这是集群再均衡与滚动升级唯一优雅的手段。见 I-4。</td></tr>
+      <tr data-t="now"><td class="cap">Retained 消息</td><td class="aws">支持；账户上限 50 万条</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">全局状态，走契约 10 的 <code>RetainedStore</code>。</td></tr>
+      <tr data-t="over"><td class="cap">通配符订阅接收 retained</td><td class="aws"><span class="no">不支持</span>，必须精确匹配主题（<b>偏离规范</b>）</td><td class="tier"><span class="chip t-over">超集</span></td><td class="note">默认按规范投递；<code>aws_strict</code> 关闭。</td></tr>
+      <tr data-t="over"><td class="cap"><code>sensor/#</code> 是否匹配 <code>sensor</code></td><td class="aws"><span class="no">不匹配</span>（<b>明确违反 MQTT 规范</b>——规范要求 <code>#</code> 匹配父层级）</td><td class="tier"><span class="chip t-over">超集</span></td><td class="note">默认按规范匹配。这是最容易让移植方踩坑的差异，<b>必须在文档显著位置说明</b>。</td></tr>
+      <tr data-t="over"><td class="cap">DUP 标志</td><td class="aws"><span class="no">不支持</span>；重投可能换 packet ID 且不置 DUP</td><td class="tier"><span class="chip t-over">超集</span></td><td class="note">我们按规范置 DUP 并保持 packet ID。</td></tr>
+      <tr data-t="now"><td class="cap">LWT + Will Delay Interval</td><td class="aws">支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">集群下遗嘱由会话 owner 节点发出；owner 宕机时由归属 leader 兜底触发。</td></tr>
+      <tr data-t="now"><td class="cap">Clean Start / Session Expiry</td><td class="aws">支持；默认过期 3600s（可调）</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">DISCONNECT 时可修改过期间隔。</td></tr>
+      <tr data-t="now"><td class="cap">Topic Alias</td><td class="aws">支持；默认上限 <span class="num">8</span></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">默认放宽到 <span class="num">16</span>，可配。别名表属会话状态，入 <code>SessionProps</code>。</td></tr>
+      <tr data-t="now"><td class="cap">Message Expiry Interval</td><td class="aws">min 1（0 调为 1），max <span class="num">604800</span>（7 天）</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><b>出站必须递减剩余时间</b>；剩余 ≤999ms 归 0。此细节极易漏，对照测试必覆盖。</td></tr>
+      <tr data-t="now"><td class="cap">Subscription Identifier</td><td class="aws">支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">随投递回传，多订阅命中时需携带多个。</td></tr>
+      <tr data-t="now"><td class="cap">Receive Maximum / 流控</td><td class="aws">入站、出站各 <span class="num">100</span> 条未确认（固定）</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">走 <code>Limiter.AllowLocal</code>。</td></tr>
+      <tr data-t="now"><td class="cap">Maximum Packet Size</td><td class="aws">服务端 <span class="num">146</span> KB；客户端不得低于 <span class="num">512</span> B</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">可配。超限返回对应 reason code 而非静默断开。</td></tr>
+      <tr data-t="now"><td class="cap">User Properties</td><td class="aws">支持；每包总计 ≤ <span class="num">8</span> KB</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">跨版本投递时对 MQTT3 订阅者丢弃。</td></tr>
+      <tr data-t="now"><td class="cap">Request / Response</td><td class="aws">支持；Correlation Data ≤ <span class="num">8</span> KB</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">Response Topic 同样受策略鉴权约束。</td></tr>
+      <tr data-t="now"><td class="cap">Payload Format / Content Type</td><td class="aws">支持；Content Type ≤ <span class="num">256</span> B</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">控制台据此自动格式化 payload 展示。</td></tr>
+      <tr data-t="now"><td class="cap">Retain Handling 0/1/2 · No Local · RAP</td><td class="aws">规范行为</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"></td></tr>
+      <tr data-t="now"><td class="cap">全 ACK 携带 reason code</td><td class="aws">支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">reason code 一并进 <code>ConnEvent</code>（契约 11），供控制台展示。</td></tr>
+      <tr data-t="now"><td class="cap">服务端主动 DISCONNECT + reason</td><td class="aws">支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">踢出、超配额、证书吊销都要给出准确 reason code。</td></tr>
+      <tr data-t="now"><td class="cap">共享订阅 <code>$share/{group}/{filter}</code></td><td class="aws">支持，<b>且 MQTT 3.1.1 也支持</b>（AWS 扩展）；组 100 个，每组 100 订阅者</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">我们同样对 3.1.1 开放。通配符多组各投一份；共享订阅<b>不接收</b> retained。</td></tr>
+      <tr data-t="next"><td class="cap">共享订阅消息排队</td><td class="aws">组内有持久会话时启用；每组上限 50 万；每订阅者 20 条/秒下发</td><td class="tier"><span class="chip t-next">v0.4</span></td><td class="note">依赖持久队列平面。接口在 v0.1（契约 10）。</td></tr>
+      <tr data-t="now"><td class="cap">clientId 抢占</td><td class="aws">后连接者胜，前者被断开</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">集群下由契约 01 的 epoch 围栏保证不双活。</td></tr>
+      <tr data-t="over"><td class="cap">消息顺序</td><td class="aws">不保证消息与 ACK 的顺序</td><td class="tier"><span class="chip t-over">超集</span></td><td class="note">同一发布者到同一主题，单节点内保序；跨节点转发保批内有序。明确声明保证边界。</td></tr>
+      <tr data-t="never"><td class="cap">MQTT over QUIC</td><td class="aws"><span class="no">不支持</span></td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">非标准扩展（EMQX 私有）。节点间传输可用 QUIC，但不对设备开放。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mB">
+  <div class="sec-head"><span class="sec-id">B</span><h3>端点、端口与传输</h3></div>
+  <p class="sec-note">这一节是"官方 SDK 能否不改一行跑通"的决定性因素。ALPN 与 SNI 必须精确对齐。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:27%">端点</th><th style="width:26%">AWS 行为</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">8883 · MQTT + mTLS</td><td class="aws">X.509 客户端证书</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">主路径。</td></tr>
+      <tr data-t="now"><td class="cap">443 · MQTT + mTLS，ALPN <code>x-amzn-mqtt-ca</code></td><td class="aws">X.509 客户端证书</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><b>必做</b>：SDK 在受限网络下的默认路径，缺了等于不兼容。</td></tr>
+      <tr data-t="now"><td class="cap">443 · MQTT over WSS + SigV4</td><td class="aws">SigV4 签名</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">浏览器端与后端应用主要入口。</td></tr>
+      <tr data-t="next"><td class="cap">443 · MQTT + 自定义认证，ALPN <code>mqtt</code></td><td class="aws">Custom authorizer</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">映射到 WASM 授权器。</td></tr>
+      <tr data-t="next"><td class="cap">443 / 8443 · HTTPS 发布</td><td class="aws">仅发布；ALPN <code>x-amzn-http-ca</code> / SigV4 / 自定义认证；支持 <code>?qos=</code></td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note"><code>POST /topics/{topic}</code>。无订阅、无 clientId、无断连检测。</td></tr>
+      <tr data-t="now"><td class="cap">强制 SNI</td><td class="aws">缺 SNI 的连接<span class="no">直接拒绝</span></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">对齐，但提供宽松开关（自建环境常无 SNI）。SNI 是多租户与自定义域名的分流依据。</td></tr>
+      <tr data-t="now"><td class="cap">TLS 1.2 / 1.3</td><td class="aws">两者；可按域名配置 TLS 策略</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">默认 1.2+，可配仅 1.3。默认优先 ECDSA P-256 并开启会话票据——握手是 CPU 墙。</td></tr>
+      <tr data-t="now"><td class="cap">IPv4 + IPv6</td><td class="aws">全部支持</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"></td></tr>
+      <tr data-t="now"><td class="cap">Keep-alive</td><td class="aws">默认 <span class="num">1200</span>s；客户端请求 &lt;30 时提到 <span class="num">30</span></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"></td></tr>
+      <tr data-t="now"><td class="cap">连接时长</td><td class="aws">证书/自定义认证 1–2 周；SigV4 最长 24h；WSS 24h</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">对齐但可配。到期前用 server redirect 优雅迁移而非硬断。</td></tr>
+      <tr data-t="next"><td class="cap">域名配置 / 自定义域名 / 多账号注册</td><td class="aws">靠 SNI 分流</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">映射为"按 SNI 分流的多租户"。</td></tr>
+      <tr data-t="never"><td class="cap">VPC 端点</td><td class="aws">支持</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">AWS 网络设施概念，自建场景无对应物。</td></tr>
+      <tr data-t="over"><td class="cap">握手限速 + 重连抖动退避</td><td class="aws">账户级连接速率配额</td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note">大规模断网恢复时的"重连风暴"是这类系统最常见的雪崩原因。<b>必须内建</b>，不能依赖客户端自觉。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mC">
+  <div class="sec-head"><span class="sec-id">C</span><h3>认证与授权</h3></div>
+  <p class="sec-note">项目的核心差异点：策略在进程内求值，零回调、零网络跳。
+  <code>MetaView</code> 保证这条路径不触网（契约 05），<code>AuthzEvent</code> 保证判定过程可被控制台回放（契约 11）。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:24%">能力</th><th style="width:28%">AWS 行为</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">X.509 客户端证书认证</td><td class="aws">证书 → principal → 策略</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">指纹查本地视图取状态与绑定策略。</td></tr>
+      <tr data-t="now"><td class="cap">IoT Policy 文档</td><td class="aws">JSON；<code>iot:Connect</code> / <code>Publish</code> / <code>Subscribe</code> / <code>Receive</code> / <code>RetainPublish</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">显式 Deny 优先。纯函数求值器，易于全覆盖单测。</td></tr>
+      <tr data-t="now"><td class="cap">策略变量</td><td class="aws"><code>${iot:ClientId}</code>、<code>${iot:Connection.Thing.ThingName}</code>、<code>${iot:Certificate.Subject.CommonName}</code>、<code>${iot:Certificate.Issuer.*}</code> 等</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><b>求值中间结果必须捕获进 <code>AuthzEvent.Vars</code></b>，否则控制台的策略调试器无法实现。</td></tr>
+      <tr data-t="now"><td class="cap">策略附加与版本</td><td class="aws">附加到证书或 Thing；策略多版本，可切默认版本</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">元数据组内，变更即刻广播刷新各节点视图。</td></tr>
+      <tr data-t="now"><td class="cap">Thing 策略变量要求</td><td class="aws">使用 Thing 变量时要求 clientId 等于 thingName</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">易漏的隐含约束，对照测试覆盖。</td></tr>
+      <tr data-t="now"><td class="cap">SigV4 认证</td><td class="aws">IAM 用户 / 角色 / Cognito 联邦</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">实现"本地 IAM-lite"：access key + secret + 策略绑定。<b>不实现完整 IAM</b>，但验签逻辑必须与 AWS 一致，否则 boto3 无法使用。</td></tr>
+      <tr data-t="over"><td class="cap">自定义授权器</td><td class="aws">Lambda 函数（网络回调）</td><td class="tier"><span class="chip t-over">超集 v0.3</span></td><td class="note"><b>替换为 WASM 插件</b>（wazero）：进程内、沙箱、语言无关、无网络跳。这是相对 EMQX webhook 模型的实质优势。</td></tr>
+      <tr data-t="next"><td class="cap">凭证提供方 / 角色别名</td><td class="aws"><code>AssumeRoleWithCertificate</code> → 临时 AWS 凭证</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">签发本地短期 token（可对接 S3 兼容存储），<b>不是</b> AWS STS 凭证。</td></tr>
+      <tr data-t="never"><td class="cap">Cognito 身份授权</td><td class="aws">支持</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">无对应身份池概念。用 SigV4 或 WASM 授权器覆盖。</td></tr>
+      <tr data-t="over"><td class="cap">策略干跑与解释</td><td class="aws"><span class="no">无</span>（只能靠 CloudWatch 事后排查）</td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note">给定 principal + 动作 + 主题，返回判定结果、命中语句下标、变量求值全过程。<b>IoT Core 用户最大的痛点，也是最廉价的差异化。</b></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mD">
+  <div class="sec-head"><span class="sec-id">D</span><h3>证书与 CA 生命周期</h3></div>
+  <p class="sec-note">关键设计决策：<b>吊销不以 CRL / OCSP 为主路径</b>。证书状态存在元数据组内，
+  握手时查本地视图——对 IoT 场景远优于 CRL 分发。CRL / OCSP 仅作为对外兼容输出。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:24%">能力</th><th style="width:28%">AWS 行为</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">内置 CA 签发密钥与证书</td><td class="aws"><code>CreateKeysAndCertificate</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">默认 ECDSA P-256。私钥仅在响应中出现一次。</td></tr>
+      <tr data-t="now"><td class="cap">CSR 签发</td><td class="aws"><code>CreateCertificateFromCsr</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">签发策略约束 CN / SAN / 有效期，防止 CSR 自带任意字段。</td></tr>
+      <tr data-t="now"><td class="cap">证书状态机</td><td class="aws"><code>ACTIVE</code> / <code>INACTIVE</code> / <code>REVOKED</code> / <code>PENDING_ACTIVATION</code> / <code>PENDING_TRANSFER</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><code>PENDING_TRANSFER</code> 不做（跨账户转移无对应概念）。</td></tr>
+      <tr data-t="over"><td class="cap">吊销即时断连</td><td class="aws">状态改为 <code>REVOKED</code> 后，已建立连接<span class="no">不保证立即断开</span></td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note"><b>吊销必须立刻踢掉所有在用该证书的活连接</b>，否则等于没吊销。集群下经事件总线广播到各节点。这是明确做得比 AWS 好的一点。</td></tr>
+      <tr data-t="next"><td class="cap">注册自有 CA</td><td class="aws"><code>RegisterCACertificate</code> + 验证证书证明持有私钥</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">同 subject 的 CA 上限 10 个。</td></tr>
+      <tr data-t="next"><td class="cap">注册设备证书 / 无 CA 注册</td><td class="aws">支持；多账号注册</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">注册速率默认 15/s，可配。</td></tr>
+      <tr data-t="next"><td class="cap">JITP · 首次连接自动注册</td><td class="aws">凭注册过的 CA 自动建 Thing + 附策略</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">模板声明式，无 Lambda。</td></tr>
+      <tr data-t="next"><td class="cap">JITR · 注册事件</td><td class="aws"><code>$aws/events/certificates/registered/{caCertId}</code></td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">配合 <code>PENDING_ACTIVATION</code> 状态。</td></tr>
+      <tr data-t="next"><td class="cap">CRL 导出 / OCSP responder</td><td class="aws">仅 CA 级 CRL 校验</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">对外提供标准 CRL 分发点与 OCSP，供非本平台的消费方使用。</td></tr>
+      <tr data-t="over"><td class="cap">签发 CA 私钥保护</td><td class="aws">AWS 托管，用户不可见</td><td class="tier"><span class="chip t-over">超集 v0.2</span></td><td class="note">可插拔密钥后端：文件 / PKCS#11 (HSM) / 云 KMS。<b>自建场景的刚性需求</b>，AWS 场景下根本不存在。</td></tr>
+      <tr data-t="next"><td class="cap">证书轮换</td><td class="aws">手工流程</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">内建轮换 Job：下发新证书 → 设备确认 → 旧证书置 INACTIVE → 宽限期后吊销。</td></tr>
+      <tr data-t="over"><td class="cap">到期预警与证书清单视图</td><td class="aws"><span class="no">无内建</span></td><td class="tier"><span class="chip t-over">超集 v0.2</span></td><td class="note">控制台展示 CA → 设备证书树、到期时间轴、吊销影响预览（"将断开 N 个在线连接"）。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mE">
+  <div class="sec-head"><span class="sec-id">E</span><h3>设备注册与批量开通</h3></div>
+  <p class="sec-note">CBOR 负载是硬需求——嵌入式 C SDK 走 CBOR，只做 JSON 等于不兼容。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:36%">主题 / 能力</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="next"><td class="cap"><code>$aws/certificates/create/{json|cbor}</code></td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">+ <code>/accepted</code> <code>/rejected</code>。直投请求方，不经消息总线。</td></tr>
+      <tr data-t="next"><td class="cap"><code>$aws/certificates/create-from-csr/{json|cbor}</code></td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">设备自持私钥，推荐路径。</td></tr>
+      <tr data-t="next"><td class="cap"><code>$aws/provisioning-templates/{t}/provision/{json|cbor}</code></td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">模板上限 256 个、每个 10KB、5 个版本。</td></tr>
+      <tr data-t="next"><td class="cap">Claim certificate 开通流程</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">出厂预置声明证书 → 换取设备专属证书。</td></tr>
+      <tr data-t="next"><td class="cap">声明式开通模板</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">资源图 + parameters + mapping，与 AWS 模板语法对齐。</td></tr>
+      <tr data-t="over"><td class="cap">开通前置校验</td><td class="tier"><span class="chip t-over">超集 v0.2</span></td><td class="note">AWS 用 pre-provisioning hook（Lambda）。<b>替换为 CEL 表达式 + WASM 插件</b>，无网络跳。</td></tr>
+      <tr data-t="next"><td class="cap">可信用户 / 单设备开通 API</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">手机 App 代设备开通的场景。</td></tr>
+      <tr data-t="next"><td class="cap">批量注册</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">AWS 从 S3 读输入；改为本地文件 / stdin / S3 兼容存储。</td></tr>
+      <tr data-t="now"><td class="cap">开通速率限制</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">AWS：CreateCertificateFromCsr 20 TPS、CreateKeysAndCertificate 10 TPS、RegisterThing 10 TPS。签发是 CPU 密集，必须限速，走 <code>AllowGlobal</code>。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mF">
+  <div class="sec-head"><span class="sec-id">F</span><h3>Device Shadow</h3></div>
+  <p class="sec-note">语义必须逐字段对齐，这是 SDK 对照测试的重点区域。
+  分区单写者（契约 06）+ Raft log index 派生版本号（I-2 组 2）让并发正确性"免费"获得。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:33%">能力</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">经典（未命名）影子全部主题</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><code>$aws/things/{t}/shadow/...</code></td></tr>
+      <tr data-t="now"><td class="cap">命名影子</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><code>$aws/things/{t}/shadow/name/{n}/...</code>；影子名 ≤ 64B。</td></tr>
+      <tr data-t="now"><td class="cap"><code>get</code> / <code>update</code> / <code>delete</code> + accepted / rejected</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">错误码与消息文本需对齐。</td></tr>
+      <tr data-t="now"><td class="cap"><code>/update/delta</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">desired 与 reported 的差分计算，嵌套对象逐层比对。</td></tr>
+      <tr data-t="now"><td class="cap"><code>/update/documents</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">previous / current 双文档。</td></tr>
+      <tr data-t="now"><td class="cap">version 乐观并发 + 409 冲突</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">版本号取 Raft log index 派生，天然单调且跨 leader 安全。</td></tr>
+      <tr data-t="now"><td class="cap">metadata 逐叶子时间戳</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><b>最容易做错的一处</b>：每个叶子字段各自带 timestamp，结构与 state 同形。</td></tr>
+      <tr data-t="now"><td class="cap">clientToken 回传</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">SDK 依赖它做请求关联。</td></tr>
+      <tr data-t="now"><td class="cap">null 值删除字段语义</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">显式 null 表示删除该键，而非置空。</td></tr>
+      <tr data-t="now"><td class="cap">REST 数据面接口</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><code>GetThingShadow</code> / <code>UpdateThingShadow</code> / <code>DeleteThingShadow</code> / <code>ListNamedShadowsForThing</code>。</td></tr>
+      <tr data-t="now"><td class="cap">配额对齐</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">文档 ≤8KB、JSON 深度 ≤8、每 thing 20 req/s、每 thing 10 条未确认。默认对齐，可配。</td></tr>
+      <tr data-t="over"><td class="cap">版本历史与回放</td><td class="tier"><span class="chip t-over">超集 v0.3</span></td><td class="note">AWS 不保留影子历史。我们保留可配置窗口的版本链，控制台可做三栏 diff 与时间轴回放。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mG">
+  <div class="sec-head"><span class="sec-id">G</span><h3>Jobs 与 OTA</h3></div>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:33%">能力</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="next"><td class="cap">设备侧 MQTT 接口全集</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note"><code>jobs/get</code>、<code>start-next</code>、<code>{jobId}/get</code>、<code>{jobId}/update</code> 各含 accepted/rejected；<code>notify</code>、<code>notify-next</code>。</td></tr>
+      <tr data-t="next"><td class="cap">execution 状态机</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note"><code>QUEUED</code> → <code>IN_PROGRESS</code> → <code>SUCCEEDED</code> / <code>FAILED</code> / <code>TIMED_OUT</code> / <code>REJECTED</code> / <code>REMOVED</code> / <code>CANCELED</code>。分区单写者保证转换串行。</td></tr>
+      <tr data-t="next"><td class="cap">job 文档 + statusDetails + stepTimeout</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note"></td></tr>
+      <tr data-t="next"><td class="cap">持续性 job + Thing Group 目标</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">新设备入组自动纳入。</td></tr>
+      <tr data-t="next"><td class="cap">灰度与中止配置</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">rollout rate（含指数递增）、abort criteria（失败率阈值）、超时配置。</td></tr>
+      <tr data-t="next"><td class="cap">MQTT 文件分发（流）</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note"><code>$aws/things/{t}/streams/{id}/...</code>，OTA 必需。预签名 URL 改为本地 / S3 兼容存储签名。</td></tr>
+      <tr data-t="next"><td class="cap">job 云侧事件</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note"><code>$aws/events/job/*</code> 与 <code>$aws/events/jobExecution/*</code>（共 12 个主题）。</td></tr>
+      <tr data-t="over"><td class="cap">灰度可视化与失败下钻</td><td class="tier"><span class="chip t-over">超集 v0.3</span></td><td class="note">AWS 只给汇总计数。我们做进度曲线 + 按失败原因分布 + 单设备执行日志下钻。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mH">
+  <div class="sec-head"><span class="sec-id">H</span><h3>规则引擎</h3></div>
+  <p class="sec-note">AWS 的 action 清单深度绑定 AWS 生态。我们保留 SQL 语法与替换模板的兼容，
+  但把 action 换成通用 sink + WASM 自定义 sink——<b>这一层不追求 action 级兼容，只追求 SQL 级兼容</b>，
+  并在文档中明确说明。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:30%">能力</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="next"><td class="cap">SQL SELECT / FROM / WHERE</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">主题过滤器作为 FROM，支持通配符。自写解析器（AWS SQL 是子集，不是标准 SQL）。</td></tr>
+      <tr data-t="next"><td class="cap">替换模板 <code>${...}</code></td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">action 参数中的动态求值。</td></tr>
+      <tr data-t="next"><td class="cap">内建函数</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note"><code>topic(n)</code>、<code>clientid()</code>、<code>timestamp()</code>、<code>parse_time</code>、<code>newuuid</code>、<code>get_thing_shadow</code>、<code>encode/decode</code>、JSON / 数学 / 字符串函数族。<code>aws_lambda()</code> 不做。</td></tr>
+      <tr data-t="next"><td class="cap">二进制负载处理</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note"><code>decode(*, 'proto')</code> 等；protobuf 描述符需注册。</td></tr>
+      <tr data-t="next"><td class="cap">Basic Ingest <code>$aws/rules/{ruleName}</code></td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">绕过 pub/sub 直投规则。主题长度限制不含前 3 段。</td></tr>
+      <tr data-t="next"><td class="cap">保留 action：republish</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">与 AWS 行为一致。</td></tr>
+      <tr data-t="over"><td class="cap">通用 sink 集合</td><td class="tier"><span class="chip t-over">超集 v0.3</span></td><td class="note">HTTP/webhook、Kafka、NATS、MQTT 桥接、PostgreSQL / MySQL / SQLite、ClickHouse / TimescaleDB / InfluxDB、Redis、S3 兼容对象存储、本地文件、Prometheus remote write。</td></tr>
+      <tr data-t="over"><td class="cap">WASM 自定义 sink / transform</td><td class="tier"><span class="chip t-over">超集 v0.3</span></td><td class="note">进程内沙箱，取代 Lambda action。</td></tr>
+      <tr data-t="over"><td class="cap">规则调试器</td><td class="tier"><span class="chip t-over">超集 v0.3</span></td><td class="note">粘贴样例 payload → 展示 SQL 求值结果、每个 action 的 dry-run 与渲染后参数。AWS 无此能力。</td></tr>
+      <tr data-t="never"><td class="cap">AWS 生态 action</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">lambda、dynamodb(v2)、kinesis、firehose、sns、sqs、step-functions、timestream、opensearch、cloudwatch、iot-analytics、iot-events、iot-sitewise、salesforce、location。<b>用通用 sink + WASM 覆盖等价场景。</b></td></tr>
+      <tr data-t="never"><td class="cap">VPC action 目标</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">AWS 网络概念。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mI">
+  <div class="sec-head"><span class="sec-id">I</span><h3>设备注册表</h3></div>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:30%">能力</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">Thing CRUD + 属性</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">有 type 时 50 个属性、无 type 时 3 个；属性总计 47KB；名称 ≤128B。</td></tr>
+      <tr data-t="now"><td class="cap">Thing 与 principal 关联</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">一设备多证书、一证书多设备均需支持。</td></tr>
+      <tr data-t="next"><td class="cap">Thing Type</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">含废弃（deprecate）语义。</td></tr>
+      <tr data-t="next"><td class="cap">Thing Group（静态，层级）</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">层级 ≤7、直接子组 ≤100、一个 thing 最多属 10 组。策略可附加到组。</td></tr>
+      <tr data-t="next"><td class="cap">动态 Thing Group</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">依赖检索索引。上限 100 个。</td></tr>
+      <tr data-t="next"><td class="cap">检索索引与查询</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">AWS 的 fleet indexing。<b>控制台的百万级设备列表强依赖此项</b>——必须服务端分页与检索，不能前端过滤。</td></tr>
+      <tr data-t="next"><td class="cap">标签（Tags）</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">用于分组与权限划分。</td></tr>
+      <tr data-t="never"><td class="cap">Billing Group</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">无计费概念。标签可覆盖分组需求。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mJ">
+  <div class="sec-head"><span class="sec-id">J</span><h3>控制面与数据面 API</h3></div>
+  <p class="sec-note">验收标准是 <code>aws</code> CLI 与 <code>boto3</code> 指向本服务后能直接工作。
+  这要求 SigV4 验签、REST-JSON 形状、错误类型名、分页 token 全部对齐——<b>错误形状对不上，SDK 的重试逻辑就会错</b>。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:30%">范围</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">SigV4 请求验签</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">含 canonical request 构造、时钟偏移容忍、签名版本协商。</td></tr>
+      <tr data-t="now"><td class="cap">错误形状对齐</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><code>ResourceNotFoundException</code>、<code>ResourceAlreadyExistsException</code>、<code>InvalidRequestException</code>、<code>ThrottlingException</code>、<code>UnauthorizedException</code>、<code>ServiceUnavailableException</code>、<code>VersionConflictException</code>、<code>LimitExceededException</code>。</td></tr>
+      <tr data-t="now"><td class="cap">分页 <code>nextToken</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">集群下 token 必须编码各节点位置（契约 12）。</td></tr>
+      <tr data-t="now"><td class="cap">Thing / 证书 / 策略 / 附加关系 API</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">约 40 个 action，覆盖 SDK 与 CLI 实际使用的全部路径。</td></tr>
+      <tr data-t="now"><td class="cap"><code>DescribeEndpoint</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">返回本地配置的端点而非 ATS 域名。<code>endpointType</code> 参数需接受但语义本地化。</td></tr>
+      <tr data-t="now"><td class="cap">数据面</td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"><code>Publish</code>、Shadow 四个 action、<code>GetRetainedMessage</code>、<code>ListRetainedMessages</code>。</td></tr>
+      <tr data-t="next"><td class="cap">开通模板 / Jobs / 规则 API</td><td class="tier"><span class="chip t-next">v0.2–0.3</span></td><td class="note">随对应功能上线。</td></tr>
+      <tr data-t="over"><td class="cap">Admin API（<code>/api/admin/v1</code>）</td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note">独立平面，REST + SSE/WS + RBAC。控制台只用它，<b>绝不污染兼容面</b>（契约 12）。</td></tr>
+      <tr data-t="never"><td class="cap">CloudTrail / Resource Groups / 标签计费 API</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">审计走本地结构化审计日志。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mK">
+  <div class="sec-head"><span class="sec-id">K</span><h3>事件与可观测性</h3></div>
+  <p class="sec-note">全部由契约 11 的单一事件总线产出，四个消费者（保留主题、控制台实时流、审计、指标）共用，不重复埋点。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:36%">事件 / 能力</th><th style="width:11%">档位</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap"><code>$aws/events/presence/{connected|disconnected}/{clientId}</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note">含断连原因码。</td></tr>
+      <tr data-t="now"><td class="cap"><code>$aws/events/subscriptions/{subscribed|unsubscribed}/{clientId}</code></td><td class="tier"><span class="chip t-now">v0.1</span></td><td class="note"></td></tr>
+      <tr data-t="next"><td class="cap">注册表事件族</td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note"><code>thing/*</code>、<code>thingType/*</code>、<code>thingGroup/*</code>、<code>thingTypeAssociation/*</code>、<code>thingGroupMembership/*</code>、<code>thingGroupHierarchy/*</code>。</td></tr>
+      <tr data-t="next"><td class="cap"><code>$aws/events/certificates/registered/{caCertId}</code></td><td class="tier"><span class="chip t-next">v0.2</span></td><td class="note">JITR 依赖。</td></tr>
+      <tr data-t="next"><td class="cap">job / jobExecution 事件族</td><td class="tier"><span class="chip t-next">v0.3</span></td><td class="note">12 个主题，需可开关（AWS 默认关闭）。</td></tr>
+      <tr data-t="over"><td class="cap">Prometheus 指标 + OpenTelemetry trace</td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note">连接数、握手耗时分位、路由延迟、转发队列深度、Raft 各组状态、分区健康度。</td></tr>
+      <tr data-t="over"><td class="cap">结构化审计日志</td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note">取代 CloudWatch Logs。JSON 行格式，含完整的授权判定上下文。</td></tr>
+      <tr data-t="over"><td class="cap">单设备连接时间线</td><td class="tier"><span class="chip t-over">超集 v0.1</span></td><td class="note">AWS 只能去 CloudWatch 翻日志。见 Part III。</td></tr>
+      <tr data-t="never"><td class="cap">CloudWatch Metrics / Logs 集成</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">Prometheus + OTel 是自建场景的等价物且更通用。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mL">
+  <div class="sec-head"><span class="sec-id">L</span><h3>明确排除的范围</h3></div>
+  <p class="sec-note">这一节必须出现在 README 第一屏。<b>含糊的兼容性声明会反噬口碑</b>——
+  说清楚不做什么，比多做两个半成品功能更能建立信任。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:28%">AWS 服务 / 能力</th><th style="width:11%">档位</th><th>理由与替代</th></tr></thead>
+    <tbody>
+      <tr data-t="never"><td class="cap">Greengrass（边缘运行时）</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">独立产品量级。本项目的单二进制本身可作为边缘节点部署，是不同的解法。</td></tr>
+      <tr data-t="never"><td class="cap">IoT Analytics / Events / SiteWise / TwinMaker / FleetWise</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">各自是独立产品。通过规则引擎 sink 导出到用户自己的分析栈。</td></tr>
+      <tr data-t="never"><td class="cap">IoT Wireless（LoRaWAN / Sidewalk）</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">需要 LNS 实现与运营商对接，范围不同。</td></tr>
+      <tr data-t="never"><td class="cap">Device Defender（ML 异常检测）</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">但 <code>$aws/things/{t}/defender/metrics/{json|cbor}</code> 的<b>接收端</b>列入 v0.4 待议，指标可转发到用户的检测系统。</td></tr>
+      <tr data-t="never"><td class="cap">Secure Tunneling</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">需要独立的隧道中继服务。<code>tunnels/notify</code> 主题仅保留占位不报错。</td></tr>
+      <tr data-t="never"><td class="cap">Device Location</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">依赖 Wi-Fi / 蜂窝定位数据源授权。</td></tr>
+      <tr data-t="next"><td class="cap">Commands（<code>$aws/commands/...</code>）</td><td class="tier"><span class="chip t-next">v0.4 待议</span></td><td class="note">与 Jobs 功能重叠较多，先观察 SDK 采用度再决定。</td></tr>
+      <tr data-t="never"><td class="cap">Device Advisor / Fleet Hub</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">Fleet Hub 的能力由我们自己的控制台覆盖且更强（Part III）。</td></tr>
+      <tr data-t="never"><td class="cap">SiteWise 资产模型主题</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note"></td></tr>
+      <tr data-t="never"><td class="cap">Cognito / 完整 IAM / STS</td><td class="tier"><span class="chip t-never">不做</span></td><td class="note">SigV4 验签兼容，但身份体系是本地的 IAM-lite。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="sec" id="mM">
+  <div class="sec-head"><span class="sec-id">M</span><h3>配额对齐表</h3></div>
+  <p class="sec-note">默认值与 AWS 对齐以保证行为可预期，但全部可配——自建场景没有理由继承云厂商的商业分层。
+  <b>每项的作用域（本地 / 全局）已按契约 09 标注</b>，这个分类本身就是设计决策。</p>
+  <div class="tscroll"><table>
+    <thead><tr><th style="width:36%">配额</th><th style="width:16%">AWS 默认</th><th style="width:12%">作用域</th><th>我们</th></tr></thead>
+    <tbody>
+      <tr data-t="now"><td class="cap">MQTT 负载大小</td><td class="num">128 KB</td><td class="aws">本地</td><td class="note">对齐，可配</td></tr>
+      <tr data-t="now"><td class="cap">MQTT5 最大包长</td><td class="num">146 KB</td><td class="aws">本地</td><td class="note">对齐，可配</td></tr>
+      <tr data-t="now"><td class="cap">主题长度 / 斜杠数</td><td class="num">256 B / 7</td><td class="aws">本地</td><td class="note">对齐。<code>$share/</code> 的两个斜杠不计入</td></tr>
+      <tr data-t="now"><td class="cap">clientId 长度</td><td class="num">128 B</td><td class="aws">本地</td><td class="note">对齐</td></tr>
+      <tr data-t="now"><td class="cap">每连接发布速率</td><td class="num">100 /s</td><td class="aws">本地</td><td class="note">对齐，可配</td></tr>
+      <tr data-t="now"><td class="cap">每连接吞吐</td><td class="num">512 KB/s</td><td class="aws">本地</td><td class="note">对齐，可配</td></tr>
+      <tr data-t="now"><td class="cap">每连接订阅数</td><td class="num">50</td><td class="aws">本地</td><td class="note">默认放宽到 <span class="num">200</span></td></tr>
+      <tr data-t="now"><td class="cap">单次 SUBSCRIBE 的订阅数</td><td class="num">8</td><td class="aws">本地</td><td class="note">默认放宽</td></tr>
+      <tr data-t="now"><td class="cap">入站 / 出站未确认 QoS 1</td><td class="num">100 / 100</td><td class="aws">本地</td><td class="note">对齐（即 Receive Maximum）</td></tr>
+      <tr data-t="now"><td class="cap">QoS 1 最大重试间隔</td><td class="num">960 s</td><td class="aws">本地</td><td class="note">对齐。MQTT3 总时长 1h / MQTT5 16min</td></tr>
+      <tr data-t="now"><td class="cap">并发连接数</td><td class="num">500,000</td><td class="aws"><b>全局</b></td><td class="note">按节点分摊；单节点规划 <span class="num">10–50</span> 万（TLS 缓冲区是内存墙）</td></tr>
+      <tr data-t="now"><td class="cap">连接请求速率</td><td class="num">3,000 /s</td><td class="aws"><b>全局</b></td><td class="note">分摊 + 握手限速。<b>每 clientId 1/s 固定</b>，防重连风暴</td></tr>
+      <tr data-t="now"><td class="cap">入站 / 出站发布速率</td><td class="num">20,000 /s</td><td class="aws"><b>全局</b></td><td class="note">分摊，近似</td></tr>
+      <tr data-t="now"><td class="cap">订阅总数</td><td class="num">500,000</td><td class="aws"><b>全局</b></td><td class="note">分摊</td></tr>
+      <tr data-t="now"><td class="cap">retained 总数</td><td class="num">500,000</td><td class="aws"><b>全局</b></td><td class="note">走复制存储，精确</td></tr>
+      <tr data-t="now"><td class="cap">retained 发布速率</td><td class="num">500 /s（每主题 1/s）</td><td class="aws"><b>全局</b></td><td class="note">对齐，可配</td></tr>
+      <tr data-t="now"><td class="cap">持久会话过期</td><td class="num">3,600 s</td><td class="aws">本地</td><td class="note">对齐，可配</td></tr>
+      <tr data-t="now"><td class="cap">keep-alive 上限</td><td class="num">1,200 s</td><td class="aws">本地</td><td class="note">对齐</td></tr>
+      <tr data-t="now"><td class="cap">共享订阅：组数 / 每组订阅者</td><td class="num">100 / 100</td><td class="aws"><b>全局</b></td><td class="note">默认放宽</td></tr>
+      <tr data-t="next"><td class="cap">共享订阅组积压上限</td><td class="num">500,000</td><td class="aws"><b>全局</b></td><td class="note">v0.4，依赖持久队列</td></tr>
+      <tr data-t="now"><td class="cap">topic alias 上限</td><td class="num">8</td><td class="aws">本地</td><td class="note">默认 <span class="num">16</span></td></tr>
+      <tr data-t="now"><td class="cap">消息过期上限</td><td class="num">604,800 s</td><td class="aws">本地</td><td class="note">对齐</td></tr>
+      <tr data-t="now"><td class="cap">user properties / correlation data</td><td class="num">8 KB / 8 KB</td><td class="aws">本地</td><td class="note">对齐</td></tr>
+      <tr data-t="now"><td class="cap">content type</td><td class="num">256 B</td><td class="aws">本地</td><td class="note">对齐</td></tr>
+      <tr data-t="now"><td class="cap">Shadow 文档 / 深度 / 影子名</td><td class="num">8 KB / 8 / 64 B</td><td class="aws">本地</td><td class="note">对齐，文档大小可配</td></tr>
+      <tr data-t="now"><td class="cap">Shadow 每 thing 速率 / 未确认</td><td class="num">20 /s · 10</td><td class="aws">本地</td><td class="note">对齐</td></tr>
+      <tr data-t="next"><td class="cap">证书注册速率</td><td class="num">15 /s</td><td class="aws"><b>全局</b></td><td class="note">签发是 CPU 密集，必须限速</td></tr>
+      <tr data-t="next"><td class="cap">开通 API 速率</td><td class="num">10–20 TPS</td><td class="aws"><b>全局</b></td><td class="note">对齐，可配</td></tr>
+      <tr data-t="next"><td class="cap">规则数 / 每规则 action 数</td><td class="num">1,000 / 10</td><td class="aws"><b>全局</b></td><td class="note">默认放宽</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="part" id="console">
+  <div class="part-head"><span class="part-num">PART III</span><h2>管理控制台</h2></div>
+  <p class="part-sub">目标不是"也有一个后台"，而是在几个具体位置明显超过 AWS 控制台。
+  超越的机会分两类：一类是 AWS <b>结构上做不到</b>的（托管服务不暴露节点与集群内部），
+  一类是 AWS <b>做得确实差</b>的（策略调试、断连归因、实时视图）。两类都值得做，但要分清。</p>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">III-1</span><h3>AWS 控制台的实际短板</h3></div>
+    <p class="sec-note">先诚实评估对手，再谈超越。以下是 IoT Core 用户反复抱怨的点。</p>
+    <ul class="tight">
+      <li><b>策略调试几乎不可能。</b>连接被拒只得到一个泛化的授权失败，既不告诉你哪条语句未命中，
+      也不告诉你 <code>${iot:...}</code> 变量求值成了什么。这是 IoT Core 的头号痛点。</li>
+      <li><b>断连原因要去 CloudWatch 翻日志</b>，且原因字符串晦涩、与控制台割裂。</li>
+      <li><b>没有实时视图。</b>看不到当前在线连接列表、看不到实时消息流（内置 MQTT 测试客户端功能很弱）、
+      看不到订阅分布。</li>
+      <li><b>没有节点与集群视图</b>——这是托管服务的本质限制，不是疏忽。自建场景下这恰恰是运维最需要的。</li>
+      <li><b>Shadow 只展示原始 JSON</b>，没有 desired/reported/delta 对照，没有历史。</li>
+      <li><b>Jobs 只给汇总计数</b>，失败分布与单设备下钻需要自己拼 API。</li>
+      <li>导航层级深、批量操作弱、检索要单独开启 fleet indexing、无深色模式。</li>
+    </ul>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">III-2</span><h3>架构约束</h3></div>
+    <p class="sec-note">五条约束，全部由 Part I 的契约决定。先立约束，再谈功能，否则控制台会在集群化时推翻重做。</p>
+    <ul class="tight">
+      <li><b>内嵌，不单独部署。</b>前端产物经 <code>go:embed</code> 打进同一个二进制。
+      零额外进程、零额外依赖——与"单静态二进制"的整体定位一致。支持反向代理子路径与禁用开关（边缘部署常需关闭）。</li>
+      <li><b>只走 Admin 面。</b>控制台的全部请求指向 <code>/api/admin/v1</code>，<b>绝不触碰 AWS 兼容面</b>（契约 12）。
+      这保证了兼容面契约可以冻结，控制台可以快速迭代。</li>
+      <li><b>实时数据走流式。</b>指标与事件用 SSE（单向、可穿透代理、自动重连），
+      MQTT 抓包用 WebSocket（需双向）。轮询只作为降级。数据源是契约 11 的事件总线。</li>
+      <li><b>百万设备列表必须服务端分页与检索。</b>依赖 I 节的检索索引，前端只做虚拟滚动。
+      <b>任何"拉全量到前端过滤"的实现都是错的</b>——这是此类控制台最常见的致命设计缺陷。</li>
+      <li><b>跨节点聚合要能部分失败。</b>scatter-gather 超时的节点在 UI 上标注为"N 个节点未响应"，
+      而不是整个页面报错。运维工具在故障时必须仍然可用——这正是最需要它的时刻。</li>
+    </ul>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">III-3</span><h3>功能规划</h3></div>
+    <p class="sec-note">★ 标记的是明确超越 AWS 的项，也是控制台的差异化重点。</p>
+    <div class="tscroll"><table>
+      <thead><tr><th style="width:19%">模块</th><th style="width:22%">AWS 现状</th><th style="width:10%">档位</th><th>我们做什么</th></tr></thead>
+      <tbody>
+        <tr data-t="over"><td class="cap">★ 策略调试器</td><td class="aws"><span class="no">无</span></td><td class="tier"><span class="chip t-over">v0.1</span></td>
+          <td class="note">输入 principal + 动作 + 主题 → 输出判定结果、命中的策略与语句下标、
+          <b>每个 <code>${iot:...}</code> 变量的求值结果</b>、以及"若要放行需如何修改"。
+          也可对历史的拒绝事件做一键回放。数据来自 <code>AuthzEvent.Vars</code>（契约 11）。</td></tr>
+        <tr data-t="over"><td class="cap">★ 单设备连接时间线</td><td class="aws">需跳转 CloudWatch 翻日志</td><td class="tier"><span class="chip t-over">v0.1</span></td>
+          <td class="note">一条时间轴串起：连接 / 断开（含 reason code 与人类可读原因）、使用的证书与指纹、
+          认证方式、TLS 版本与 ALPN、<b>握手耗时</b>、限流命中、策略拒绝、订阅变更、Shadow 更新、Job 执行。
+          排障从"翻日志"变成"看一屏"。</td></tr>
+        <tr data-t="over"><td class="cap">★ 集群与节点监控</td><td class="aws"><span class="no">结构上没有</span></td><td class="tier"><span class="chip t-over">v0.4</span></td>
+          <td class="note">节点列表与角色、连接数分布、各 Raft 组的 leader 与落后量、
+          分区归属与健康度、节点间转发延迟与队列深度、物化视图版本偏差、
+          一键腾空节点（经 server redirect 优雅迁移）。<b>自建场景的核心价值。</b></td></tr>
+        <tr data-t="over"><td class="cap">★ 实时连接视图</td><td class="aws"><span class="no">无</span></td><td class="tier"><span class="chip t-over">v0.1</span></td>
+          <td class="note">全集群在线连接列表，可按 thing / clientId / 证书 / 节点 / 协议版本 / IP 筛选，
+          实时在线率曲线，单击踢出，查看该连接的订阅与在途消息。</td></tr>
+        <tr data-t="over"><td class="cap">★ MQTT 测试客户端</td><td class="aws">有，但很弱</td><td class="tier"><span class="chip t-over">v0.1</span></td>
+          <td class="note">MQTT 5 全属性（user properties、response topic、correlation data、
+          topic alias、message expiry）、QoS 0/1/2、retained、共享订阅、
+          <b>CBOR / protobuf 自动解码</b>、payload 按 content type 格式化、消息录制与回放。</td></tr>
+        <tr data-t="over"><td class="cap">★ 主题流量抓包</td><td class="aws"><span class="no">无</span></td><td class="tier"><span class="chip t-over">v0.2</span></td>
+          <td class="note">按主题过滤器实时抓取经过 broker 的消息（带采样与速率上限，避免抓包本身压垮节点）。
+          类似 <code>tcpdump</code> 的体验。权限受 RBAC 严格约束。</td></tr>
+        <tr data-t="over"><td class="cap">★ 证书与 CA 管理</td><td class="aws">扁平列表</td><td class="tier"><span class="chip t-over">v0.2</span></td>
+          <td class="note">CA → 设备证书的树形视图、到期时间轴与预警、
+          <b>吊销影响预览</b>（"将立即断开 N 个在线连接，影响 M 个 thing"）、批量吊销、轮换进度。</td></tr>
+        <tr data-t="over"><td class="cap">★ Shadow 视图</td><td class="aws">原始 JSON</td><td class="tier"><span class="chip t-over">v0.2</span></td>
+          <td class="note">desired / reported / delta 三栏对照 diff、逐叶子 metadata 时间戳、
+          版本历史时间轴与回放、就地编辑 desired 并预览将产生的 delta。</td></tr>
+        <tr data-t="over"><td class="cap">★ Jobs / OTA 视图</td><td class="aws">汇总计数</td><td class="tier"><span class="chip t-over">v0.3</span></td>
+          <td class="note">灰度进度曲线、按失败原因的分布与下钻、单设备执行日志、
+          中止条件触发预测、暂停 / 恢复 / 调整速率。</td></tr>
+        <tr data-t="over"><td class="cap">★ 规则调试器</td><td class="aws"><span class="no">无</span></td><td class="tier"><span class="chip t-over">v0.3</span></td>
+          <td class="note">粘贴样例 payload → SQL 求值结果、渲染后的 action 参数、各 action 的 dry-run 结果。
+          规则上线前可验证。</td></tr>
+        <tr data-t="next"><td class="cap">舰队总览</td><td class="aws">基础指标</td><td class="tier"><span class="chip t-next">v0.1</span></td>
+          <td class="note">在线率、连接与消息速率、错误率、授权拒绝 Top N、
+          握手耗时分位、异常设备（频繁重连 / 频繁被限流）排行。<b>异常排行比平均值有用得多。</b></td></tr>
+        <tr data-t="next"><td class="cap">设备（Thing）管理</td><td class="aws">有，导航较深</td><td class="tier"><span class="chip t-next">v0.1</span></td>
+          <td class="note">服务端检索与分页、虚拟滚动、按属性 / 组 / 类型 / 在线状态筛选、批量操作、
+          单设备聚合页（属性 + 证书 + 策略 + 影子 + 作业 + 时间线一屏）。</td></tr>
+        <tr data-t="next"><td class="cap">分组与注册</td><td class="aws">有</td><td class="tier"><span class="chip t-next">v0.2</span></td>
+          <td class="note">组层级树、动态组规则编辑与命中预览、开通模板编辑器（带校验与干跑）。</td></tr>
+        <tr data-t="next"><td class="cap">审计与事件检索</td><td class="aws">CloudTrail / CloudWatch</td><td class="tier"><span class="chip t-next">v0.2</span></td>
+          <td class="note">结构化事件全文与字段检索、保留期可配、导出。</td></tr>
+        <tr data-t="next"><td class="cap">RBAC 与设置</td><td class="aws">IAM</td><td class="tier"><span class="chip t-next">v0.1</span></td>
+          <td class="note">控制台独立的角色模型（<b>不复用 IoT policy</b>——设备策略与运维权限是两件事）。
+          只读 / 运维 / 管理员三档起步，支持 OIDC 接入。</td></tr>
+        <tr data-t="next"><td class="cap">国际化</td><td class="aws">多语言</td><td class="tier"><span class="chip t-next">v0.1</span></td>
+          <td class="note">中英双语从第一天就做。<b>一个面向全球采用的开源项目，事后补 i18n 的代价远高于一开始就做。</b></td></tr>
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">III-4</span><h3>前端技术栈</h3></div>
+    <p class="sec-note">选型标准：产物要小（嵌进二进制）、密集表格与高频时序图要快、不引入重型组件库。</p>
+    <div class="tscroll"><table>
+      <thead><tr><th style="width:22%">关注点</th><th style="width:24%">选择</th><th>理由</th></tr></thead>
+      <tbody>
+        <tr data-t="now"><td class="cap">语言与构建</td><td class="aws">TypeScript + Vite</td><td class="note">构建产物可控，<code>go:embed</code> 友好。</td></tr>
+        <tr data-t="now"><td class="cap">框架</td><td class="aws">React</td><td class="note">生态（尤其表格与虚拟滚动）成熟度决定的务实选择，不是偏好。</td></tr>
+        <tr data-t="now"><td class="cap">数据层</td><td class="aws">TanStack Query</td><td class="note">分页游标、缓存失效、SSE 增量合并都有现成模式。</td></tr>
+        <tr data-t="now"><td class="cap">表格</td><td class="aws">TanStack Table + Virtual</td><td class="note">百万行虚拟滚动 + 服务端分页，这是硬需求（III-2）。</td></tr>
+        <tr data-t="now"><td class="cap">高频时序图</td><td class="aws">uPlot</td><td class="note">体积极小、绘制极快，适合实时指标。重型图表库在这个场景是错的选择。</td></tr>
+        <tr data-t="next"><td class="cap">分析型图表</td><td class="aws">ECharts</td><td class="note">仅在需要的页面按需加载，不进主 bundle。</td></tr>
+        <tr data-t="now"><td class="cap">组件与样式</td><td class="aws">Radix 原语 + 自有样式</td><td class="note">只取无样式的可访问性原语，避免整套设计系统的体积与风格绑定。</td></tr>
+        <tr data-t="now"><td class="cap">主题</td><td class="aws">深浅双主题，token 驱动</td><td class="note">运维人员长时间盯屏，深色模式不是装饰。</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<section class="part" id="gates">
+  <div class="part-head"><span class="part-num">PART IV</span><h2>验收门槛</h2></div>
+  <p class="part-sub">"实现了协议"不是验收标准。<b>官方 AWS Device SDK 的示例不改一行能跑通</b>才是。
+  这套对照测试要在第一周就搭起来——它既是护城河，也是唯一能让人相信兼容性声明的东西。</p>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">IV-1</span><h3>兼容性对照套件</h3></div>
+    <p class="sec-note">同一套官方示例，分别打 AWS 与本服务，diff 行为。差异要么修复，要么登记为已知差异并出现在矩阵里。</p>
+    <ul class="tight">
+      <li><b>设备 SDK</b>：<code>aws-iot-device-sdk-python-v2</code>、<code>-js-v2</code>、<code>-cpp-v2</code>、
+      <code>-java-v2</code>、<code>aws-iot-device-sdk-embedded-C</code>。覆盖 pubsub、shadow（含命名影子）、
+      jobs、fleet provisioning、共享订阅、MQTT5 各示例。<b>embedded-C 必须过</b>——它走 CBOR 且对协议细节最敏感。</li>
+      <li><b>控制面</b>：<code>aws</code> CLI 与 <code>boto3</code> 指向本服务，跑完整的注册 → 签发 → 附策略 → 连接 → 吊销流程。</li>
+      <li><b>协议一致性</b>：OASIS 一致性条款逐条、Paho 互操作测试、与 mosquitto / EMQX 的交叉验证。</li>
+      <li><b>解码器 fuzz</b>：Go 原生 fuzzing 持续跑 <code>internal/mqtt/packet</code>，语料库入库。
+      畸形包处理是这类项目的 CVE 高发区，而 broker 暴露在公网。</li>
+      <li><b>集群正确性</b>：故障注入测试——杀节点、网络分区、时钟跳变、Raft leader 频繁切换下，
+      验证<b>同一 clientId 绝不双活</b>、Shadow 版本绝不回退、离线队列行为符合声明。
+      这类测试 v0.1 就要存在（单副本也能跑出 epoch 校验路径）。</li>
+      <li><b>性能基线</b>：emqtt-bench / mqtt-stresser 可复现脚本 + 硬件规格 + 原始数据公开。
+      <b>不发布无法复现的数字。</b></li>
+    </ul>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">IV-2</span><h3>v0.1 的完成定义</h3></div>
+    <p class="sec-note">范围必须窄且硬。下面这些全绿才叫 v0.1，少一条都不发。</p>
+    <ul class="tight">
+      <li>MQTT 3.1.1 + 5.0 全功能（含 QoS 2 超集），8883 / 443-ALPN / WSS-SigV4 三个端点。</li>
+      <li>内嵌 CA 签发与 CSR 签发；证书状态机；<b>吊销即时断连</b>。</li>
+      <li>IoT Policy 求值含全部策略变量；<b>策略调试器可用</b>。</li>
+      <li>完整 Device Shadow（经典 + 命名，含 metadata 逐叶子时间戳与 409 冲突）。</li>
+      <li>连接与订阅生命周期事件；Prometheus + OTel；结构化审计日志。</li>
+      <li>控制面 ~40 个 action + 数据面全部；<code>aws</code> CLI 与 <code>boto3</code> 可直接使用。</li>
+      <li>控制台：总览、设备、实时连接、MQTT 测试客户端、策略调试器、单设备时间线、RBAC、中英双语。</li>
+      <li><b>十二条 Day-1 契约全部落地，六条 CI 规则全部开启</b>，单机 CI 跑在 1 副本 Raft 组上。</li>
+      <li>官方 SDK 对照套件绿灯，fuzz 持续运行无 crash。</li>
+    </ul>
+  </div>
+
+  <div class="sec">
+    <div class="sec-head"><span class="sec-id">IV-3</span><h3>主要风险</h3></div>
+    <div class="tscroll"><table>
+      <thead><tr><th style="width:20%">风险</th><th style="width:10%">量级</th><th>应对</th></tr></thead>
+      <tbody>
+        <tr data-t="never"><td class="cap">范围爆炸</td><td class="tier"><span class="chip t-never">高</span></td>
+          <td class="note">AWS IoT 是十几个子服务。本矩阵就是应对手段——公开声明 profile，
+          <b>拒绝在 v0.1 做任何标为路线图的东西</b>。</td></tr>
+        <tr data-t="never"><td class="cap">人力与可持续性</td><td class="tier"><span class="chip t-never">高</span></td>
+          <td class="note">到可信的 v1.0 约 2–5 人年。<b>这是本项目最可能的死因，不是技术。</b>
+          要么把 v0.1 砍到极窄并做到无可指摘以吸引贡献者，要么尽早确定组织与资金形式。</td></tr>
+        <tr data-t="next"><td class="cap">控制台拖慢内核</td><td class="tier"><span class="chip t-next">中</span></td>
+          <td class="note">UI 工作量容易失控。约束：契约 11 与 12 的数据面做好后，
+          前端可独立迭代；内核不为 UI 需求让步，更不污染兼容面。</td></tr>
+        <tr data-t="next"><td class="cap">dragonboat 单一维护者</td><td class="tier"><span class="chip t-next">中</span></td>
+          <td class="note">已隔离在 <code>MetaStore</code> / <code>ShardStore</code> 之后，可模块级替换。
+          锁定 Pebble 保持 CGO-free。</td></tr>
+        <tr data-t="next"><td class="cap">法律与命名</td><td class="tier"><span class="chip t-next">中</span></td>
+          <td class="note">API 层面做兼容实现本身没问题（botocore 的 service model 是 Apache-2.0，可用）；
+          <b>不得抄 AWS 文档原文</b>，宣传上使用"AWS IoT Core–compatible API"这类措辞，
+          避免暗示背书。许可建议 Apache-2.0。</td></tr>
+        <tr data-t="next"><td class="cap">性能声明失信</td><td class="tier"><span class="chip t-next">中</span></td>
+          <td class="note">只发布可复现的基准（脚本 + 硬件 + 原始数据）。
+          单节点连接数的真实瓶颈是 TLS 每连接缓冲区，不是 goroutine——不要给出做不到的数字。</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+</div>
+
+<script>
+(function(){
+  var btns = Array.prototype.slice.call(document.querySelectorAll('.fbtn'));
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tr[data-t]'));
+  var tiers = ['now','next','over','never'];
+  var counts = {now:0,next:0,over:0,never:0};
+  rows.forEach(function(r){ var t = r.getAttribute('data-t'); if(counts[t]!==undefined) counts[t]++; });
+  btns.forEach(function(b){
+    var f = b.getAttribute('data-f');
+    var n = b.querySelector('.n');
+    if(n && counts[f]!==undefined) n.textContent = counts[f];
+  });
+  var active = {now:true,next:true,over:true,never:true};
+  function sync(){
+    rows.forEach(function(r){
+      var t = r.getAttribute('data-t');
+      r.classList.toggle('dim', !active[t]);
+    });
+    tiers.forEach(function(t){
+      var b = document.querySelector('.fbtn[data-f="'+t+'"]');
+      if(b) b.setAttribute('aria-pressed', active[t] ? 'true' : 'false');
+    });
+    var all = tiers.every(function(t){ return active[t]; });
+    var ab = document.querySelector('.fbtn[data-f="all"]');
+    if(ab) ab.setAttribute('aria-pressed', all ? 'true' : 'false');
+  }
+  btns.forEach(function(b){
+    b.addEventListener('click', function(){
+      var f = b.getAttribute('data-f');
+      if(f === 'all'){
+        var all = tiers.every(function(t){ return active[t]; });
+        tiers.forEach(function(t){ active[t] = all ? false : true; });
+        if(all) active.now = true;
+      } else {
+        var only = active[f] && tiers.every(function(t){ return t === f || !active[t]; });
+        var allOn = tiers.every(function(t){ return active[t]; });
+        if(allOn){ tiers.forEach(function(t){ active[t] = (t === f); }); }
+        else if(only){ tiers.forEach(function(t){ active[t] = true; }); }
+        else { active[f] = !active[f]; }
+      }
+      sync();
+    });
+  });
+  sync();
+})();
+</script>

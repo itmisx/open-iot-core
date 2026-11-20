@@ -1,0 +1,8 @@
+{
+  "name": "openiotd-console-e2e",
+  "private": true,
+  "description": "控制台的浏览器端到端检查。独立于 web/console 的依赖树（PRD LANG-019）：playwright 只在这里出现，不进控制台的 package.json，也不进 make gate。",
+  "devDependencies": {
+    "playwright": "1.49.1"
+  }
+}

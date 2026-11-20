@@ -1,0 +1,23 @@
+# 只给 compose 的 init 服务用。它唯一的作用是定下**设备侧服务端证书的
+# SAN**——这件事只能经配置文件的 pki.server_hosts 给，没有等价的命令行
+# 开关，而 init 不挂配置时取的是默认值（只有 localhost 与 127.0.0.1）。
+#
+# 为什么不把 node-a.yaml 挂给 init：那份配置里 node.mode 是 bootstrap，
+# 而 bootstrap 要求数据目录为空（CLU-031），于是第二次
+# `docker compose up -d` 会以「身份冲突」失败——`--if-needed` 只吞
+# 「PKI 已存在」，吞不了这一条。所以单放这一份，它不带 node 段。
+#
+# 这张表只在 init 的那一次用上：服务端证书签完就定死，之后改它**不会
+# 重签**（要改得重新初始化，等于换掉整条信任链）。node-*.yaml 里因此
+# 不再写 server_hosts——那边写了也不生效，两处都写只会悄悄漂移。
+pki:
+  enabled: true
+  server_hosts:
+    - localhost
+    - 127.0.0.1
+    # compose 的服务名：设备在同一个网络里按 node-b:8883 连时用它。
+    # 少了这三条，容器内的设备握手会报主机名不匹配，而 TLS 握手失败
+    # 既没有指标也没有日志（见根 README 的「已知边界」）。
+    - node-a
+    - node-b
+    - node-c

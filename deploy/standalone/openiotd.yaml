@@ -1,0 +1,42 @@
+# 单机容器的配置。
+#
+# 与 examples/openiotd.yaml 的差别只在容器相关的三处：监听地址绑
+# 0.0.0.0、数据目录指向卷、管理面显式确认对外暴露。其余保持默认。
+node:
+  mode: standalone
+  data_dir: /var/lib/openiotd
+
+listeners:
+  # 设备侧：双向 TLS。服务端证书由 init 时的 pki.server_hosts 决定，
+  # 容器里必须绑 0.0.0.0，否则端口映射进来也连不上。
+  mqtt_tls:
+    enabled: true
+    addr: 0.0.0.0:8883
+    require_client_cert: true
+
+  # 管理面与控制台。
+  #
+  # 绑非回环地址必须把 acknowledge_public_exposure 设成 true
+  # （配置校验会拦）：这个端点能吊销证书、踢连接、改策略，
+  # 暴露出去必须是一个有意识的决定。容器里没有"回环"可言——
+  # 端口一映射就是对外的，所以请在它前面放反向代理或只绑到
+  # 127.0.0.1 的宿主端口（见 README 的「别把 9090 直接挂公网」）。
+  admin:
+    enabled: true
+    addr: 0.0.0.0:9090
+    acknowledge_public_exposure: true
+
+pki:
+  enabled: true
+  # 设备用什么名字连这个 broker，这里就要写什么。
+  #
+  # 服务端证书在 init 时一次签出，SAN 来自这张表；之后改这里不会
+  # 重签。写漏了的表现是设备握手时报主机名不匹配，而 broker 日志
+  # 上只看到一次失败的握手。
+  server_hosts:
+    - localhost
+    - 127.0.0.1
+
+log:
+  level: info
+  format: json

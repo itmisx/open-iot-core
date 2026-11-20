@@ -1,0 +1,15 @@
+# 滚动升级或节点排空时，最多只许一个 Pod 同时不可用。
+#
+# 三个节点的多数派是 2：同时下掉两个就失去多数派，写入全部返回 503
+# （读取仍然正常，CLU-042 的取舍）。没有这条，一次 `kubectl drain`
+# 就可能一口气带走两个。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: openiotd
+  namespace: open-iot-core
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: openiotd

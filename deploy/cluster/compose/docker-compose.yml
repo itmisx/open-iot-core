@@ -1,0 +1,126 @@
+# 三节点集群。
+#
+# 三个是最小的有意义规模：多数派为 2，掉一个节点仍可写。两个节点的
+# 多数派也是 2，掉一个就写不了，不比单机强。四个节点的多数派是 3，
+# 容错数与三个相同——扩容到偶数不提高可用性。
+#
+# 起之前先跑一次 ./gen-certs.sh 生成复制链。
+#
+# 这不是生产清单，缺的是：三个节点都在同一台机器上（真实部署要跨故障
+# 域）、管理面直接暴露端口（生产请放在反向代理后面并限制来源）、数据卷
+# 里的 CA 私钥与 access key secret 都是明文（AUTH-092，生产请在卷一层
+# 加密）。
+
+name: open-iot-core
+
+x-node: &node
+  image: ${OPENIOTD_IMAGE:-ghcr.io/itmisx/open-iot-core:latest}
+  restart: unless-stopped
+  healthcheck:
+    # /readyz 在未就绪时返回 503，wget 会以非零退出——正好是健康检查
+    # 要的语义。用 busybox 自带的 wget 而不是装 curl：为了一条探活就
+    # 给每个生产节点多装一个包不划算。
+    #
+    # 探 /readyz 而不是 /healthz：后者只回答"进程还活着吗"，而一个
+    # 监听还没起来的节点在它那里也是 ok 的。
+    test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9090/readyz"]
+    interval: 10s
+    timeout: 3s
+    retries: 6
+    start_period: 20s
+
+services:
+  # 一次性初始化：建数据目录、CA、管理面令牌，再把设备 CA 分发给
+  # 另外两个节点。
+  #
+  # 单列一个服务而不是让 serve 自动初始化，是跟着 CLU-055 来的：
+  # serve 遇到未初始化的目录必须明确报错。一个会自动建空集群的 serve，
+  # 在 data_dir 写错时的症状是"所有设备认证失败"，真因完全看不出来。
+  init:
+    <<: *node
+    restart: "no"
+    healthcheck:
+      disable: true
+    volumes:
+      - data-a:/var/lib/openiotd
+      - data-b:/var/lib/node-b
+      - data-c:/var/lib/node-c
+      # 只含 pki.server_hosts 的一份配置：服务端证书的 SAN 只在 init
+      # 这一次签出，而它只能经配置文件给。理由见 init-pki.yaml 的注释。
+      - ./init-pki.yaml:/etc/openiotd/init-pki.yaml:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        # --if-needed：已经做过的部分跳过，所以 `up` 可以反复跑。
+        # 不自己写 `if [ -f manifest.json ]` 那种守卫：它判的是身份文件
+        # 在不在就跳过**全部**步骤，于是一个只建到一半的目录永远补不齐。
+        openiotd init --data-dir /var/lib/openiotd --node-id node-a \
+          --config /etc/openiotd/init-pki.yaml --if-needed
+        # 三个节点必须共用同一套设备 CA：设备证书由任一节点签发，
+        # 而它可能连到任意一个节点上——CA 不同则 mTLS 直接握手失败。
+        # 真实部署里这一步是"把同一份 CA 分发到各节点"。
+        # 脚本里的变量一律写成 $$name：compose 会先对整段做一次插值，
+        # 单个 $$ 开头的变量会被它替换成空串（连这行注释也会）。
+        # 这两次 init 不必给 --config：它们生成的 pki 紧接着就被
+        # node-a 的那份覆盖，SAN 以 node-a 签出的为准。
+        for peer in node-b node-c; do
+          openiotd init --data-dir "/var/lib/$$peer" --node-id "$$peer" --if-needed
+          rm -rf "/var/lib/$$peer/pki"
+          cp -R /var/lib/openiotd/pki "/var/lib/$$peer/pki"
+          # 管理面令牌也统一，省得三个节点三个令牌
+          cp /var/lib/openiotd/admin-token "/var/lib/$$peer/admin-token"
+        done
+        echo "初始化完成"
+
+  node-a:
+    <<: *node
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - data-a:/var/lib/openiotd
+      - ./pki:/etc/openiotd/pki:ro
+      - ./node-a.yaml:/etc/openiotd/openiotd.yaml:ro
+    command: ["serve", "--config", "/etc/openiotd/openiotd.yaml"]
+    ports:
+      # 只绑到宿主的回环地址。要对外提供服务，请在前面放一层
+      # 反向代理或负载均衡，而不是把这里改成 0.0.0.0。
+      #
+      # 端口可改：8883 很容易已经被本机的 `make demo` 或另一个 broker
+      # 占着，而 compose 报的是 "address already in use"，不会告诉你
+      # 占用者是谁。
+      - "127.0.0.1:${MQTT_PORT_A:-8883}:8883"
+      - "127.0.0.1:${ADMIN_PORT_A:-9090}:9090"
+
+  node-b:
+    <<: *node
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - data-b:/var/lib/openiotd
+      - ./pki:/etc/openiotd/pki:ro
+      - ./node-b.yaml:/etc/openiotd/openiotd.yaml:ro
+    command: ["serve", "--config", "/etc/openiotd/openiotd.yaml"]
+    ports:
+      - "127.0.0.1:${MQTT_PORT_B:-8884}:8883"
+      - "127.0.0.1:${ADMIN_PORT_B:-9091}:9090"
+
+  node-c:
+    <<: *node
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - data-c:/var/lib/openiotd
+      - ./pki:/etc/openiotd/pki:ro
+      - ./node-c.yaml:/etc/openiotd/openiotd.yaml:ro
+    command: ["serve", "--config", "/etc/openiotd/openiotd.yaml"]
+    ports:
+      - "127.0.0.1:${MQTT_PORT_C:-8885}:8883"
+      - "127.0.0.1:${ADMIN_PORT_C:-9092}:9090"
+
+volumes:
+  data-a:
+  data-b:
+  data-c:

@@ -1,0 +1,205 @@
+# StatefulSet，不是 Deployment。
+#
+# 三条理由，缺一条都不行：
+#   1. 节点身份要稳定——节点 ID 写在数据目录的 manifest.json 里，
+#      复制证书的 CommonName 必须等于它；
+#   2. 每个节点要独占一份持久卷（raft 日志、元数据、CA 私钥）；
+#   3. DNS 名要稳定，复制组照着 peers 里的名字拨号。
+#
+# 副本数固定 3。不要配 HPA：多数派是 len(members)/2+1，节点数随负载
+# 上下跳意味着多数派跟着跳，而**扩容到偶数不提高容错**——三节点和四
+# 节点都只能掉一个。真要加节点，走 Admin API 的成员变更（见 README）。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openiotd
+  namespace: open-iot-core
+spec:
+  serviceName: openiotd-peers
+  replicas: 3
+  podManagementPolicy: Parallel # 选举需要大家同时在场，逐个起会卡在第一个
+  selector:
+    matchLabels:
+      app: openiotd
+  template:
+    metadata:
+      labels:
+        app: openiotd
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001 # 让挂进来的 PVC 归容器里的非 root 用户
+      # 三个副本尽量分散到不同节点：三个 Pod 落在同一台机器上时，
+      # 这台机器一挂就直接失去多数派，集群的意义就没了。
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: openiotd
+              topologyKey: kubernetes.io/hostname
+
+      initContainers:
+        # 数据目录第一次使用时初始化。
+        #
+        # 单列一步而不是让 serve 自动初始化，跟着 CLU-055：serve 遇到
+        # 未初始化的目录必须明确报错。这里放进 initContainer 是安全的，
+        # 因为目录是 PVC 明确挂进来的，不存在"路径打错"那种情形。
+        - name: init
+          image: ghcr.io/itmisx/open-iot-core:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              # --if-needed：initContainer 每次起 Pod 都会跑一遍，
+              # 已经做过的部分跳过。不自己写 `if [ -f manifest.json ]`
+              # 那种守卫：它判的是身份文件在不在就跳过**全部**步骤，
+              # 于是一个只建到一半的目录永远补不齐，而下一次启动看起来
+              # 是正常跳过的。
+              openiotd init --data-dir /var/lib/openiotd --node-id "$POD_NAME" --if-needed
+              # 三个节点必须共用同一套**设备** CA：设备证书由任一节点
+              # 签发，而它可能连到任意一个 Pod——CA 不同则 mTLS 直接
+              # 握手失败。所以用预先建好的那一份覆盖 init 生成的。
+              # 这份 Secret 由 prepare.sh 生成，见 README 的「部署」。
+              rm -rf /var/lib/openiotd/pki
+              mkdir -p /var/lib/openiotd/pki
+              cp -L /etc/openiotd/device-ca/* /var/lib/openiotd/pki/
+              chmod 600 /var/lib/openiotd/pki/issuing-ca.key /var/lib/openiotd/pki/server.key
+              # 管理面令牌也统一，否则三个 Pod 三个令牌
+              cp -L /etc/openiotd/admin/admin-token /var/lib/openiotd/admin-token
+              chmod 600 /var/lib/openiotd/admin-token
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/openiotd
+            - name: device-ca
+              mountPath: /etc/openiotd/device-ca
+              readOnly: true
+            - name: admin-token
+              mountPath: /etc/openiotd/admin
+              readOnly: true
+
+      containers:
+        - name: openiotd
+          # 清单里写的是 latest，便于试跑。**生产请钉具体版本**：
+          # latest 配 IfNotPresent 既不会自动更新，又让"这三个 Pod 跑的
+          # 是哪一版"取决于各节点上碰巧缓存了什么。升级方式见 README。
+          # 这两处镜像不认 OPENIOTD_IMAGE（那个变量只对三份 docker
+          # 清单与 prepare.sh 的临时容器有效），要换就改清单或用
+          # `kubectl set image`。
+          image: ghcr.io/itmisx/open-iot-core:latest
+          imagePullPolicy: IfNotPresent
+          # mode 按 Pod 序号算：0 号发起选举，其余 join。
+          #
+          # 只有第一次启动时它才有意义（之后以落盘的 raft 状态为准），
+          # 但 0 号被重建时仍要能起来：服务端据冷层里有没有 applied index
+          # 判断这是不是"第一次起这个集群"，不是看 mode 写的什么
+          # （见 startReplication；2026-11-20 实测补的，见那里的说明）。
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              ORDINAL="${POD_NAME##*-}"
+              if [ "$ORDINAL" = "0" ]; then
+                export OPENIOTD_MODE=bootstrap
+              else
+                export OPENIOTD_MODE=join
+                export OPENIOTD_SEEDS="openiotd-0.openiotd-peers:7946"
+              fi
+              export OPENIOTD_NODE_ID="$POD_NAME"
+              exec openiotd serve --config /etc/openiotd/openiotd.yaml
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: mqtt-tls
+              containerPort: 8883
+            - name: admin
+              containerPort: 9090
+            - name: repl
+              containerPort: 7946
+          # /readyz 未就绪时返回 503，正是探针要的语义。
+          # /healthz 只回答"进程还活着吗"，拿它做 readiness 会把一个
+          # 监听还没起来的 Pod 放进 Service。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 6
+          # 启动探针给选举留时间：冷启动时三个 Pod 要互相等到多数派。
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 24
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/openiotd
+            - name: config
+              mountPath: /etc/openiotd/openiotd.yaml
+              subPath: openiotd.yaml
+              readOnly: true
+            # 每个 Pod 只挂**自己**那张复制证书。
+            #
+            # subPathExpr 支持环境变量展开，于是一个 Secret 装三套证书，
+            # 每个 Pod 按自己的名字取。没有它就只能给每个副本单独写一份
+            # 清单，而那正是 StatefulSet 要避免的事。
+            - name: repl-tls
+              mountPath: /etc/openiotd/repl/tls.crt
+              subPathExpr: $(POD_NAME).crt
+              readOnly: true
+            - name: repl-tls
+              mountPath: /etc/openiotd/repl/tls.key
+              subPathExpr: $(POD_NAME).key
+              readOnly: true
+            - name: repl-tls
+              mountPath: /etc/openiotd/repl/ca.crt
+              subPath: ca.crt
+              readOnly: true
+
+      volumes:
+        - name: config
+          configMap:
+            name: openiotd-config
+        - name: repl-tls
+          secret:
+            secretName: openiotd-repl-tls
+            defaultMode: 0400
+        - name: device-ca
+          secret:
+            secretName: openiotd-device-ca
+            defaultMode: 0400
+        - name: admin-token
+          secret:
+            secretName: openiotd-admin-token
+            defaultMode: 0400
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # raft 日志、元数据、审计日志与事件日志都在这里。
+            # 按设备数与事件量调整；这不是能随手扩的东西，宁可一开始给多。
+            storage: 10Gi

@@ -1,0 +1,5 @@
+# 真实设备 SDK，不是我们自己拼的客户端——这套测试的全部价值就在这里。
+awsiotsdk==1.31.0
+# QoS 2、遗嘱、持久会话：AWS IoT Core 不支持 QoS 2，它的 SDK 因此不开放；
+# 这几项是 open-iot-core 的超集行为，用通用客户端验证。
+paho-mqtt==2.1.0

@@ -1,0 +1,48 @@
+# 构建产物
+/openiotd
+/openiotctl
+/dist/
+/bin/
+
+# 教程示例的构建产物与跑出来的材料。
+#
+# out/ 里是**真私钥**（示例会签一张设备证书）。它和 deploy 的 pki/ 同一条
+# 理由：离被 git add -A 顺手带进历史只差一步，而私钥进了历史就只能换掉
+# 整条信任链。
+/examples/sdk/golang/golang
+/examples/sdk/*/out/
+/examples/sdk/java/target/
+/examples/sdk/python/venv/
+
+# 测试产物
+coverage.out
+coverage.out.strict
+coverage.html
+
+# 运行时数据目录
+/data/
+
+# 前端构建产物（按 UI-039，预构建产物另行入库）
+/web/node_modules/
+/web/dist/
+/web/console/node_modules/
+/web/console/dist/
+
+# 浏览器 e2e 的依赖树（playwright 与 Chromium 不入库，见 tests/console-e2e/README.md）
+/tests/console-e2e/node_modules/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+.demo/
+
+# 部署示例生成的 TLS 材料。
+#
+# gen-certs.sh 产出的是**真私钥**。它在仓库目录里，离被 git add -A
+# 顺手带进历史只差一步，而私钥一旦进了历史就只能换掉整条信任链。
+/deploy/cluster/compose/pki/
+/deploy/cluster/k8s/pki/
+
+# demo
+.demo

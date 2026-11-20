@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 02:00 CST。推到 main 也会跑；没有这条 cron，仓库闲着时夜间任务不会启动。
+    - cron: '0 18 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  # 合并门禁：对应 docs/prd/19-testing.md 的 TST-070 至 TST-076
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+      - name: 格式
+        run: make fmt-check
+      - name: vet
+        run: make vet
+      - name: 架构契约检查
+        run: make contract
+      - name: 竞态检测下的测试
+        run: make test-race
+      - name: 覆盖率门槛
+        run: make cover-check
+      - name: 交叉编译
+        run: make cross
+      - name: 短时 fuzz
+        run: make fuzz-short
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+      - name: 依赖漏洞扫描
+        run: make vuln
+
+  # 夜间随机种子的确定性模拟（TST-034）。
+  #
+  # 门禁跑固定种子集，这里跑随机的：失败时日志里有可直接重放的命令，
+  # 把那个种子加进 defaultSimSeeds 就变成一条永久回归。
+  simulation-nightly:
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+      - name: 随机种子模拟
+        run: make sim SIM_SEEDS=200 SIM_OPS=5000
+
+  # 夜间长时 fuzz：失败语料会作为构件保留，便于入库
+  fuzz-nightly:
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+      - name: 长时 fuzz
+        run: make fuzz-long FUZZTIME=5m
+      - name: 保留失败语料
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: |
+            internal/mqtt/packet/testdata/fuzz/
+            internal/mqtt/topic/testdata/fuzz/
+            internal/authz/testdata/fuzz/
+            internal/shadow/testdata/fuzz/

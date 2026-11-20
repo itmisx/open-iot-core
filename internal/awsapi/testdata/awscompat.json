@@ -1,0 +1,197 @@
+[
+  {
+    "name": "DescribeEndpoint",
+    "status": 200,
+    "body": {
+      "endpointAddress": "127.0.0.1:8883"
+    }
+  },
+  {
+    "name": "CreateThing",
+    "status": 200,
+    "body": {
+      "attributes": {
+        "site": "a"
+      },
+      "thingArn": "arn:aws:iot:local:000000000000:thing/lamp",
+      "thingName": "lamp",
+      "version": 1
+    }
+  },
+  {
+    "name": "DescribeThing",
+    "status": 200,
+    "body": {
+      "attributes": {
+        "site": "a"
+      },
+      "thingArn": "arn:aws:iot:local:000000000000:thing/lamp",
+      "thingName": "lamp",
+      "version": 1
+    }
+  },
+  {
+    "name": "ListThings",
+    "status": 200,
+    "body": {
+      "things": [
+        {
+          "attributes": {
+            "site": "a"
+          },
+          "thingArn": "arn:aws:iot:local:000000000000:thing/lamp",
+          "thingName": "lamp",
+          "version": 1
+        }
+      ]
+    }
+  },
+  {
+    "name": "CreateThingDuplicate",
+    "status": 409,
+    "errorType": "ResourceAlreadyExistsException",
+    "body": {
+      "__type": "ResourceAlreadyExistsException",
+      "message": "资源已存在"
+    }
+  },
+  {
+    "name": "DescribeThingMissing",
+    "status": 404,
+    "errorType": "ResourceNotFoundException",
+    "body": {
+      "__type": "ResourceNotFoundException",
+      "message": "资源不存在"
+    }
+  },
+  {
+    "name": "CreateThingTypeRejected",
+    "status": 400,
+    "errorType": "InvalidRequestException",
+    "body": {
+      "__type": "InvalidRequestException",
+      "message": "不支持 Thing Type"
+    }
+  },
+  {
+    "name": "CreatePolicy",
+    "status": 200,
+    "body": {
+      "policyArn": "arn:aws:iot:local:000000000000:policy/allow",
+      "policyDocument": "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iot:*\",\"Resource\":\"*\"}]}",
+      "policyName": "allow",
+      "policyVersionId": "1"
+    }
+  },
+  {
+    "name": "GetPolicy",
+    "status": 200,
+    "body": {
+      "defaultVersionId": "1",
+      "policyArn": "arn:aws:iot:local:000000000000:policy/allow",
+      "policyDocument": "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iot:*\",\"Resource\":\"*\"}]}",
+      "policyName": "allow"
+    }
+  },
+  {
+    "name": "ListPolicies",
+    "status": 200,
+    "body": {
+      "policies": [
+        {
+          "policyArn": "arn:aws:iot:local:000000000000:policy/allow",
+          "policyName": "allow"
+        }
+      ]
+    }
+  },
+  {
+    "name": "CreatePolicyBad",
+    "status": 400,
+    "errorType": "InvalidRequestException",
+    "body": {
+      "__type": "InvalidRequestException",
+      "message": "registry: 策略文档无法编译: 策略 bad 编译失败: authz: 策略文档解析失败: unexpected EOF"
+    }
+  },
+  {
+    "name": "GetIndexing",
+    "status": 200,
+    "body": {
+      "thingIndexingConfiguration": {
+        "thingConnectivityIndexingMode": "OFF",
+        "thingIndexingMode": "OFF"
+      }
+    }
+  },
+  {
+    "name": "SearchOff",
+    "status": 400,
+    "errorType": "InvalidRequestException",
+    "body": {
+      "__type": "InvalidRequestException",
+      "message": "registry: 检索未开启"
+    }
+  },
+  {
+    "name": "UpdateIndexing",
+    "status": 200
+  },
+  {
+    "name": "SearchThing",
+    "status": 200,
+    "body": {
+      "things": [
+        {
+          "attributes": {
+            "site": "a"
+          },
+          "thingId": "lamp",
+          "thingName": "lamp"
+        }
+      ]
+    }
+  },
+  {
+    "name": "CreateRoleAlias",
+    "status": 200,
+    "body": {
+      "creationDate": "2023-11-14T22:13:20Z",
+      "credentialDurationSeconds": 3600,
+      "lastModifiedDate": "2023-11-14T22:13:20Z",
+      "roleAlias": "ops",
+      "roleArn": "arn:aws:iam::000000000000:role/ops"
+    }
+  },
+  {
+    "name": "RoleAliasCredentials",
+    "status": 503,
+    "errorType": "ServiceUnavailableException",
+    "body": {
+      "__type": "ServiceUnavailableException",
+      "message": "本节点不签发云临时凭证"
+    }
+  },
+  {
+    "name": "GetShadowDisabled",
+    "status": 503,
+    "errorType": "ServiceUnavailableException",
+    "body": {
+      "__type": "ServiceUnavailableException",
+      "message": "影子服务未启用"
+    }
+  },
+  {
+    "name": "Publish",
+    "status": 200
+  },
+  {
+    "name": "GetRetainedDisabled",
+    "status": 503,
+    "errorType": "ServiceUnavailableException",
+    "body": {
+      "__type": "ServiceUnavailableException",
+      "message": "保留消息未启用"
+    }
+  }
+]

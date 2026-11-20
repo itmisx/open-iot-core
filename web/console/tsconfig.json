@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    // vite/client 带来 import.meta.glob 的类型。教程正文是 docs/tutorial/
+    // 下的 markdown，由 glob 以 ?raw 取入（UI-078）——没有这一行，
+    // import.meta.glob 在类型检查里是未知属性。
+    "types": ["vite/client"],
+    "noEmit": true
+  },
+  "include": ["src"]
+}

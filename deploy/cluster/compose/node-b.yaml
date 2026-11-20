@@ -1,0 +1,58 @@
+# 节点 b 的配置。三份只有 node.id、mode、seeds 与复制证书路径不同（复制
+# 监听地址三份相同：它是容器内的 0.0.0.0:7946）。
+node:
+  # 节点 ID 必须与复制证书的 CommonName 一致（CLU-069）。
+  id: node-b
+
+  mode: join
+  data_dir: /var/lib/openiotd
+  seeds: ["node-a:7946"]
+cluster:
+  # voters 是**初始**投票者数，要与 replication.peers 的条数一致。
+  # 成员变更之后以复制日志为准，这份配置不用跟着改（CLU-090）。
+  voters: 3
+  max_view_staleness: 10s
+  replication:
+    addr: "0.0.0.0:7946"
+    cert_file: /etc/openiotd/pki/node-b.pem
+    key_file: /etc/openiotd/pki/node-b.key
+    ca_file: /etc/openiotd/pki/ca.pem
+    pump_interval: 200ms
+    # 初始成员。拨号用的名字就是 compose 的服务名；复制层不按主机名
+    # 校验对端，身份按证书的 CommonName 认（CLU-069、CLU-102），
+    # 所以 gen-certs.sh 不为拨号用的名字另签 SAN（CLU-103）。
+    peers:
+      node-a: "node-a:7946"
+      node-b: "node-b:7946"
+      node-c: "node-c:7946"
+    # 副本号：共识库按 uint64 认成员，而本项目的身份是字符串节点 ID
+    # （与证书 CommonName 绑死，CLU-069）。显式写出来，不从 ID 推导——
+    # 撞号的表现是日志复制错乱，而日志里看不出跟节点 ID 有关系。
+    #
+    # 三个节点的这张表必须**完全一致**，而且与 peers 的键集合相同。
+    replicas:
+      node-a: 1
+      node-b: 2
+      node-c: 3
+
+listeners:
+  mqtt_tls:
+    enabled: true
+    addr: 0.0.0.0:8883
+    require_client_cert: true
+  admin:
+    enabled: true
+    addr: 0.0.0.0:9090
+    acknowledge_public_exposure: true
+
+pki:
+  enabled: true
+  # 这里刻意**不写** server_hosts：那张表只在 init 签服务端证书的那一次
+  # 起作用，serve 从不重签，写在这儿不生效（写了也只是个看着生效的装饰，
+  # 而设备握手失败既没有指标也没有日志）。它在 init-pki.yaml 里，由
+  # compose 的 init 服务挂给 `openiotd init`——设备 CA 与服务端证书由
+  # node-a 一次性签出，再分发给另外两个节点。
+
+log:
+  level: info
+  format: json

@@ -1,0 +1,16 @@
+# 构建上下文里只需要源码。把这些排除掉，`docker build` 不必把
+# 几十兆的依赖树和演示数据传给守护进程。
+.demo/
+.git/
+.github/
+coverage.out
+coverage.out.strict
+coverage.html
+openiotd
+openiotctl
+data/
+web/console/node_modules/
+web/console/dist/
+tests/console-e2e/node_modules/
+docs/
+.DS_Store

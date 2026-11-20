@@ -1,0 +1,54 @@
+# 单节点 docker compose。掉了就停服——要高可用看 ../../cluster/。
+#
+# 与 ../docker/ 的裸命令是同一个部署，区别只在谁来记住这串参数。
+# 共通的事（server_hosts、为什么只绑回环、为什么探 /readyz、
+# OPENIOTD_AUTO_INIT 的代价）在 ../../README.md，这里不复制一遍：
+# 复制出来的三份会各自漂移。
+#
+# 只有一个服务，所以也没有 x-node 那样的 YAML 锚点：锚点是给「两处要
+# 一模一样」用的，一处就直接写。
+
+name: openiotd
+
+services:
+  openiotd:
+    image: ${OPENIOTD_IMAGE:-ghcr.io/itmisx/open-iot-core:latest}
+    restart: unless-stopped
+    environment:
+      # 入口脚本在 serve 之前补一次 `init --if-needed`（NFR-105），
+      # 于是这份清单不再需要一个一次性的 init 服务与 depends_on。
+      #
+      # 它**不比原先那个 init 服务更危险**：那个服务也是每次 up 都无条件
+      # 跑一遍 `init --if-needed`，所以「数据卷是空的就静默初始化出一个
+      # 空节点」这件事两种写法完全一样。CLU-055 禁止的是 **serve** 自己
+      # 去做，而这两种写法都是编排在做。
+      #
+      # 换掉的是另外两件小事，知道就行：init 的输出现在混在节点日志里
+      # （原先 `docker compose logs init` 是单独一份），以及 init 失败时
+      # 这个容器会按 restart 策略不断重试，而不是像一次性服务那样干净地
+      # 失败一次、把 openiotd 拦在 depends_on 上。
+      OPENIOTD_AUTO_INIT: "1"
+    command: ["serve", "--config", "/etc/openiotd/openiotd.yaml"]
+    volumes:
+      - data:/var/lib/openiotd
+      # 配置在 standalone/ 根下，两种单机方式共用一份，避免改了一处忘了另一处。
+      - ../openiotd.yaml:/etc/openiotd/openiotd.yaml:ro
+    ports:
+      # 只绑宿主回环。改成 0.0.0.0 等于把能吊销证书、踢连接、改策略的
+      # 管理面挂上公网——要对外请放反向代理（../../README.md）。
+      # 换端口：MQTT_PORT=18883 ADMIN_PORT=19090 docker compose up -d
+      - "127.0.0.1:${MQTT_PORT:-8883}:8883"
+      - "127.0.0.1:${ADMIN_PORT:-9090}:9090"
+    healthcheck:
+      # 用 busybox 自带的 wget 而不是装 curl——为一条探活给镜像多装一个
+      # 包不划算。timeout 必须短于 interval，否则探测会互相重叠。
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9090/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  # 具名卷，不是 bind mount：里面有 CA 私钥、元数据与审计日志。
+  # 删掉它等于已签发的全部设备证书作废，而且找不回来。
+  data:

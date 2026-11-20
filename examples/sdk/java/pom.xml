@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  教程「SDK 接入 / Java」那一页的示例工程（UI-080）。
+
+  独立于仓库的 Go module：主 module 只有 bbolt 与 yaml/v3 两个直接依赖
+  （LANG-019），教程的代价不该由运行时来付。
+
+  跑法：
+    OIOT_ENDPOINT=http://127.0.0.1:9090/api/aws \
+    AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+    mvn -q compile exec:java
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.openiotcore</groupId>
+  <artifactId>openiot-sdk-example</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <aws.sdk.version>2.29.0</aws.sdk.version>
+  </properties>
+
+  <!-- tutorial:begin deps -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${aws.sdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- 控制面：建设备、签证书、改策略 -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>iot</artifactId>
+    </dependency>
+    <!-- 数据面：发布、读写影子。签名服务名是 iotdata（API-110） -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>iotdataplane</artifactId>
+    </dependency>
+  </dependencies>
+  <!-- tutorial:end deps -->
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.1.0</version>
+        <configuration>
+          <mainClass>io.openiotcore.example.Main</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -1,0 +1,159 @@
+# 打 tag 时发布：先过一遍门禁，再推多架构镜像与各平台二进制。
+#
+# 门禁放在发布前面而不是只依赖 main 上那次：tag 可能打在任意提交上，
+# 也可能是从分支上切出来的。发一个没过门禁的版本，比晚发几分钟糟得多。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 手动触发用于演练：只构建不推送，验证 Dockerfile 还能用。
+  workflow_dispatch:
+
+permissions:
+  contents: write # 创建 Release 并上传二进制
+  packages: write # 推 ghcr.io
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+      - name: 合并门禁
+        run: make gate
+
+  image:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU 用来在 amd64 runner 上产出 arm64 层。
+      #
+      # 二进制是交叉编译出来的（Go 自带，不需要模拟器），QEMU 只用于
+      # 执行 arm64 基础镜像里的 apk——那几条命令很短，开销可以接受。
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr.io
+        if: github.event_name != 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 标签策略：
+      #   v1.2.3 -> 1.2.3、1.2、latest
+      # 只给正式版打 latest；带后缀的预发布（v1.2.3-rc1）不动 latest，
+      # 否则 `:latest` 会在某一天悄悄变成一个预发布版本。
+      - name: 推导镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 冒烟测试：镜像推完了才发现它起不来，是最难堪的一种发布。
+      # 这里把单机路径跑一遍——init、serve、/readyz。
+      - name: 冒烟测试
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          set -eux
+          IMG="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+          docker run --rm -v smoke:/var/lib/openiotd \
+            "$IMG" init
+          # 管理面绑非回环地址要在配置里显式确认（没有等价的命令行
+          # 开关，这是有意的：把它做成一个随手可加的 flag，就等于
+          # 没有这道门）。走的正是 deploy/standalone 里那份配置的路径。
+          docker run -d --name smoke -v smoke:/var/lib/openiotd \
+            -v "$PWD/deploy/standalone/openiotd.yaml:/etc/openiotd/openiotd.yaml:ro" \
+            -p 127.0.0.1:9090:9090 "$IMG" \
+            serve --config /etc/openiotd/openiotd.yaml
+          for _ in $(seq 30); do
+            curl -sf http://127.0.0.1:9090/readyz >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9090/readyz
+          docker logs smoke
+          docker rm -f smoke
+
+          # 再跑一遍单条命令那条路径（OPENIOTD_AUTO_INIT=1，NFR-105）。
+          # 它与上面不是同一条代码路径：入口脚本在 serve 之前补一次
+          # init，而入口脚本只在镜像里存在——TST-154 用桩验的是它的
+          # 分支，验不了"真镜像里 chmod 对不对、PATH 上找不找得到
+          # openiotd"。另起一个卷，否则它只会命中 --if-needed 的跳过
+          # 分支，等于什么都没验。
+          docker volume rm -f smoke-auto || true
+          docker run -d --name smoke-auto -e OPENIOTD_AUTO_INIT=1 \
+            -v smoke-auto:/var/lib/openiotd \
+            -v "$PWD/deploy/standalone/openiotd.yaml:/etc/openiotd/openiotd.yaml:ro" \
+            -p 127.0.0.1:9091:9090 "$IMG" \
+            serve --config /etc/openiotd/openiotd.yaml
+          for _ in $(seq 30); do
+            curl -sf http://127.0.0.1:9091/readyz >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9091/readyz
+          # 这一行是判据：PKI 是**这一次**生成的。不匹配「数据目录已
+          # 初始化」——那句在跳过分支里也会打，于是一个残留的卷会让这
+          # 一步照样通过（上面的 volume rm 就是为它兜的底）。
+          docker logs smoke-auto 2>&1 | grep -q "PKI 已生成"
+          docker rm -f smoke-auto
+
+  binaries:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      # 单二进制是这个项目的卖点之一（控制台也在里面），所以 Release
+      # 页上要能直接下到。CGO_ENABLED=0 保证它在任何同架构的发行版上
+      # 都能跑，不依赖目标机的 libc 版本。
+      - name: 交叉编译
+        run: |
+          set -eux
+          mkdir -p dist
+          for t in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
+            os=${t%/*}; arch=${t#*/}
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+              go build -trimpath -ldflags="-s -w" \
+              -o "dist/openiotd-$os-$arch" ./cmd/openiotd
+          done
+          cd dist && sha256sum openiotd-* > SHA256SUMS
+
+      - name: 创建 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/openiotd-*
+            dist/SHA256SUMS
+          generate_release_notes: true

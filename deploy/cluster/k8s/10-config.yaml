@@ -1,0 +1,73 @@
+# 三个节点共用一份配置。
+#
+# 每个 Pod 不同的只有两样：节点 ID 与 bootstrap/join。两者都由环境变量
+# 给（OPENIOTD_NODE_ID / OPENIOTD_MODE），在 StatefulSet 的启动命令里按
+# Pod 序号算出来——配置文件本身不做模板替换，省掉一层 Helm/kustomize。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openiotd-config
+  namespace: open-iot-core
+data:
+  openiotd.yaml: |
+    node:
+      # id 与 mode 由环境变量提供，这里留空。
+      data_dir: /var/lib/openiotd
+
+    cluster:
+      # 初始投票者数，与下面 peers 的条数一致。
+      # 成员变更之后以复制日志为准，这份配置不用跟着改（CLU-090）。
+      voters: 3
+      max_view_staleness: 10s
+      replication:
+        addr: "0.0.0.0:7946"
+        # 每个 Pod 挂进来的是**自己**那张证书，路径固定。
+        # 证书的 CommonName 必须等于节点 ID（CLU-069），
+        # 这由 StatefulSet 的 subPathExpr 保证（见 30-statefulset.yaml）。
+        cert_file: /etc/openiotd/repl/tls.crt
+        key_file: /etc/openiotd/repl/tls.key
+        ca_file: /etc/openiotd/repl/ca.crt
+        pump_interval: 200ms
+        # 初始成员用 headless Service 给出的稳定 DNS 名。
+        # 这是 StatefulSet 而不是 Deployment 的原因之一：Pod 名字和
+        # DNS 名必须稳定，否则重建一个 Pod 就等于换了一个节点身份。
+        peers:
+          openiotd-0: "openiotd-0.openiotd-peers:7946"
+          openiotd-1: "openiotd-1.openiotd-peers:7946"
+          openiotd-2: "openiotd-2.openiotd-peers:7946"
+        # 副本号：共识库按 uint64 认成员，而本项目的身份是字符串节点 ID
+        # （与证书 CommonName 绑死，CLU-069）。显式写出来，不从 ID 推导。
+        #
+        # 扩容时新 Pod 的号要接着往后排，并在调成员接口时一起给出
+        # （POST /cluster/members 的 replicaId）——leader 无从知道它。
+        replicas:
+          openiotd-0: 1
+          openiotd-1: 2
+          openiotd-2: 3
+
+    listeners:
+      mqtt_tls:
+        enabled: true
+        addr: 0.0.0.0:8883
+        require_client_cert: true
+      admin:
+        enabled: true
+        addr: 0.0.0.0:9090
+        # 容器里没有"回环"可言，端口一暴露就是对外的。
+        # 这个端点能吊销证书、踢连接、改策略——请只经 NetworkPolicy
+        # 允许的来源访问，不要给它配 Ingress。
+        acknowledge_public_exposure: true
+
+    pki:
+      enabled: true
+      # 这里刻意**不写** server_hosts：k8s 下设备 CA 与服务端证书来自
+      # Secret openiotd-device-ca，initContainer 会用它覆盖 init 自己
+      # 生成的那一份，SAN 在 prepare.sh 跑那次 init 时就定死了。
+      #
+      # 所以要加对外域名改的是 prepare.sh 的 EXTRA_HOSTS（见 README
+      # 的「部署」），不是这里：这张表在本清单里**不生效**，而漏了
+      # 域名的表现是设备握手报主机名不匹配，既没有指标也没有日志。
+
+    log:
+      level: info
+      format: json

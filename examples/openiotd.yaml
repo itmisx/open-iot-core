@@ -1,0 +1,227 @@
+# openiotd 配置示例
+#
+# 这份文件由 `openiotd config print` 生成，内容即全部默认值。
+# 优先级：默认值 < 本文件 < 环境变量 < 命令行 flags。
+#
+# 未知字段会导致启动失败而不是被忽略——配置键打错字若被静默忽略，
+# 一个本想开启 require_client_cert 的部署会在无人察觉的情况下关闭它。
+#
+# 没有 CA 口令这一项（AUTH-092 整条去掉了）：签发 CA 私钥与 access key 的
+# secret 都明文落在数据目录里，保护只有 0700 的目录权限与 0600 的文件权限。
+# 旧配置里的 pki.passphrase_file 现在会被拒绝；要静态加密请在卷那一层做。
+#
+# 所以本文件与 `openiotd config print` 有**一处刻意的差异**：那条命令仍会
+# 打印 `pki.passphrase_file: ""`（字段留在结构里，为的是「配了就拒」而不是
+# 静默忽略），而这份示例不列它——列出来等于邀请人去填。对齐时请保留这处
+# 差异，不要把它当成漂移补回来。
+node:
+  id: ""
+  mode: standalone
+  role:
+    - broker
+    - signer
+  data_dir: ./data
+  advertise_addr: ""
+  mesh_addr: ""
+  seeds: []
+cluster:
+  shard_count: 64
+  voters: 3
+  max_view_staleness: 0s
+  replication:
+    addr: ""
+    peers: {}
+    # 节点 ID 到副本号的映射，键集合须与 peers 完全相同。
+    # 显式配置，不从节点 ID 哈希推导——撞号的症状是日志复制错乱，
+    # 而日志里看不出跟节点 ID 有关系。加成员时要把新节点的副本号
+    # 一起给（POST /cluster/members 的 replicaId）。
+    replicas: {}
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+    pump_interval: 0s
+    # 会话分区组的 raft 日志条数，0 表示默认 8，上限 64（CLU-111）。
+    #
+    # 一经初始化不得更改：分片号参与「哪个分片拥有哪些会话」的判定，
+    # 改了之后既有会话会被算到别的分片上，而那条日志里没有它们。
+    #
+    # 它不是上面的 shard_count——那个是路由用的虚拟分区数（默认 64），
+    # 这个是真实的 raft 日志条数。
+    session_shards: 0
+meta:
+  backend: embedded
+view:
+  resync_interval: 30s
+listeners:
+  mqtt_tls:
+    enabled: true
+    addr: 0.0.0.0:8883
+    require_client_cert: true
+    alpn: []
+    min_tls_version: "1.2"
+    require_sni: false
+    handshake_timeout: 10s
+    cert_file: ""
+    key_file: ""
+    client_ca_file: ""
+  mqtt_alpn:
+    enabled: false
+    addr: 0.0.0.0:443
+    require_client_cert: true
+    alpn:
+      - x-amzn-mqtt-ca
+    min_tls_version: "1.2"
+    require_sni: false
+    handshake_timeout: 10s
+    cert_file: ""
+    key_file: ""
+    client_ca_file: ""
+  mqtt_plain:
+    enabled: false
+    addr: 127.0.0.1:1883
+  mqtt_wss:
+    enabled: false
+    addr: 0.0.0.0:443
+    region: ""
+    keys_file: ""
+    max_connection: 24h0m0s
+    redirect_to: ""
+    min_tls_version: "1.2"
+    require_sni: false
+    handshake_timeout: 10s
+    cert_file: ""
+    key_file: ""
+  admin:
+    enabled: true
+    addr: 127.0.0.1:9090
+    auth_token_file: ""
+    acknowledge_public_exposure: false
+    acknowledge_plaintext_key_export: false
+# 接入层运行参数（MQTT-118 至 MQTT-121）。全部留 0 即取默认值。
+broker:
+  # 0 = 按 CPU 核数自适应（GOMAXPROCS × 2，下限 8）。
+  writer_workers: 0
+  outbound_buffer: 0
+  read_buffer: 0
+  max_write_batch: 0
+  write_timeout: 0s
+# 配额按名字覆盖，名字取自 docs/prd/17-quotas.md，0 表示取消该项限制。
+# 名字打错会被拒绝启动，并在错误里列出全部可用名字（QTA-109）。
+quota: {}
+pki:
+  enabled: true
+  root_cert_file: ""
+  issuing_cert_file: ""
+  issuing_key_file: ""
+  default_validity: 2160h0m0s
+  max_validity: 9528h0m0s
+  server_hosts:
+    - localhost
+    - 127.0.0.1
+iot:
+  partition: aws
+  region: local
+  account: "000000000000"
+console:
+  enabled: true
+  base_path: /
+auth:
+  mode: cert
+  acknowledge_insecure: false
+log:
+  level: info
+  format: json
+aws_api:
+  enabled: false
+  region: ""
+  keys_file: ""
+  endpoint_address: ""
+otel:
+  enabled: false
+  endpoint: ""
+  service_name: open-iot-core
+
+# ---------------------------------------------------------------------------
+# 集群（v0.4 阶段 B：元数据复制）
+#
+# node.mode 取 bootstrap 或 join 时，元数据（设备、证书、策略、属性槽位）
+# 经下面这个复制组复制；standalone 写了 cluster.replication 会被拒
+# （CLU-070：那份配置看起来像集群而进程其实是单机）。
+#
+# 消息面、影子与 Admin 扇出都跨节点了：设备连 A 上发布、订阅者在 B 上
+# 能收到；同一 clientId 连到另一个节点会把旧连接挤掉（最终一致，
+# CLU-081）；加减节点走 Admin API 不必重启（CLU-090）。
+#
+# 还差的：跨节点的共享订阅组、零窗口的严格 epoch 栅栏。
+#
+# 三节点的最小配置（每个节点一份，改 node.id 与 replication.addr）：
+#
+# node:
+#   id: a                  # 必填，且复制证书的 CommonName 必须等于它
+#   mode: bootstrap        # 第一个节点发起选举；其余写 join 并给 seeds
+#   data_dir: /var/lib/openiotd
+# cluster:
+#   voters: 3              # 初始投票者数，要与 peers 的条数一致
+#   max_view_staleness: 10s
+#   replication:
+#     addr: "10.0.0.1:7946"
+#     cert_file: /etc/openiotd/repl/a.pem   # CommonName=a；拨号侧不校验 SAN（CLU-102）
+#     key_file: /etc/openiotd/repl/a.key
+#     ca_file: /etc/openiotd/repl/ca.pem    # 与设备 CA 无关的独立信任链
+#     pump_interval: 200ms
+#     peers:               # **初始**成员，须含本节点自己。成员变更之后
+#                          # 以复制日志为准，这份不用跟着改（CLU-090）
+#       a: "10.0.0.1:7946"
+#       b: "10.0.0.2:7946"
+#       c: "10.0.0.3:7946"
+#
+# 可跑的完整例子见 tests/cluster/run.sh（make cluster-test）。
+#
+# 加一个节点：新节点的 peers 只写自己（mode: join、seeds 指向现有节点），
+# 起来之后在**任一节点**上
+#   curl -H "Authorization: Bearer $TOKEN" -X POST \
+#     -d '{"id":"d","addr":"10.0.0.4:7946"}' \
+#     http://10.0.0.1:8080/api/admin/v1/cluster/members
+# 它的地址随成员变更复制给其余节点，不必改别人的配置文件。
+# 移除：DELETE .../cluster/members/d。
+# 当前成员与多数派所需票数：GET .../cluster/members（OBS-147）。
+#
+# 注意多数派的分母会跟着变：三节点能掉一个，四节点**还是**只能掉一个
+# （多数派 3）。扩容到四台不提高容错，要容错两台得五台。
+
+# ---------------------------------------------------------------------------
+# access key（SigV4）
+#
+# 两种钥匙，来源不同，别混。
+#
+# 设备钥匙（AUTH-076）—— listeners.mqtt_wss.keys_file。一把钥匙代表一台
+# 设备，权限来自这台设备已附加的 IoT Policy，所以没有 role：
+#
+#   [{"id":"AKIA...","secret":"...","thing":"lamp-001"}]
+#
+# 它仍是节点本地的一份文件，启动时读一次，改完要重启；集群下每个节点
+# 各有一份。连接路径上不许有磁盘 IO（AUTH-010），所以这份没跟着下面那
+# 批一起搬进复制层。
+#
+# 控制面钥匙（AUTH-086）—— 给 boto3、aws CLI 用，打 /api/aws。
+# **没有配置项**：它存在复制的元数据里，经管理面发放：
+#
+#   curl -X POST -H "Authorization: Bearer $(cat <数据目录>/admin-token)" \
+#     -H 'Content-Type: application/json' -d '{"role":"operator","note":"CI"}' \
+#     http://127.0.0.1:8080/api/admin/v1/awskeys
+#
+# 响应里的 secret 只出现这一次。控制台的「访问控制」页是同一套动作。
+# 旧配置里的 aws_api.keys_file 会在启动时被拒——静默忽略的话，那份文件
+# 里的钥匙一把都不生效，而现象只是全部 401。
+#
+# 角色与控制台的三个角色同名同义（AUTH-078、AUTH-081）：
+#   reader    只能读
+#   operator  日常写：建删设备、签发与吊销证书、改策略、发布、写影子
+#   admin     还能动信任根：注册自有 CA、发凭证
+# 级别不够是 403 AccessDeniedException，与签名不对的 401
+# UnauthorizedException 是两回事——前者换钥匙，后者查密钥和时钟。
+#
+# secret 明文存在复制的元数据里（AUTH-092）。SigV4 是 HMAC，验签要拿到
+# 原文，所以它存不了哈希；而加密要一个口令，口令又要穿过四种部署方式送进
+# 容器——去掉它换的是部署的简单。后果写清楚：记录进 raft 日志、快照与
+# 备份，一份备份泄露等于全部钥匙泄露，处置是删掉重发。
