@@ -195,4 +195,5 @@ Principal 列举用 `nextToken` / `maxResults`。`x-amzn-principal` 携带证书
 | API-126 | `PATCH /awskeys/{id}` 只改停用状态，请求体必须显式给出 `disabled`。缺字段要报 400 而不是当成 `false`：一次漏字段的请求会把刚停掉的钥匙重新放出来。`DELETE /awskeys/{id}` 删掉一把，删不存在的是 404。两者都写审计（动作名 `EnableAWSKey`、`DisableAWSKey`、`DeleteAWSKey`，目标是 id），审计里不得出现密钥材料。 | v0.1 |
 | API-127 | 这组端点只给 `admin`。列表本身不含密钥材料，但它说出了有哪些钥匙、各是什么角色、谁还没过期——那是一张攻击面地图；而发一把 `admin` 的 access key 等于把整个控制面交出去，不该由 `operator` 做。（AUTH-092 之前这里还有一句「口令缺失导致发不出钥匙时返回 503」，口令去掉之后任何节点都发得出钥匙，那条分支与它的 503 一并移除。） | v0.1 |
 | API-128 | `GET /api/admin/v1/cluster/members` 的响应须给出当前 `leader`（节点 ID）。原先它只列成员与多数派票数，看不出"现在谁在接写入"——而那是故障时第一个要知道的事，也是运维判断"写入失败是因为没有 leader 还是因为没有多数派"的唯一依据。单机返回本节点自己。这个字段随选举变化，不是配置；集群验收的杀 leader 用例（TST-147）也靠它查出要杀谁。 | v0.1 |
+| API-129 | `GET /overview` 的 `quotas` 须返回全部生效配额，不得过滤统计值全为零的定义。配额从启动时就已存在；按命中情况过滤会把“尚未统计”错误呈现为“没有这项配置”。`allowed`、`rejected` 与 `current` 保留数值零，由控制台区分尚未统计与统计后的零值。 | v0.1 |
 

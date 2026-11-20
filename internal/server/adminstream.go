@@ -363,11 +363,8 @@ func (a *adminServer) handleOverview(w http.ResponseWriter, _ *http.Request) {
 		Events: eventStats{Emitted: map[string]uint64{}},
 	}
 	for _, st := range s.lim.Stats() {
-		// 只回传被用过的配额：三十多项里多数在一个部署里从不触发，
-		// 全列出来会把真正在动的那几项埋掉。
-		if st.Allowed == 0 && st.Rejected == 0 && st.Current == 0 {
-			continue
-		}
+		// 配额定义从启动时就全部生效，不能因尚无流量而从管理面消失。
+		// 否则控制台会把“统计值为零”呈现成“没有这项配置”（API-129）。
 		out.Quotas = append(out.Quotas, quotaStat{
 			Name: st.Name, Scope: scopeName(st.Scope), Kind: kindName(st.Kind),
 			Limit: s.lim.Limit(st.ID), Allowed: st.Allowed,

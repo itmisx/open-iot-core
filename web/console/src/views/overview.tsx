@@ -123,10 +123,11 @@ function OverviewBody({ d, t }: { d: Overview; t: T }) {
 }
 
 /**
- * QuotaTable 按拒绝数降序排。
+ * QuotaTable 按拒绝数降序排，尚未产生统计的定义留在表内。
  *
  * 异常排行比平均值有用（UI-020）：运维要的是"哪一项正在被打满"，
- * 而按名字排序会把它埋在三十多项里。
+ * 而按名字排序会把它埋在三十多项里。未统计不等于零：零表示检查过但
+ * 没有拒绝，破折号表示这项自启动以来尚未走到（UI-085）。
  */
 function QuotaTable({ rows, t }: { rows: QuotaStat[]; t: T }) {
   const sorted = [...rows].sort((a, b) => b.rejected - a.rejected || b.allowed - a.allowed)
@@ -144,28 +145,35 @@ function QuotaTable({ rows, t }: { rows: QuotaStat[]; t: T }) {
           </tr>
         </thead>
         <tbody>
-          {sorted.map((q) => (
-            <tr key={q.name}>
-              <td className="mono" title={q.prdRef ? `PRD ${q.prdRef}` : undefined}>
-                {q.name}
-              </td>
-              <td>
-                <Badge tone={q.scope === 'global' ? 'info' : 'muted'}>{q.scope}</Badge>
-              </td>
-              <td className="num">{q.limit === 0 ? '∞' : fmtNum(q.limit)}</td>
-              <td className="num">{fmtNum(q.allowed)}</td>
-              <td className="num">
-                {q.rejected > 0 ? (
-                  <span style={{ color: 'var(--danger)', fontWeight: 600 }}>
-                    {fmtNum(q.rejected)}
-                  </span>
-                ) : (
-                  '0'
-                )}
-              </td>
-              <td className="num">{q.kind === 'count' ? fmtNum(q.current) : '—'}</td>
-            </tr>
-          ))}
+          {sorted.map((q) => {
+            const observed = q.allowed !== 0 || q.rejected !== 0 || q.current !== 0
+            return (
+              <tr key={q.name}>
+                <td className="mono" title={q.prdRef ? `PRD ${q.prdRef}` : undefined}>
+                  {q.name}
+                </td>
+                <td>
+                  <Badge tone={q.scope === 'global' ? 'info' : 'muted'}>{q.scope}</Badge>
+                </td>
+                <td className="num">{q.limit === 0 ? '∞' : fmtNum(q.limit)}</td>
+                <td className="num">{observed ? fmtNum(q.allowed) : '—'}</td>
+                <td className="num">
+                  {!observed ? (
+                    '—'
+                  ) : q.rejected > 0 ? (
+                    <span style={{ color: 'var(--danger)', fontWeight: 600 }}>
+                      {fmtNum(q.rejected)}
+                    </span>
+                  ) : (
+                    '0'
+                  )}
+                </td>
+                <td className="num">
+                  {observed && q.kind === 'count' ? fmtNum(q.current) : '—'}
+                </td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>

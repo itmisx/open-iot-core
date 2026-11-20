@@ -15,6 +15,7 @@ import (
 	"github.com/itmisx/open-iot-core/internal/events"
 	"github.com/itmisx/open-iot-core/internal/mqtt/packet"
 	"github.com/itmisx/open-iot-core/internal/mqtt/reason"
+	"github.com/itmisx/open-iot-core/internal/quota"
 	"github.com/itmisx/open-iot-core/internal/registry"
 )
 
@@ -458,7 +459,9 @@ func TestOverviewEndpoint(t *testing.T) {
 		} `json:"node"`
 		Quotas []struct {
 			Name     string `json:"name"`
+			Allowed  uint64 `json:"allowed"`
 			Rejected uint64 `json:"rejected"`
+			Current  int64  `json:"current"`
 		} `json:"quotas"`
 		Events struct {
 			Emitted map[string]uint64 `json:"emitted"`
@@ -484,6 +487,12 @@ func TestOverviewEndpoint(t *testing.T) {
 	var arr []json.RawMessage
 	if err := json.Unmarshal(shape["quotas"], &arr); err != nil {
 		t.Errorf("配额应是数组: %v", err)
+	}
+	if len(out.Quotas) != quota.QuotaCount() {
+		t.Fatalf("配额数 = %d，期望全部 %d 项定义", len(out.Quotas), quota.QuotaCount())
+	}
+	if out.Quotas[0].Allowed != 0 || out.Quotas[0].Rejected != 0 || out.Quotas[0].Current != 0 {
+		t.Fatalf("尚未使用的配额应保留零统计: %+v", out.Quotas[0])
 	}
 }
 
