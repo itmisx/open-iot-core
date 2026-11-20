@@ -150,7 +150,7 @@ async function main() {
     await page.goto(`${BASE}/#/`, { waitUntil: 'networkidle' })
     await page.waitForSelector('h1', { timeout: 10000 })
     const body = await page.textContent('.main')
-    must(body.includes('舰队总览'), '标题不对')
+    must(body.includes('运行概览'), '标题不对')
     must(/节点/.test(body), '没有节点区块')
     must(/在线连接/.test(body), '没有连接计数')
     return '标题、节点与计数都在'

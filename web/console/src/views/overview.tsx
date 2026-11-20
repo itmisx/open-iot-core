@@ -1,4 +1,4 @@
-/* 舰队总览（PRD UI-020）。 */
+/* 运行概览（PRD UI-020）。 */
 import { Fragment } from 'react'
 import { api, type Overview, type QuotaStat } from '../api'
 import type { T } from '../i18n'

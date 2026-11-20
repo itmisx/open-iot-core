@@ -2,33 +2,49 @@
 
 # open-iot-core
 
-**A self-hosted MQTT broker and device management plane, wire- and API-compatible with AWS IoT Core.**
-Device registry, certificate PKI, Device Shadow, IoT Policy authorization and an admin console are all built in — one static binary, no callback services.
+**Run an AWS IoT Core–compatible device data and management plane on your own infrastructure.**
 
-[![license](https://img.shields.io/badge/license-Apache--2.0-blue?logo=apache&logoColor=white)](LICENSE) [![go](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)](go.mod) [![stage](https://img.shields.io/badge/stage-v0.1%20usable%20core-orange?logo=semver&logoColor=white)](#-known-limitations) [![deps](https://img.shields.io/badge/direct%20deps-3-brightgreen?logo=dependabot&logoColor=white)](#third-party) [![image](https://img.shields.io/badge/ghcr.io-open--iot--core-2496ED?logo=docker&logoColor=white)](https://github.com/itmisx/open-iot-core/pkgs/container/open-iot-core)[![ci](https://img.shields.io/github/actions/workflow/status/itmisx/open-iot-core/ci.yml?branch=main&logo=githubactions&logoColor=white&label=ci)](https://github.com/itmisx/open-iot-core/actions/workflows/ci.yml)
+MQTT broker, device registry, certificate PKI, Device Shadow, IoT Policy, an
+AWS-compatible API and the admin console ship in one static binary. No Redis,
+PostgreSQL or callback service is required.
+
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue?logo=apache&logoColor=white)](LICENSE) [![go](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)](go.mod) [![mqtt](https://img.shields.io/badge/MQTT-3.1.1%20%7C%205.0-6600cc?logo=mqtt&logoColor=white)](#-capability-matrix) [![cluster](https://img.shields.io/badge/cluster-dragonboat-4c6ef5)](#-architecture) [![image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/itmisx/open-iot-core/pkgs/container/open-iot-core) [![ci](https://img.shields.io/github/actions/workflow/status/itmisx/open-iot-core/ci.yml?branch=main&logo=githubactions&logoColor=white&label=ci)](https://github.com/itmisx/open-iot-core/actions/workflows/ci.yml)
 
 [简体中文](README.md) · **English**
 
-<sub>Not affiliated with, endorsed by, or sponsored by Amazon Web Services.</sub>
+<sub>Apache-2.0 · the same artifact for standalone and clustered deployments · linux/amd64, linux/arm64, darwin/arm64</sub>
 
 </div>
 
-> [!IMPORTANT]
-> The current stage is a **v0.1 usable core**: it runs real devices, issues and revokes
-> certificates, and exposes operational state. This is not v1.0 and there are **no
-> production deployments**. Read [🚨 Known limitations](#-known-limitations) before
-> deploying — that section lists existing constraints you will face today, not planned work.
+![open-iot-core runtime overview showing node status, event counters and every effective quota](docs/images/02-overview.png)
 
----
+<p align="center"><sub>Web console overview</sub></p>
 
-## Contents
+## Why open-iot-core
 
-[✨ Highlights](#-highlights) · [🚀 Quick start](#-quick-start) · [📐 Architecture](#-architecture) · [📦 Capability matrix](#-capability-matrix) · [🚨 Known limitations](#-known-limitations)
-[💻 CLI](#-cli) · [🐳 Deployment](#-deployment) · [🔒 Security](#-security) · [📚 Documentation](#-documentation) · [🧪 Development](#-development) · [📄 License and attribution](#-license-and-attribution)
+| Scenario | What you get |
+| --- | --- |
+| **Move away from AWS IoT Core** | Keep the AWS IoT Device SDK on devices; point `boto3` and the `aws` CLI at a different endpoint |
+| **Air-gapped, on-premises or data-residency deployments** | Run the broker, identity, authorization, shadows and management plane locally |
+| **Avoid assembling an IoT platform from services** | MQTT, PKI, registry, policies, shadows, audit, metrics and a console in one process |
+| **Use clustering without a commercial license** | Apache-2.0; metadata, shadows, persistent sessions and offline queues replicate across nodes |
 
----
+### Evidence, not just a feature list
 
-## ✨ Highlights
+| Surface | Repository acceptance criterion |
+| --- | --- |
+| **Real client compatibility** | AWS IoT Device SDK, `boto3` and the `aws` CLI run against a temporary node |
+| **Cluster failover** | Three real processes; kill the leader, elect another and continue writing; recover persistent sessions and offline queues on another node |
+| **Protocol and concurrency correctness** | Race detector, deterministic simulation and short fuzzing; at least 95% coverage in MQTT, authorization and shadow packages |
+| **Console usability** | 37 flows execute in real Chromium; browser errors and unhandled promise rejections fail the run |
+| **Merge gate** | Formatting, static analysis, architecture contracts, race tests, coverage, cross-compilation and fuzzing run under `make gate` |
+
+> [!NOTE]
+> The project is currently **pre-1.0**. It connects real devices, but has no public
+> production deployment yet. This is not a “production ready” claim; read the
+> [known limitations](#-known-limitations) before deploying.
+
+## Highlights
 
 | | |
 | --- | --- |
@@ -40,31 +56,32 @@ Device registry, certificate PKI, Device Shadow, IoT Policy authorization and an
 | 🪪 **Apache-2.0** | Not BSL / SSPL / ELv2; clustering is not charged separately |
 | 🔍 **Explainable authorization** | A policy dry-run returns the decision, the index of the matching statement, the resolved value of every policy variable, and a remediation suggestion — verifiable without connecting a real device |
 
-## 🚀 Quick start
+## Quick start
+
+Start a standalone node with Docker Compose. No separate `init` command is needed:
 
 ```bash
-# 1. Build (the console bundle is committed; Node is not required)
+git clone https://github.com/itmisx/open-iot-core.git
+cd open-iot-core/deploy/standalone/compose
+docker compose up -d
+
+# Print the admin token required by the console
+docker compose exec openiotd openiotd admin token
+```
+
+The console is at **<http://127.0.0.1:9090/>** and the MQTT mTLS endpoint is
+`127.0.0.1:8883`. Data is kept in a Docker volume.
+
+Running from source requires Go but does not require Node:
+
+```bash
 go build -o openiotd ./cmd/openiotd
-
-# 2. Initialize the data directory: CA, server certificate, sample policy, admin token
 ./openiotd init --data-dir ./data
-
-# 3. Issue and register one device certificate
 ./openiotd cert issue --data-dir ./data --thing dev-001 --policy device-scoped
-
-# 4. Start
 ./openiotd serve --data-dir ./data
 ```
 
-The console is at **<http://127.0.0.1:9090/>**; the first screen requires the token from `./data/admin-token`.
-
-> [!TIP]
-> For a pre-populated demo environment, `make demo` creates the CA, issues certificates,
-> writes sample data and starts the service; `make demo-clean` removes it. With Docker,
-> `deploy/standalone/compose/` is a single `docker compose up -d`; to skip the separate
-> `init` step with a bare `docker run`, add `-e OPENIOTD_AUTO_INIT=1` (suitable for
-> trials only — see [`deploy/README.md`](deploy/README.md): with it on, mounting the
-> wrong path no longer fails, it silently initialises an empty node).
+See [Deployment](#-deployment) for standalone, clustered, Docker and Kubernetes paths.
 
 <details>
 <summary><b>🧯 Common causes of a failed first connection</b> — check here first when you get <code>NotAuthorized</code></summary>

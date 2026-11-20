@@ -2,33 +2,47 @@
 
 # open-iot-core
 
-**自托管的 MQTT broker 与设备管理平面，线路与 API 层面兼容 AWS IoT Core。**
-设备注册、证书 PKI、Device Shadow、IoT Policy 授权与管理控制台全部内建 —— 一个静态二进制，零回调服务。
+**在自己的基础设施上运行兼容 AWS IoT Core 的设备接入与管理平面。**
 
-[![license](https://img.shields.io/badge/license-Apache--2.0-blue?logo=apache&logoColor=white)](LICENSE) [![go](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)](go.mod) [![stage](https://img.shields.io/badge/stage-v0.1%20%E5%8F%AF%E7%94%A8%E5%86%85%E6%A0%B8-orange?logo=semver&logoColor=white)](#-已知边界) [![deps](https://img.shields.io/badge/%E7%9B%B4%E6%8E%A5%E4%BE%9D%E8%B5%96-3-brightgreen?logo=dependabot&logoColor=white)](#第三方) [![image](https://img.shields.io/badge/ghcr.io-open--iot--core-2496ED?logo=docker&logoColor=white)](https://github.com/itmisx/open-iot-core/pkgs/container/open-iot-core)[![ci](https://img.shields.io/github/actions/workflow/status/itmisx/open-iot-core/ci.yml?branch=main&logo=githubactions&logoColor=white&label=ci)](https://github.com/itmisx/open-iot-core/actions/workflows/ci.yml)
+MQTT broker、设备注册、证书 PKI、Device Shadow、IoT Policy、AWS 兼容 API
+与管理控制台装在同一个静态二进制中，不依赖 Redis、PostgreSQL 或回调服务。
+
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue?logo=apache&logoColor=white)](LICENSE) [![go](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)](go.mod) [![mqtt](https://img.shields.io/badge/MQTT-3.1.1%20%7C%205.0-6600cc?logo=mqtt&logoColor=white)](#-能力矩阵) [![cluster](https://img.shields.io/badge/cluster-dragonboat-4c6ef5)](#-架构) [![image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/itmisx/open-iot-core/pkgs/container/open-iot-core) [![ci](https://img.shields.io/github/actions/workflow/status/itmisx/open-iot-core/ci.yml?branch=main&logo=githubactions&logoColor=white&label=ci)](https://github.com/itmisx/open-iot-core/actions/workflows/ci.yml)
 
 **简体中文** · [English](README.en.md)
 
-<sub>An Apache-2.0, self-hosted MQTT broker with an **AWS IoT Core–compatible API**.<br>
-Not affiliated with, endorsed by, or sponsored by Amazon Web Services.</sub>
+<sub>Apache-2.0 · 单机与集群同一制品 · linux/amd64、linux/arm64、darwin/arm64</sub>
 
 </div>
 
-> [!IMPORTANT]
-> 当前阶段是 **v0.1 可用内核**：可接入真实设备，可签发与吊销证书，可观测运行状态。
-> 不是 v1.0，**没有生产部署案例**。部署前请先阅读 [🚨 已知边界](#-已知边界) ——
-> 该节列出的不是待办事项，而是当前部署即会面对的既有约束。
+![open-iot-core 运行概览：节点状态、事件统计与全部生效配额](docs/images/02-overview.png)
 
----
+<p align="center"><sub>Web 控制台总览</sub></p>
 
-## 目录
+## 为什么是 open-iot-core
 
-[✨ 核心特性](#-核心特性) · [🚀 快速开始](#-快速开始) · [📐 架构](#-架构) · [📦 能力矩阵](#-能力矩阵) · [🚨 已知边界](#-已知边界)
-[💻 命令行](#-命令行) · [🐳 部署](#-部署) · [🔒 安全](#-安全) · [📚 文档](#-文档) · [🧪 开发](#-开发) · [📄 许可与归属](#-许可与归属)
+| 场景 | 得到什么 |
+| --- | --- |
+| **从 AWS IoT Core 迁出** | 设备继续使用 AWS IoT Device SDK；`boto3` 与 `aws` CLI 只需改 endpoint |
+| **内网、离线或数据不出境** | broker、身份、授权、影子和管理面全部本地运行，不回调云端服务 |
+| **不想拼装一套 IoT 平台** | 一个进程内建 MQTT、PKI、注册表、策略、影子、审计、指标与控制台 |
+| **需要开源集群能力** | Apache-2.0；元数据、影子、持久会话与离线队列可跨节点复制 |
 
----
+### 可验证，而不只是一张功能清单
 
-## ✨ 核心特性
+| 验证面 | 仓库内的判据 |
+| --- | --- |
+| **真实客户端兼容** | AWS IoT Device SDK、`boto3` 与 `aws` CLI 对临时节点实跑 |
+| **集群故障恢复** | 三个真实进程，强杀 leader 后重新选举并继续写入；持久会话与离线队列跨节点恢复 |
+| **协议与并发正确性** | race detector、确定性模拟、短时 fuzz；MQTT、授权、影子三个严格包覆盖率不低于 95% |
+| **控制台可用性** | 真实 Chromium 执行 37 项流程，整轮不允许浏览器错误或未处理的 Promise rejection |
+| **合并门禁** | 格式、静态分析、架构契约、race、覆盖率、交叉编译与 fuzz 统一由 `make gate` 执行 |
+
+> [!NOTE]
+> 项目目前是 **pre-1.0**，可接入真实设备，但尚无公开生产部署案例。
+> 这不是“production ready”声明；正式部署前请阅读[已知边界](#-已知边界)。
+
+## 核心能力
 
 | | |
 | --- | --- |
@@ -40,31 +54,32 @@ Not affiliated with, endorsed by, or sponsored by Amazon Web Services.</sub>
 | 🪪 **Apache-2.0** | 非 BSL / SSPL / ELv2；集群能力不额外收费 |
 | 🔍 **授权可解释** | 策略干跑给出判定结果、命中语句下标、各策略变量的求值结果与放行建议，无需接入真实设备即可验证 |
 
-## 🚀 快速开始
+## 快速开始
+
+使用 Docker Compose 启动单节点，不需要预先执行 `init`：
 
 ```bash
-# 1. 构建（控制台产物已入库，不需要 Node）
+git clone https://github.com/itmisx/open-iot-core.git
+cd open-iot-core/deploy/standalone/compose
+docker compose up -d
+
+# 查看登录控制台所需的管理面令牌
+docker compose exec openiotd openiotd admin token
+```
+
+控制台位于 **<http://127.0.0.1:9090/>**，MQTT mTLS 端点位于
+`127.0.0.1:8883`。数据保存在 Docker volume 中。
+
+从源码运行只需要 Go，不需要 Node：
+
+```bash
 go build -o openiotd ./cmd/openiotd
-
-# 2. 初始化数据目录：生成 CA、服务端证书、示例策略、管理面令牌
 ./openiotd init --data-dir ./data
-
-# 3. 签一张设备证书并登记
 ./openiotd cert issue --data-dir ./data --thing dev-001 --policy device-scoped
-
-# 4. 启动
 ./openiotd serve --data-dir ./data
 ```
 
-控制台在 **<http://127.0.0.1:9090/>**，首屏需填入 `./data/admin-token` 中的令牌。
-
-> [!TIP]
-> 如需预置数据的演示环境：`make demo` 创建 CA、签发证书、写入示例数据并启动服务，
-> `make demo-clean` 清理。使用 Docker 时，`deploy/standalone/compose/` 对应一条
-> `docker compose up -d`；裸 `docker run` 想省掉 init 那一步，加
-> `-e OPENIOTD_AUTO_INIT=1`（仅适合试用，代价见
-> [`deploy/README.md`](deploy/README.md)：开着它时数据卷挂错路径不会报错，
-> 而是静默初始化出一个空节点）。
+完整的单机、集群、Docker 与 Kubernetes 路径见[部署](#-部署)。
 
 <details>
 <summary><b>🧯 首次连接的常见失败原因</b> —— 返回 <code>NotAuthorized</code> 时先查此处</summary>

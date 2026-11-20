@@ -91,7 +91,7 @@ const zh: Dict = {
   'gate.bad': '令牌无效或管理面未启用',
   'gate.stored': '令牌仅保存在本标签页（sessionStorage），关闭即清除',
 
-  'overview.title': '舰队总览',
+  'overview.title': '运行概览',
   'overview.subtitle': '节点状态、实时计数与全部生效配额',
   'overview.conns': '在线连接',
   'overview.curve': '在线连接',
@@ -525,7 +525,7 @@ const en: Dict = {
   'gate.bad': 'Invalid token, or the admin API is not enabled',
   'gate.stored': 'The token is kept in this tab only (sessionStorage) and cleared on close',
 
-  'overview.title': 'Fleet overview',
+  'overview.title': 'Runtime overview',
   'overview.subtitle': 'Node status, live counters and all effective quotas',
   'overview.conns': 'Connections',
   'overview.curve': 'Connections online',
