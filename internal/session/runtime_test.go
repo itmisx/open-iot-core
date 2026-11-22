@@ -35,8 +35,11 @@ func TestRuntimeEnqueueChecksEpoch(t *testing.T) {
 	if err := r.Enqueue(stale, Outbound{Bytes: []byte{0x00}}); !errors.Is(err, cluster.ErrStaleEpoch) {
 		t.Errorf("旧 epoch 入队应返回 ErrStaleEpoch，得到 %v", err)
 	}
-	if got := <-r.Outbound(); len(got.Bytes) != 2 {
+	if got, ok := r.Dequeue(); !ok || len(got.Bytes) != 2 {
 		t.Errorf("出站队列内容不正确: %+v", got)
+	}
+	if r.out != nil {
+		t.Fatal("单条消息排空后仍常驻队列 sidecar")
 	}
 }
 
@@ -57,8 +60,60 @@ func TestRuntimeEnqueueBackpressure(t *testing.T) {
 	}
 }
 
+func TestRuntimeOutboundQueueAllocatesOnlyOnSecondPending(t *testing.T) {
+	r, _ := newTestRuntime(t, 4)
+	e := r.Epoch()
+	if r.out != nil {
+		t.Fatal("空队列不应常驻 sidecar")
+	}
+	if err := r.Enqueue(e, Outbound{Bytes: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if r.out == nil || r.out.ring != nil {
+		t.Fatal("第一条待发消息应使用内联槽")
+	}
+	if err := r.Enqueue(e, Outbound{Bytes: []byte{2}}); err != nil {
+		t.Fatal(err)
+	}
+	if r.out == nil {
+		t.Fatal("第二条待发消息后没有队列 sidecar")
+	}
+	if len(r.out.ring) != 4 {
+		t.Fatalf("第二条待发消息后 ring 长度=%d，期望 4", len(r.out.ring))
+	}
+}
+
+func TestRuntimeOutboundQueueFIFOAcrossWrap(t *testing.T) {
+	r, _ := newTestRuntime(t, 3)
+	e := r.Epoch()
+	for _, v := range []byte{1, 2, 3} {
+		if err := r.Enqueue(e, Outbound{Bytes: []byte{v}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, ok := r.Dequeue()
+	if !ok || first.Bytes[0] != 1 {
+		t.Fatalf("第一条=%+v ok=%v", first, ok)
+	}
+	if err := r.Enqueue(e, Outbound{Bytes: []byte{4}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []byte{2, 3, 4} {
+		got, ok := r.Dequeue()
+		if !ok || len(got.Bytes) != 1 || got.Bytes[0] != want {
+			t.Fatalf("FIFO got=%+v ok=%v want=%d", got, ok, want)
+		}
+	}
+	if r.OutboundLen() != 0 {
+		t.Fatal("排空后长度非零")
+	}
+	if r.out != nil {
+		t.Fatal("突发排空后仍由连接持有队列 sidecar")
+	}
+}
+
 // cap 便于测试检查默认队列深度。
-func (r *Runtime) cap() int { return cap(r.out) }
+func (r *Runtime) cap() int { return r.outCap }
 
 func TestRuntimeSubscribeReplacesAndUnsubscribe(t *testing.T) {
 	r, _ := newTestRuntime(t, 4)
@@ -280,6 +335,9 @@ func TestMemStoreEpochFencing(t *testing.T) {
 	older.Epoch = cluster.MakeEpoch(1, 9)
 	if err := m.Save(ctx, older); !errors.Is(err, cluster.ErrStaleEpoch) {
 		t.Errorf("旧 epoch 保存应返回 ErrStaleEpoch，得到 %v", err)
+	}
+	if err := m.Replace(ctx, older); !errors.Is(err, cluster.ErrStaleEpoch) {
+		t.Errorf("旧 epoch 替换应返回 ErrStaleEpoch，得到 %v", err)
 	}
 	cur, _, _ := m.Load(ctx, "dev-001")
 	if cur.Epoch != newer.Epoch {

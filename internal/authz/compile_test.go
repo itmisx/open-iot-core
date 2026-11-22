@@ -73,6 +73,25 @@ func TestCompileActions(t *testing.T) {
 	}
 }
 
+func TestCompiledSetTracksCertificateVariables(t *testing.T) {
+	plain := mustCompile(t, "plain", `{"Statement":[{"Effect":"Allow",
+	  "Action":"iot:Publish","Resource":"arn:aws:iot:*:*:topic/${iot:ClientId}"}]}`)
+	if plain.UsesCertificateVariables() {
+		t.Fatal("只引用 ClientId 的策略被误标为证书变量策略")
+	}
+	for _, variable := range []string{
+		"iot:Certificate.SerialNumber",
+		"iot:Certificate.Subject.CommonName",
+		"iot:Certificate.Issuer.Organization",
+	} {
+		cs := mustCompile(t, variable, `{"Statement":[{"Effect":"Allow",
+		  "Action":"iot:Publish","Resource":"arn:aws:iot:*:*:topic/${`+variable+`}"}]}`)
+		if !cs.UsesCertificateVariables() {
+			t.Errorf("引用 %s 的策略未标记证书变量", variable)
+		}
+	}
+}
+
 // TestGlobMatchCrossesSlash 固定住一处语义陷阱：
 // 策略资源中的 * 跨越 /，而 MQTT 的 + 不跨越。
 // 混同两者会让 topic/a/* 意外只匹配一层。

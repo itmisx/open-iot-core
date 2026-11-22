@@ -58,10 +58,10 @@ func (c *conn) trackAndSend(out *packet.Publish, src *router.Message, subIDs []u
 	if c.closedRC.Load() != 0 {
 		return
 	}
-	if c.clientID != "" && c.b.lookup(c.clientID) != c {
+	if c.clientID() != "" && c.b.lookup(c.clientID()) != c {
 		return
 	}
-	if !c.b.opt.Limiter.Acquire(quota.OutboundInflight, c.clientID, 1) {
+	if !c.b.opt.Limiter.Acquire(quota.OutboundInflight, c.clientID(), 1) {
 		if src != nil {
 			c.pushQueued(src, uint8(out.QoS), subIDs, out.Retain)
 		}
@@ -92,12 +92,12 @@ func (c *conn) trackAndSend(out *packet.Publish, src *router.Message, subIDs []u
 	}
 	// 占上额度之后连接可能已经在关，或者已经被接管。这种消息不会再被
 	// 重投，留在表里就是一笔没人还的额度。
-	if c.closedRC.Load() != 0 || (c.clientID != "" && c.b.lookup(c.clientID) != c) {
+	if c.closedRC.Load() != 0 || (c.clientID() != "" && c.b.lookup(c.clientID()) != c) {
 		c.undoInflight(m.PacketID)
 		return
 	}
 	if err := c.sendForeign(out); err != nil {
-		if errors.Is(err, session.ErrDetached) || (c.clientID != "" && c.b.lookup(c.clientID) != c) {
+		if errors.Is(err, session.ErrDetached) || (c.clientID() != "" && c.b.lookup(c.clientID()) != c) {
 			c.undoInflight(m.PacketID)
 		}
 		return
@@ -193,7 +193,7 @@ func (c *conn) resend(m session.InflightMsg) {
 }
 
 func (c *conn) onRetry(id uint16) {
-	if c.closedRC.Load() != 0 || c.b.lookup(c.clientID) != c {
+	if c.closedRC.Load() != 0 || c.b.lookup(c.clientID()) != c {
 		return
 	}
 	m, ok := c.rt.InflightByID(id)
@@ -232,36 +232,45 @@ func (c *conn) armRetry(id uint16) {
 		}
 	}
 	stop := c.b.opt.AfterFunc(delay, func() { c.onRetry(id) })
-	c.retryMu.Lock()
-	defer c.retryMu.Unlock()
+	retry := c.retryState()
+	retry.mu.Lock()
+	defer retry.mu.Unlock()
 	if c.closedRC.Load() != 0 {
 		stop()
 		return
 	}
-	if c.retryStop == nil {
-		c.retryStop = make(map[uint16]func() bool)
+	if retry.stops == nil {
+		retry.stops = make(map[uint16]func() bool)
 	}
-	if prev := c.retryStop[id]; prev != nil {
+	if prev := retry.stops[id]; prev != nil {
 		prev()
 	}
-	c.retryStop[id] = stop
+	retry.stops[id] = stop
 }
 
 func (c *conn) clearRetry(id uint16) {
-	c.retryMu.Lock()
-	stop := c.retryStop[id]
-	delete(c.retryStop, id)
-	c.retryMu.Unlock()
+	retry := c.retry.Load()
+	if retry == nil {
+		return
+	}
+	retry.mu.Lock()
+	stop := retry.stops[id]
+	delete(retry.stops, id)
+	retry.mu.Unlock()
 	if stop != nil {
 		stop()
 	}
 }
 
 func (c *conn) stopRetries() {
-	c.retryMu.Lock()
-	stops := c.retryStop
-	c.retryStop = nil
-	c.retryMu.Unlock()
+	retry := c.retry.Load()
+	if retry == nil {
+		return
+	}
+	retry.mu.Lock()
+	stops := retry.stops
+	retry.stops = nil
+	retry.mu.Unlock()
 	for _, stop := range stops {
 		stop()
 	}
@@ -294,7 +303,7 @@ func (c *conn) promoteQueued() {
 			QoS:          m.QoS,
 			Retain:       m.Retain,
 			ExpiryUnixMs: m.ExpiryUnixMs,
-		}, router.SubRef{ClientID: c.clientID, QoS: m.QoS, RetainAsPub: true}, m.SubIDs)
+		}, router.SubRef{ClientID: c.clientID(), QoS: m.QoS, RetainAsPub: true}, m.SubIDs)
 		return
 	}
 }
@@ -310,9 +319,10 @@ func (c *conn) seedPacketIDs(msgs []session.InflightMsg) {
 	if max == 0 {
 		return
 	}
+	next := &c.retryState().nextPacketID
 	for {
-		cur := c.nextPacketID.Load()
-		if cur >= max || c.nextPacketID.CompareAndSwap(cur, max) {
+		cur := next.Load()
+		if cur >= max || next.CompareAndSwap(cur, max) {
 			return
 		}
 	}
@@ -325,19 +335,19 @@ func (c *conn) outboundHeld() int64 {
 	if !ok {
 		return 0
 	}
-	return q.Current(quota.OutboundInflight, c.clientID)
+	return q.Current(quota.OutboundInflight, c.clientID())
 }
 
 func (c *conn) acquireDeficit(n int) int {
 	if n <= 0 {
 		return 0
 	}
-	if c.b.opt.Limiter.Acquire(quota.OutboundInflight, c.clientID, n) {
+	if c.b.opt.Limiter.Acquire(quota.OutboundInflight, c.clientID(), n) {
 		return n
 	}
 	got := 0
 	for i := 0; i < n; i++ {
-		if !c.b.opt.Limiter.Acquire(quota.OutboundInflight, c.clientID, 1) {
+		if !c.b.opt.Limiter.Acquire(quota.OutboundInflight, c.clientID(), 1) {
 			break
 		}
 		got++
@@ -349,5 +359,5 @@ func (c *conn) releaseInflightQuota(n int) {
 	if n <= 0 {
 		return
 	}
-	c.b.opt.Limiter.Release(quota.OutboundInflight, c.clientID, n)
+	c.b.opt.Limiter.Release(quota.OutboundInflight, c.clientID(), n)
 }

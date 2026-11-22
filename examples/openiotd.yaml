@@ -79,6 +79,12 @@ listeners:
   mqtt_plain:
     enabled: false
     addr: 127.0.0.1:1883
+    # TLS 终结外移时设为 v2，并把 addr 放在设备不能直达的私网。
+    # 终结器须发送 OpenIoT 客户端证书 TLV；仅标准 SSL verified/CN TLV
+    # 不足以恢复指纹身份，会被拒绝。
+    proxy_protocol: ""
+    trusted_proxies: []
+    proxy_header_timeout: 3s
   mqtt_wss:
     enabled: false
     addr: 0.0.0.0:443

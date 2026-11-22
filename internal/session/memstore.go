@@ -44,11 +44,44 @@ func (m *MemStore) Load(_ context.Context, clientID string) (*State, bool, error
 func (m *MemStore) Save(_ context.Context, st *State) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// 已被接管的旧会话不得覆盖新会话的状态。
-	if cur, ok := m.byID[st.ClientID]; ok && st.Epoch < cur.Epoch {
-		return cluster.ErrStaleEpoch
+	if err := m.checkWriteEpoch(st); err != nil {
+		return err
 	}
 	m.byID[st.ClientID] = st.Clone()
+	return nil
+}
+
+func (m *MemStore) Replace(_ context.Context, st *State) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Replace 只是 clean start 所需的「清队列+写新状态」原子性，
+	// 不能绕过 Save 的 epoch 围栏。否则被接管的旧连接可以用
+	// Clean Start 覆盖已经落盘的新一代会话。
+	if err := m.checkWriteEpoch(st); err != nil {
+		return err
+	}
+	m.byID[st.ClientID] = st.Clone()
+	return nil
+}
+
+// checkWriteEpoch 在 m.mu 持有期间执行 Save/Replace 共用的围栏。
+func (m *MemStore) checkWriteEpoch(st *State) error {
+	cur, ok := m.byID[st.ClientID]
+	if !ok {
+		return nil
+	}
+	// 已被接管的旧会话不得覆盖新会话的状态。
+	if st.Epoch < cur.Epoch {
+		return cluster.ErrStaleEpoch
+	}
+	// epoch 相等时「活的压过死的」，与持久实现同一条判据
+	// （见 store.SessionStore.staleAtEqualEpoch，CLU-131）。
+	// 三个实现必须一致：不一致的话，broker 的用例在内存实现上
+	// 全绿而集群里是另一套语义。
+	if st.Epoch == cur.Epoch && st.Owner != cur.Owner &&
+		st.DisconnectUnixMs != 0 && cur.DisconnectUnixMs == 0 {
+		return cluster.ErrStaleEpoch
+	}
 	return nil
 }
 

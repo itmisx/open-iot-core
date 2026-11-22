@@ -42,6 +42,9 @@ type writerPool struct {
 	// 服务端不能为它无界等待（PRD MQTT-035）。
 	writeTimeout time.Duration
 	wg           sync.WaitGroup
+	// mergeBuffers 只在同一次 flush 有两帧以上时借用。缓冲归 writer 池而
+	// 不是连接，避免活跃连接永久保留历史最大突发的 backing array。
+	mergeBuffers sync.Pool
 
 	// flushed 与 writeErrs 供指标使用。
 	flushed   atomic.Uint64
@@ -148,31 +151,45 @@ func (p *writerPool) wake(c *conn) {
 
 // flush 把一个连接的出站缓冲排空并写出。
 func (p *writerPool) flush(c *conn) {
-	// 排空通道，合并为一次写入：这既减少系统调用，也让 TCP 能把
-	// 多个小报文合进同一个段。
-	buf := c.wbuf[:0]
-	var releases []func()
-	for {
-		select {
-		case out, ok := <-c.rt.Outbound():
-			if !ok {
-				// 运行时已关闭。
-				c.queued.Store(false)
-				return
-			}
-			buf = append(buf, out.Bytes...)
-			if out.Release != nil {
-				releases = append(releases, out.Release)
-			}
-			if len(buf) < c.maxWriteBatch {
-				continue
-			}
-		default:
+	// 先直接借用队列第一项的字节。CONNECT 的 CONNACK、稳态 PINGRESP 和
+	// 大多数 ACK 都是队列里唯一的一帧；若先 append 到连接合并缓冲，会为每条
+	// 空闲连接额外分配并永久保留一块 backing array，还做一次无收益拷贝。
+	// 只有确实存在第二项时才切到合并缓冲，仍保持突发下的一次 Write。
+	first, ok := c.rt.Dequeue()
+	if !ok {
+		c.queued.Store(false)
+		if c.rt.OutboundLen() > 0 {
+			p.wake(c)
 		}
-		break
+		return
 	}
-	c.wbuf = buf
-
+	buf := first.Bytes
+	var releases []func()
+	if first.Release != nil {
+		releases = append(releases, first.Release)
+	}
+	merged := false
+	var mergeBuf *[]byte
+	for len(buf) < c.b.opt.MaxWriteBatch {
+		out, ok := c.rt.Dequeue()
+		if !ok {
+			break
+		}
+		if !merged {
+			merged = true
+			mergeBuf = p.takeMergeBuffer()
+			merge := (*mergeBuf)[:0]
+			merge = append(merge, buf...)
+			buf = merge
+		}
+		buf = append(buf, out.Bytes...)
+		if out.Release != nil {
+			releases = append(releases, out.Release)
+		}
+		if len(buf) >= c.b.opt.MaxWriteBatch {
+			break
+		}
+	}
 	if len(buf) > 0 {
 		// contract:allow-time-now 写超时是 net.Conn 的绝对时间接口要求，
 		// 仅用于超时判定，不参与任何排序或版本比较。
@@ -190,12 +207,32 @@ func (p *writerPool) flush(c *conn) {
 	for _, r := range releases {
 		r()
 	}
+	if mergeBuf != nil {
+		p.putMergeBuffer(mergeBuf, c.b.opt.MaxWriteBatch)
+	}
 
 	// 清除标记后重新检查：在写出期间可能又有报文入队。
 	c.queued.Store(false)
-	if len(c.rt.Outbound()) > 0 {
+	if c.rt.OutboundLen() > 0 {
 		p.wake(c)
 	}
+}
+
+func (p *writerPool) takeMergeBuffer() *[]byte {
+	if v := p.mergeBuffers.Get(); v != nil {
+		return v.(*[]byte)
+	}
+	return new([]byte)
+}
+
+func (p *writerPool) putMergeBuffer(buf *[]byte, maxWriteBatch int) {
+	// 一条超大帧可以让 append 超过批量阈值；不把异常大 backing array
+	// 永久留在共享池。两倍阈值容得下正常的“最后一帧越界”。
+	if maxWriteBatch <= 0 || cap(*buf) > maxWriteBatch*2 {
+		return
+	}
+	*buf = (*buf)[:0]
+	p.mergeBuffers.Put(buf)
 }
 
 // Close 停止写出池。它不关闭连接，只停止刷写。幂等。

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"encoding/json"
@@ -79,8 +81,22 @@ func (s *Server) buildMetaStore(kv *store.SwapKV, env authz.Env) (metaStore, err
 		revKey = store.MetaRevisionKey()
 	}
 	local := meta.NewLocalStore(meta.LocalOptions{
-		Now:             s.now,
-		Cold:            kv,
+		Now:  s.now,
+		Cold: kv,
+		ApplyRecords: func(records []meta.RecordOp) error {
+			ops := make([]store.Op, len(records))
+			for i, record := range records {
+				kind := store.OpSet
+				if record.Delete {
+					kind = store.OpDelete
+				}
+				ops[i] = store.Op{Kind: kind, Key: record.Key, Value: record.Value}
+			}
+			return kv.Batch(ops, true)
+		},
+		InTransaction: func(fn func(meta.Transaction) error) error {
+			return kv.InTx(true, func(tx store.Tx) error { return fn(tx) })
+		},
 		RevisionKey:     revKey,
 		InitialRevision: initialRev,
 		Compile: func(name string, doc []byte) (any, error) {
@@ -88,7 +104,8 @@ func (s *Server) buildMetaStore(kv *store.SwapKV, env authz.Env) (metaStore, err
 		},
 		// 影子命令的 apply：单机下不会有带影子载荷的命令（影子直接写
 		// 本地存储），集群下每个节点都要执行它。
-		ApplyShadow: s.applyShadowCommand,
+		ApplyShadow:   s.applyShadowCommand,
+		ApplyShadowTx: s.applyShadowCommandTx,
 	})
 	if s.cfg.Node.Mode == config.ModeStandalone {
 		return local, nil
@@ -137,14 +154,14 @@ func (s *Server) buildMetaStore(kv *store.SwapKV, env authz.Env) (metaStore, err
 			}
 		},
 		ColdSnapshot: func(w io.Writer) error {
-			_, serr := kv.Snapshot(w)
+			_, serr := kv.SnapshotFiltered(w, s.preserveShardKey)
 			return serr
 		},
 		// 冷层整库替换之后必须重载内存里的保留消息（CLU-107）：retained
 		// 与冷层在同一个库里，而装载只在启动时跑一次——不重载的话，磁盘
 		// 已经是 leader 的那一份，内存还是自己的，下次重启才换过去。
 		ColdRestore: func(r io.Reader) error {
-			if err := kv.RestoreFrom(r); err != nil {
+			if err := kv.RestoreFiltered(r, s.preserveShardKey); err != nil {
 				return err
 			}
 			return s.reloadRetained()
@@ -166,6 +183,30 @@ func (s *Server) buildMetaStore(kv *store.SwapKV, env authz.Env) (metaStore, err
 	s.replDir = dir
 	s.replStore = rs
 	return rs, nil
+}
+
+// preserveShardKey 标出不属于 metadata 状态机的共享冷库键。metadata 快照
+// 恢复只能替换自己的 keyspace；session/shadow 分片各由自己的 Raft 快照负责。
+func (s *Server) preserveShardKey(key []byte) bool {
+	if len(key) == 0 {
+		return false
+	}
+	switch store.Prefix(key[0]) {
+	case store.PrefixSession, store.PrefixQueued:
+		return true
+	case store.PrefixShadow:
+		return s.cfg.Cluster.Replication.ShadowShards != 0
+	case store.PrefixSystem:
+		body := key[1:]
+		if bytes.HasPrefix(body, []byte("session-applied-")) {
+			return true
+		}
+		return s.cfg.Cluster.Replication.ShadowShards != 0 &&
+			(bytes.HasPrefix(body, []byte("shadow-applied-")) ||
+				bytes.HasPrefix(body, []byte("shadow-pruned-v1-")))
+	default:
+		return false
+	}
 }
 
 // startReplicationGroup 建起真正的复制组。
@@ -191,13 +232,23 @@ func (s *Server) startReplicationGroup() error {
 		AppliedIndex: func() uint64 {
 			return uint64(s.replStore.View().Revision())
 		},
-		TLS:         s.replTLS,
-		Dir:         s.replDir,
-		Apply:       s.replStore.ApplyCommitted,
+		TLS:   s.replTLS,
+		Dir:   s.replDir,
+		Apply: s.replStore.ApplyCommitted,
+		ApplyBatch: func(entries []cluster.ShardEntry) error {
+			batch := make([]meta.CommittedData, len(entries))
+			for i := range entries {
+				batch[i] = meta.CommittedData{Index: entries[i].Index, Data: entries[i].Data}
+			}
+			return s.replStore.ApplyCommittedBatch(batch)
+		},
 		SnapshotTo:  s.replStore.SnapshotTo,
 		RestoreFrom: s.replStore.RestoreFrom,
 		Bootstrap:   s.cfg.Node.Mode == config.ModeBootstrap,
 		Output:      raftLogWriter{log: s.log},
+		// 0 表示取库那一侧的默认值（100 毫秒）。会话分片共用同一个
+		// NodeHost，所以 RTT 只在这里给一次就对两组都生效。
+		RTT: time.Duration(rep.RTT),
 	})
 	if err != nil {
 		return fmt.Errorf("server: 复制组监听 %s 失败: %w", rep.Addr, err)
@@ -222,6 +273,386 @@ func (s *Server) startReplicationGroup() error {
 	return nil
 }
 
+const (
+	shadowShardBase uint64 = 2
+)
+
+type shadowShardEnvelope struct {
+	ID    string                `json:"id,omitempty"`
+	Raw   json.RawMessage       `json:"raw,omitempty"`
+	Batch []shadowShardEnvelope `json:"batch,omitempty"`
+}
+
+type shadowRPCRead struct {
+	Op     string `json:"op"`
+	Thing  string `json:"thing"`
+	Shadow string `json:"shadow,omitempty"`
+}
+
+type shadowRouteStats struct {
+	remoteReads         atomic.Uint64
+	remoteReadRPCs      atomic.Uint64
+	remoteReadFallbacks atomic.Uint64
+	remoteReadErrors    atomic.Uint64
+	remoteWrites        atomic.Uint64
+	remoteWriteErrors   atomic.Uint64
+}
+
+type shadowRPCResponse struct {
+	Result   *shadow.Result   `json:"result,omitempty"`
+	Document *shadow.Document `json:"document,omitempty"`
+	Names    []string         `json:"names,omitempty"`
+	Found    bool             `json:"found,omitempty"`
+	Domain   *shadow.Error    `json:"domain,omitempty"`
+}
+
+func decodeShadowRPCResponse(raw []byte) (shadowRPCResponse, error) {
+	var resp shadowRPCResponse
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&resp); err != nil {
+		return shadowRPCResponse{}, err
+	}
+	return resp, nil
+}
+
+func shadowRPCTimeout(ctx context.Context) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	timeout := 10 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+		if timeout <= 0 {
+			return 0, context.DeadlineExceeded
+		}
+	}
+	return timeout, nil
+}
+
+func decodeShadowShardEnvelopes(raw []byte) ([]shadowShardEnvelope, error) {
+	var env shadowShardEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, err
+	}
+	if len(env.Batch) > 0 {
+		if env.ID != "" || len(env.Raw) != 0 || len(env.Batch) > 64 {
+			return nil, errors.New("影子分片批命令格式无效")
+		}
+		for i := range env.Batch {
+			if env.Batch[i].ID == "" || len(env.Batch[i].Raw) == 0 || len(env.Batch[i].Batch) != 0 {
+				return nil, errors.New("影子分片批命令含无效子命令")
+			}
+		}
+		return env.Batch, nil
+	}
+	if env.ID == "" || len(env.Raw) == 0 {
+		return nil, errors.New("影子分片命令缺少 id/raw")
+	}
+	return []shadowShardEnvelope{env}, nil
+}
+
+func mergeShadowShardProposals(items [][]byte) ([]byte, []uint8, int, error) {
+	if len(items) == 0 {
+		return nil, nil, 0, errors.New("没有可合并的影子提案")
+	}
+	batch := make([]shadowShardEnvelope, 0, 64)
+	widths := make([]uint8, 0, len(items))
+	bytesUsed, consumed := 0, 0
+	for _, item := range items {
+		envs, err := decodeShadowShardEnvelopes(item)
+		if err != nil {
+			if consumed == 0 {
+				return nil, nil, 1, err
+			}
+			break
+		}
+		if len(batch)+len(envs) > 64 || (consumed > 0 && bytesUsed+len(item) > 1<<20) {
+			break
+		}
+		batch = append(batch, envs...)
+		widths = append(widths, uint8(len(envs)))
+		bytesUsed += len(item)
+		consumed++
+	}
+	if consumed <= 1 {
+		return append([]byte(nil), items[0]...), widths, 1, nil
+	}
+	raw, err := json.Marshal(shadowShardEnvelope{Batch: batch})
+	return raw, widths, consumed, err
+}
+
+// startShadowShards 把新影子写入从单一 metadata 日志拆到 8 条独立日志。
+// 先保持 RF=all，使现有任意节点本地读与滚动升级语义不变；下一阶段再在
+// 服务转发与远程读完成后切 RF=3，届时才减少每节点存储。
+func (s *Server) startShadowShards(replicas map[cluster.NodeID]uint64) error {
+	if s.shadowRepl == nil || s.shadows == nil {
+		return errors.New("server: 影子分片启动前复制存储尚未装配")
+	}
+	count := s.cfg.Cluster.Replication.ShadowShards
+	owns := func(shard uint64) func(string) bool {
+		return func(thing string) bool {
+			return thing != "" && cluster.ShardFor(shadowShardBase, count, thing) == shard
+		}
+	}
+	g, err := s.repl.StartShardGroup(cluster.ShardOptions{
+		Base: shadowShardBase, Count: count,
+		LayoutName: "shadow-layout.json", Label: "影子",
+		ReplicationFactor: int(s.cfg.Cluster.Replication.ShadowReplicationFactor),
+		Replicas:          replicas, Peers: s.replPeers,
+		Bootstrap: s.cfg.Node.Mode == config.ModeBootstrap,
+		ApplyBatch: func(shard uint64, ents []cluster.ShardEntry) error {
+			batch := make([]store.ShadowEntry, 0, len(ents))
+			ids := make([]string, 0, len(ents))
+			for i := range ents {
+				envs, err := decodeShadowShardEnvelopes(ents[i].Data)
+				if err != nil {
+					return fmt.Errorf("server: 影子分片命令损坏: %w", err)
+				}
+				for _, env := range envs {
+					ids = append(ids, env.ID)
+					batch = append(batch, store.ShadowEntry{Index: ents[i].Index, Data: env.Raw})
+				}
+			}
+			if err := s.shadows.ApplyShadowBatch(shard, batch, owns(shard)); err != nil {
+				return err
+			}
+			// ApplyShadowBatch 返回时事务已经提交；绝不能提前唤醒请求方。
+			for i := range batch {
+				s.shadowRepl.DeliverCommitted(ids[i], batch[i].Result, batch[i].Err)
+			}
+			return nil
+		},
+		AppliedIndex: s.shadows.ShadowAppliedIndex,
+		SnapshotTo: func(shard uint64, w io.Writer) error {
+			return s.shadows.SnapshotShadowShard(shard, owns(shard), w)
+		},
+		RestoreFrom: func(shard uint64, r io.Reader) error {
+			return s.shadows.RestoreShadowShard(shard, owns(shard), r)
+		},
+		MergeProposals: mergeShadowShardProposals,
+	})
+	if err != nil {
+		return fmt.Errorf("server: 启动影子分区组失败: %w", err)
+	}
+	s.repl.SetShadowHandlers(s.handleShadowWriteRPC, s.handleShadowReadRPC)
+	if err := s.shadowSvc.UsePartitionerAndActivate(g, func() error {
+		// 服务写锁将旧 metadata 路径与新分片路径隔开：
+		// 裁剪事务提交后才切路由，避免旧路径又在非本地分片写回一条。
+		if s.cfg.Cluster.Replication.ShadowReplicationFactor != 0 {
+			deleted, already, err := s.shadows.PruneNonLocal(
+				g.PlacementFingerprint(), g.HasLocalReplicaBytes)
+			if err != nil {
+				return fmt.Errorf("server: 裁剪非本地影子失败: %w", err)
+			}
+			s.log.Info("影子历史数据裁剪完成", "删除", deleted, "已执行", already)
+		}
+		s.shadowShards.Store(g)
+		return nil
+	}); err != nil {
+		_ = g.Close()
+		s.shadowShards.Store(nil)
+		return err
+	}
+	rf := s.cfg.Cluster.Replication.ShadowReplicationFactor
+	if rf == 0 {
+		rf = uint64(len(replicas))
+	}
+	s.log.Info("影子分区组已启动", "分片数", g.ShardCount(), "副本因子", rf)
+	return nil
+}
+
+func (s *Server) handleShadowWriteRPC(raw []byte) ([]byte, error) {
+	cmd, err := shadow.DecodeCommand(raw)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(s.bgCtx, 10*time.Second)
+	defer cancel()
+	res, err := s.shadowRepl.Apply(ctx, cmd)
+	resp := shadowRPCResponse{Result: res}
+	if err != nil {
+		var domain *shadow.Error
+		if !errors.As(err, &domain) {
+			return nil, err
+		}
+		resp.Domain = domain
+	}
+	return json.Marshal(resp)
+}
+
+func (s *Server) handleShadowReadRPC(raw []byte) ([]byte, error) {
+	var req shadowRPCRead
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(s.bgCtx, 10*time.Second)
+	defer cancel()
+	timeout, err := shadowRPCTimeout(ctx)
+	if err != nil {
+		return nil, err
+	}
+	shards := s.shadowShards.Load()
+	if shards == nil {
+		return nil, errors.New("server: 影子分片未启动")
+	}
+	if err := shards.Barrier(req.Thing, timeout); err != nil {
+		return nil, err
+	}
+	resp := shadowRPCResponse{}
+	switch req.Op {
+	case "get":
+		resp.Document, resp.Found = s.shadows.Get(req.Thing, req.Shadow)
+	case "list":
+		resp.Names = s.shadows.List(req.Thing)
+	default:
+		return nil, errors.New("server: 未知影子读操作")
+	}
+	return json.Marshal(resp)
+}
+
+func (s *Server) applyForwardedShadow(ctx context.Context, _ cluster.NodeID,
+	cmd shadow.Command,
+) (*shadow.Result, error) {
+	shards := s.shadowShards.Load()
+	if shards == nil {
+		return nil, errors.New("server: 影子分片未启动")
+	}
+	if shards.HasLocalReplica(cmd.Thing) {
+		return s.shadowRepl.Apply(ctx, cmd)
+	}
+	owner, ok := shards.PreferredNode(cmd.Thing)
+	if !ok {
+		return nil, cluster.ErrNotMember
+	}
+	raw, err := shadow.EncodeCommand(cmd)
+	if err != nil {
+		return nil, err
+	}
+	response, err := s.repl.ForwardShadowWrite(owner, raw)
+	s.shadowRoute.remoteWrites.Add(1)
+	if err != nil {
+		s.shadowRoute.remoteWriteErrors.Add(1)
+		return nil, err
+	}
+	resp, err := decodeShadowRPCResponse(response)
+	if err != nil {
+		s.shadowRoute.remoteWriteErrors.Add(1)
+		return nil, err
+	}
+	if resp.Domain != nil {
+		return nil, resp.Domain
+	}
+	if resp.Result == nil {
+		s.shadowRoute.remoteWriteErrors.Add(1)
+		return nil, errors.New("server: 影子写应答缺少结果")
+	}
+	return resp.Result, nil
+}
+
+func (s *Server) localShadowGet(ctx context.Context, thing, name string) (*shadow.Document, bool, error) {
+	shards := s.shadowShards.Load()
+	if shards == nil {
+		doc, ok := s.shadows.Get(thing, name)
+		return doc, ok, nil
+	}
+	timeout, err := shadowRPCTimeout(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if !shards.HasLocalReplica(thing) {
+		resp, err := s.forwardShadowRead(ctx, thing, name, "get")
+		return resp.Document, resp.Found, err
+	}
+	if err := shards.Barrier(thing, timeout); err != nil {
+		return nil, false, err
+	}
+	doc, ok := s.shadows.Get(thing, name)
+	return doc, ok, nil
+}
+
+func (s *Server) localShadowList(ctx context.Context, thing string) ([]string, error) {
+	shards := s.shadowShards.Load()
+	if shards == nil {
+		return s.shadows.List(thing), nil
+	}
+	timeout, err := shadowRPCTimeout(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !shards.HasLocalReplica(thing) {
+		resp, err := s.forwardShadowRead(ctx, thing, "", "list")
+		return resp.Names, err
+	}
+	if err := shards.Barrier(thing, timeout); err != nil {
+		return nil, err
+	}
+	return s.shadows.List(thing), nil
+}
+
+func (s *Server) forwardShadowRead(ctx context.Context, thing, name, op string) (shadowRPCResponse, error) {
+	shards := s.shadowShards.Load()
+	if shards == nil {
+		return shadowRPCResponse{}, errors.New("server: 影子分片未启动")
+	}
+	if shards.HasLocalReplica(thing) {
+		if op == "get" {
+			doc, found, err := s.localShadowGet(ctx, thing, name)
+			return shadowRPCResponse{Document: doc, Found: found}, err
+		}
+		names, err := s.localShadowList(ctx, thing)
+		return shadowRPCResponse{Names: names}, err
+	}
+	raw, err := json.Marshal(shadowRPCRead{Op: op, Thing: thing, Shadow: name})
+	if err != nil {
+		return shadowRPCResponse{}, err
+	}
+	s.shadowRoute.remoteReads.Add(1)
+	return s.tryShadowRead(shards.ReplicaNodes(thing), raw, s.repl.ForwardShadowRead)
+}
+
+func (s *Server) tryShadowRead(nodes []cluster.NodeID, raw []byte,
+	forward func(cluster.NodeID, []byte) ([]byte, error),
+) (shadowRPCResponse, error) {
+	var lastErr error
+	for i, node := range nodes {
+		if i > 0 {
+			s.shadowRoute.remoteReadFallbacks.Add(1)
+		}
+		s.shadowRoute.remoteReadRPCs.Add(1)
+		response, rerr := forward(node, raw)
+		if rerr != nil {
+			lastErr = rerr
+			continue
+		}
+		resp, rerr := decodeShadowRPCResponse(response)
+		if rerr != nil {
+			lastErr = rerr
+			continue
+		}
+		return resp, nil
+	}
+	if lastErr == nil {
+		lastErr = cluster.ErrNotMember
+	}
+	s.shadowRoute.remoteReadErrors.Add(1)
+	return shadowRPCResponse{}, lastErr
+}
+
+func (s *Server) forwardShadowGet(ctx context.Context, _ cluster.NodeID,
+	thing, name string,
+) (*shadow.Document, bool, error) {
+	resp, err := s.forwardShadowRead(ctx, thing, name, "get")
+	return resp.Document, resp.Found, err
+}
+
+func (s *Server) forwardShadowList(ctx context.Context, _ cluster.NodeID,
+	thing string,
+) ([]string, error) {
+	resp, err := s.forwardShadowRead(ctx, thing, "", "list")
+	return resp.Names, err
+}
+
 // startSessionShards 起会话分区组，并把会话写入切到复制实现上（CLU-111）。
 //
 // 这一步让会话与离线队列不再钉在接入节点的盘上：设备连到另一个节点时
@@ -242,12 +673,27 @@ func (s *Server) startSessionShards(replicas map[cluster.NodeID]uint64) error {
 	}
 	local := s.sessionLocal
 	g, err := s.repl.StartSessionShards(cluster.ShardOptions{
-		Count:     rep.SessionShards,
-		Replicas:  replicas,
-		Peers:     s.replPeers,
-		Bootstrap: s.cfg.Node.Mode == config.ModeBootstrap,
-		Apply: func(shard, index uint64, data []byte) (uint64, error) {
-			return local.ApplySessionCmd(shard, index, data, owns(shard))
+		Count:             rep.SessionShards,
+		ReplicationFactor: int(rep.SessionReplicationFactor),
+		Replicas:          replicas,
+		Peers:             s.replPeers,
+		Bootstrap:         s.cfg.Node.Mode == config.ModeBootstrap,
+		// 整批 apply（CLU-125）：一批已提交日志进同一个写事务，于是
+		// fsync 从"每条一次"变成"每批一次"。逐条那条路径（Apply）留着
+		// 没接——它仍被单条的用例与 RestoreSessionShard 之外的调用方
+		// 使用，而两条并存要有一条是权威的：这里接的是整批。
+		ApplyBatch: func(shard uint64, ents []cluster.ShardEntry) error {
+			batch := make([]store.SessionEntry, len(ents))
+			for i := range ents {
+				batch[i] = store.SessionEntry{Index: ents[i].Index, Data: ents[i].Data}
+			}
+			if err := local.ApplySessionBatch(shard, batch, owns(shard)); err != nil {
+				return err
+			}
+			for i := range ents {
+				ents[i].Result = batch[i].Result
+			}
+			return nil
 		},
 		AppliedIndex: local.SessionAppliedIndex,
 		SnapshotTo: func(shard uint64, w io.Writer) error {
@@ -256,6 +702,10 @@ func (s *Server) startSessionShards(replicas map[cluster.NodeID]uint64) error {
 		RestoreFrom: func(shard uint64, r io.Reader) error {
 			return local.RestoreSessionShard(shard, owns(shard), r)
 		},
+		ReadSession: func(clientID string) ([]byte, bool, error) {
+			return local.ReadReplicaSnapshot(clientID)
+		},
+		MergeProposals: store.MergeSessionProposals,
 		// ApplyTimeout 留 0 取分片层的默认值（10 秒），与元数据组一致：
 		// 两者都没有单独的配置项，超时只在"分片还没选出 leader"时触发。
 	})
@@ -267,8 +717,22 @@ func (s *Server) startSessionShards(replicas map[cluster.NodeID]uint64) error {
 	// 日志可应用。
 	shards = g
 	s.shards = g
+	owners, err := cluster.NewShardOwnership(s.repl, g, s.cfg.Cluster.ShardCount)
+	if err != nil {
+		_ = g.Close()
+		return fmt.Errorf("server: 启动分片所有权服务失败: %w", err)
+	}
+	if err := s.owners.Use(owners); err != nil {
+		_ = owners.Close()
+		_ = g.Close()
+		return fmt.Errorf("server: 切换分片所有权服务失败: %w", err)
+	}
 	s.sessions.use(store.NewReplicatedSessionStore(local, g))
-	s.log.Info("会话分区组已启动", "分片数", g.ShardCount())
+	rf := rep.SessionReplicationFactor
+	if rf == 0 {
+		rf = uint64(len(replicas))
+	}
+	s.log.Info("会话分区组已启动", "分片数", g.ShardCount(), "副本因子", rf)
 	return nil
 }
 
@@ -410,10 +874,9 @@ func (s *Server) startReplication(ctx context.Context) error {
 // 没有分区组时（单机，或装配尚未走到那一步）回真：这个判据只在集群下
 // 有意义，而在单机下让它恒假会把就绪探针永久钉死。
 func (s *Server) shardsReady() bool {
-	if s.shards == nil {
-		return true
-	}
-	return s.shards.Ready()
+	shadowShards := s.shadowShards.Load()
+	return (s.shards == nil || s.shards.Ready()) &&
+		(shadowShards == nil || shadowShards.Ready())
 }
 
 // runShardReadiness 把会话分区组的就绪持续写进就绪探针（CLU-118）。
@@ -442,6 +905,18 @@ func (s *Server) runShardReadiness(ctx context.Context) {
 			was = now
 			if now {
 				s.ready.Set(compShards, true, "")
+				if n, err := s.shards.BalanceLeaders(); err != nil {
+					s.log.Warn("会话分片 leader 均衡请求部分失败", "错误", err)
+				} else if n > 0 {
+					s.log.Info("会话分片 leader 开始均衡", "转移数", n)
+				}
+				if shadowShards := s.shadowShards.Load(); shadowShards != nil {
+					if n, err := shadowShards.BalanceLeaders(); err != nil {
+						s.log.Warn("影子分片 leader 均衡请求部分失败", "错误", err)
+					} else if n > 0 {
+						s.log.Info("影子分片 leader 开始均衡", "转移数", n)
+					}
+				}
 			} else {
 				s.ready.Set(compShards, false, "会话分区组尚未选出 leader")
 			}
@@ -590,6 +1065,31 @@ func (s *Server) buildShadowStore(local shadow.Store) (shadow.Store, error) {
 type shadowLog struct{ s *Server }
 
 func (l shadowLog) AppendShadow(ctx context.Context, id string, raw []byte) error {
+	if shadowShards := l.s.shadowShards.Load(); shadowShards != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		cmd, err := shadow.DecodeCommand(raw)
+		if err != nil {
+			return err
+		}
+		env, err := json.Marshal(shadowShardEnvelope{ID: id, Raw: raw})
+		if err != nil {
+			return err
+		}
+		if _, err := shadowShards.Propose(cmd.Thing, env); err != nil {
+			return err
+		}
+		// 提案可能直达远端 leader；等本地 RF=all 副本应用后 pending 才有结果。
+		timeout := 10 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			timeout = time.Until(deadline)
+			if timeout <= 0 {
+				return context.DeadlineExceeded
+			}
+		}
+		return shadowShards.Barrier(cmd.Thing, timeout)
+	}
 	_, err := l.s.replStore.Apply(ctx, meta.Command{
 		ID:     id,
 		Kind:   meta.CmdNop,
@@ -607,6 +1107,15 @@ func (s *Server) applyShadowCommand(id string, raw []byte) error {
 		return errors.New("server: 影子复制未装配")
 	}
 	return s.shadowRepl.ApplyCommitted(id, raw)
+}
+
+func (s *Server) applyShadowCommandTx(id string, raw []byte, tx meta.Transaction) (func(), error) {
+	if s.shadowRepl == nil || s.shadows == nil {
+		return nil, errors.New("server: 影子复制未装配")
+	}
+	return s.shadowRepl.ApplyCommittedTx(id, raw, func(cmd shadow.Command) (*shadow.Result, error) {
+		return s.shadows.ApplyTx(tx, cmd)
+	})
 }
 
 // ---------- mesh 分发与通告（CLU-075 至 CLU-080） ----------
@@ -633,8 +1142,38 @@ func (s *Server) onMesh(from cluster.NodeID, p cluster.MeshPayload) {
 	if p.Filters != nil && s.rt != nil {
 		s.rt.Interest().Advertise(from, p.Filters)
 	}
-	if p.Things != nil && s.remoteThings != nil {
-		s.remoteThings.Advertise(from, p.Things)
+	if s.remoteThings != nil {
+		switch {
+		case p.ThingSnapshot:
+			s.remoteThings.ApplySnapshot(from, p.ThingEpoch, p.ThingVersion, p.Things)
+			s.thingSyncMu.Lock()
+			delete(s.thingLegacyPeers, from)
+			s.thingSyncMu.Unlock()
+		case p.ThingEpoch != 0:
+			s.remoteThings.ApplyDelta(from, p.ThingEpoch, p.ThingFrom,
+				p.ThingVersion, p.ThingChanges)
+			s.thingSyncMu.Lock()
+			delete(s.thingLegacyPeers, from)
+			s.thingSyncMu.Unlock()
+		case p.Things != nil:
+			// 兼容旧格式的全量快照。下一条带版本的增量会因没有
+			// cursor 请求一次新格式快照，之后进入增量模式。
+			s.remoteThings.Advertise(from, p.Things)
+			s.thingSyncMu.Lock()
+			if s.thingLegacyPeers == nil {
+				s.thingLegacyPeers = make(map[cluster.NodeID]bool)
+			}
+			s.thingLegacyPeers[from] = true
+			s.thingSyncMu.Unlock()
+		}
+	}
+	if p.ThingSync && from != "" {
+		s.thingSyncMu.Lock()
+		if s.thingSyncRequests == nil {
+			s.thingSyncRequests = make(map[cluster.NodeID]bool)
+		}
+		s.thingSyncRequests[from] = true
+		s.thingSyncMu.Unlock()
 	}
 	if p.Shares != nil && s.rt != nil {
 		// 共享订阅组的成员数（MQTT-116）。同样是全量快照：丢一次通告
@@ -665,7 +1204,7 @@ func (s *Server) runGossip(ctx context.Context) {
 	if interval <= 0 {
 		interval = defaultPumpInterval
 	}
-	// 通告比追平稀疏得多：它是全量快照，频率高只是白费带宽。
+	// 设备归属走带版本增量；通配符与共享组数量很小，仍发全量快照。
 	t := time.NewTicker(interval * 5)
 	defer t.Stop()
 	// known 记住上一轮见到的对端，用来发现"新出现的对端"并给它发一次
@@ -674,6 +1213,9 @@ func (s *Server) runGossip(ctx context.Context) {
 	//
 	// 只有这个协程读写它，因此不加锁。
 	known := map[cluster.NodeID]bool{}
+	thingSynced := map[cluster.NodeID]bool{}
+	thingPeerVersion := map[cluster.NodeID]uint64{}
+	var thingPublishedVersion uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -682,29 +1224,61 @@ func (s *Server) runGossip(ctx context.Context) {
 			if s.repl == nil {
 				continue
 			}
-			p := cluster.MeshPayload{
+			thingVersion, thingChanges := s.brk.DrainThingChanges()
+			thingFrom := thingPublishedVersion
+			base := cluster.MeshPayload{
 				Filters: s.rt.LocalWildcards(),
-				Things:  s.brk.LocalThings(),
 				Shares:  s.rt.LocalSharedCounts(),
 			}
-			// 两个字段都要给出非 nil 的切片：nil 表示"这次没带这类
+			// 两个小快照都要给出非 nil 的切片：nil 表示"这次没带这类
 			// 负载"，而空切片表示"本节点一个都没有"。混同的后果是
 			// 最后一个订阅退订之后对端永远记着旧的那一份。
-			if p.Filters == nil {
-				p.Filters = []string{}
+			if base.Filters == nil {
+				base.Filters = []string{}
 			}
-			if p.Things == nil {
-				p.Things = []string{}
+			if base.Shares == nil {
+				base.Shares = []cluster.ShareCount{}
 			}
-			if p.Shares == nil {
-				p.Shares = []cluster.ShareCount{}
+			s.thingSyncMu.Lock()
+			syncRequests := s.thingSyncRequests
+			s.thingSyncRequests = make(map[cluster.NodeID]bool)
+			legacyPeers := make(map[cluster.NodeID]bool, len(s.thingLegacyPeers))
+			for peer := range s.thingLegacyPeers {
+				legacyPeers[peer] = true
 			}
+			s.thingSyncMu.Unlock()
 			peers := s.repl.Peers()
 			for _, peer := range peers {
+				p := base
+				p.ThingEpoch = s.thingEpoch
+				p.ThingSync = s.remoteThings != nil && s.remoteThings.NeedsSync(peer)
+				peerVersion := thingPeerVersion[peer]
+				switch {
+				case legacyPeers[peer] || syncRequests[peer] || !thingSynced[peer]:
+					v, things := s.brk.ThingSnapshot()
+					p.ThingSnapshot = true
+					p.ThingFrom, p.ThingVersion, p.Things = v, v, things
+				case peerVersion == thingFrom:
+					p.ThingFrom, p.ThingVersion = thingFrom, thingVersion
+					p.ThingChanges = thingChanges
+				case peerVersion >= thingVersion:
+					// 对端刚拿过一份比当前已发布水位更新的快照。
+					// 不倒灌旧增量，只发送它已经看到的版本心跳。
+					p.ThingFrom, p.ThingVersion = peerVersion, peerVersion
+				default:
+					v, things := s.brk.ThingSnapshot()
+					p.ThingSnapshot = true
+					p.ThingFrom, p.ThingVersion, p.Things = v, v, things
+				}
 				if err := s.repl.SendMesh(peer, p); err != nil {
 					s.log.Debug("通告失败", "对端", string(peer), "错误", err.Error())
+					thingSynced[peer] = false
+					continue
 				}
+				thingSynced[peer] = true
+				thingPeerVersion[peer] = p.ThingVersion
 			}
+			thingPublishedVersion = thingVersion
 			// 新出现的对端要补一次保留消息全量（CLU-108）。两端各自
 			// 做这件事，所以 dump 天然是双向的——这同时把一个刚重启、
 			// Lamport 计数器落后的节点抬上来（MQTT-123 的接收规则）。
@@ -713,6 +1287,12 @@ func (s *Server) runGossip(ctx context.Context) {
 				seen[peer] = true
 				if !known[peer] {
 					s.dumpRetainedTo(peer)
+				}
+			}
+			for peer := range thingSynced {
+				if !seen[peer] {
+					delete(thingSynced, peer)
+					delete(thingPeerVersion, peer)
 				}
 			}
 			known = seen
@@ -765,6 +1345,10 @@ func (s *Server) forgetDepartedNodes() {
 		if s.remoteThings != nil {
 			s.remoteThings.Forget(node)
 		}
+		s.thingSyncMu.Lock()
+		delete(s.thingLegacyPeers, node)
+		delete(s.thingSyncRequests, node)
+		s.thingSyncMu.Unlock()
 		s.log.Info("已忘掉离开成员列表的节点的通告", "节点", string(node))
 	}
 }
@@ -1169,6 +1753,9 @@ func (s *Server) AddClusterMember(id, addr string, replicaID uint64) error {
 	if s.repl == nil {
 		return errors.New("server: 单机模式没有复制组")
 	}
+	if s.cfg.Cluster.Replication.SessionReplicationFactor != 0 {
+		return errors.New("server: RF 会话分片尚不支持在线成员变更；须先迁移各分片的 Raft 副本")
+	}
 	if err := s.repl.AddMember(cluster.NodeID(id), addr, replicaID); err != nil {
 		return err
 	}
@@ -1181,6 +1768,9 @@ func (s *Server) AddClusterMember(id, addr string, replicaID uint64) error {
 func (s *Server) RemoveClusterMember(id string) error {
 	if s.repl == nil {
 		return errors.New("server: 单机模式没有复制组")
+	}
+	if s.cfg.Cluster.Replication.SessionReplicationFactor != 0 {
+		return errors.New("server: RF 会话分片尚不支持在线成员变更；须先迁移各分片的 Raft 副本")
 	}
 	if err := s.repl.RemoveMember(cluster.NodeID(id)); err != nil {
 		return err

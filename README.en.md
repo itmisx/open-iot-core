@@ -38,6 +38,7 @@ PostgreSQL or callback service is required.
 | **Protocol and concurrency correctness** | Race detector, deterministic simulation and short fuzzing; at least 95% coverage in MQTT, authorization and shadow packages |
 | **Console usability** | 37 flows execute in real Chromium; browser errors and unhandled promise rejections fail the run |
 | **Merge gate** | Formatting, static analysis, architecture contracts, race tests, coverage, cross-compilation and fuzzing run under `make gate` |
+| **Performance data** | Throughput, latency, connection rate and per-connection memory come from one `make bench-e2e` run; script, environment record and raw data are all committed |
 
 > [!NOTE]
 > The project is currently **pre-1.0**. It connects real devices, but has no public
@@ -233,6 +234,61 @@ path. The derivation is in `docs/prd/02-architecture.md`.
 
 </details>
 
+## 📊 Benchmarks
+
+Produced by a single command on one **Apple M3 Pro (11 cores / 36 GiB / macOS 26.3 /
+go1.24.4)**; the script, the per-run raw data and the environment record are all in the
+repository (2026-11-22):
+
+```bash
+RESULTS=docs/baseline/throughput make bench-e2e
+```
+
+| Scenario | Single node (whole machine) | Three-node cluster (one machine, **total**) |
+| --- | --- | --- |
+| **One-to-one QoS 0, zero-loss ceiling** | **150,000 msg/s**, p50 0.37 ms, p99 1.30 ms | same node **150,000**, p50 0.21 ms, p99 1.30 ms<br>cross-node **120,000**, p50 0.76 ms, p99 2.12 ms |
+| **One-to-one QoS 1** (16 in flight) | 100k offered → **99,968 msg/s**, zero loss, p50 15.68 ms | cross-node, 40k offered → **40,000**, zero loss, p50 0.51 ms |
+| **Fan-out** (1 → 1000 subscribers × 100 msg/s) | **99,998 msg/s**, p50 2.02 ms, p99 6.84 ms | cross-node **99,997**, p50 2.46 ms, p99 7.18 ms |
+| **Connects, non-persistent session** (concurrency 256) | **33,321 conn/s**, 12,000 held, p50 5.11 ms | **23,540 conn/s**, 6,000 held, p50 10.25 ms |
+| **Connects, persistent session** | same as above (standalone skips consensus) | **3,227 conn/s** (concurrency 2048, 6,000 held), p50 497 ms, p99 991 ms |
+| **Memory per connection** | **2,306 bytes** (heap growth ÷ connections, at 12,000 held) | — |
+| **Shadow updates** (through the replicated log) | **166 updates/s** (at concurrency 5; flat at 154–166 from 1 to 100, reproducible) | **456–1,476 updates/s** at concurrency 200 (4 samples — **this machine cannot resolve a ceiling**) |
+
+**Four preconditions**: the load generator and the server share one machine; traffic goes
+to the plaintext endpoint (no TLS handshake); authentication is `insecure-none` while
+**authorization is still evaluated per operation**; throughput-related quotas are lifted.
+Drop any one of them and these numbers get read as what a default configuration can do.
+
+Reading the table:
+
+- **A zero-loss ceiling is measured with a rate ladder** — pressure is raised rung by rung
+  until delivery stops keeping up, so it is a ceiling rather than "whatever we offered".
+  The cross-node 120k is a **lower bound**: no loss had appeared yet at that rung.
+- **The cluster column is a three-node total**; don't divide it by the single-node column.
+  Same-node and single-node are both 150k, which means this row is capped by **the
+  machine**, not by the node.
+- **The connect rows are medians of 3 runs**: single-node range 21,956–33,738, cluster
+  non-persistent 22,828–24,249, cluster persistent 2,976–3,270. The first two have a wide
+  run-to-run spread, so a single run is not comparable.
+- **The two rows that go through consensus need enough concurrency to be measured at all.**
+  Both persistent connects and shadow updates rise with concurrency: persistent connects
+  reach only ~1,156/s at concurrency 256, 1,922 at 512, and 3,227 at 2048 — **a figure
+  taken at low concurrency is capped by the load generator, not by the server**. The
+  concurrency used is stated in parentheses for both rows.
+- **The shadow row has opposite shapes on one node and three**, so don't read it as
+  "a cluster is always slower": on a single node throughput stays at 154–166 updates/s
+  from concurrency 1 to 100 while latency grows linearly (it is serialized — adding
+  concurrency does nothing; CLU-190's group commit took the apply layer from 160 to
+  1,318 updates/s and end-to-end up 39%, but the shape did not change — the remaining
+  serialization is upstream and not yet located); on three nodes it rises with concurrency but
+  varies by 3.2× between runs at high concurrency (four samples at concurrency 200 read
+  456 / 489 / 1,199 / 1,476), so this machine cannot give a ceiling. Control-plane writes
+  (shadow, thing creation, certificate issuance) go through this replicated log; the
+  device data plane does not.
+
+Every ladder rung, the raw JSONL and the measurement protocol are in
+[`docs/baseline/throughput.md`](docs/baseline/throughput.md).
+
 ## 🚨 Known limitations
 
 > [!WARNING]
@@ -254,12 +310,11 @@ path. The derivation is in `docs/prd/02-architecture.md`.
 **Implementation behind the baseline**
 
 - **`aws_strict` has no configuration entry point.** The deviations listed under "Deliberate differences from AWS" cannot currently be reverted to AWS behaviour (PRD `CMP-002`, `CMP-003` require this; the implementation has not caught up).
-- **Quotas have no configuration entry point.** Defaults are aligned with AWS but are currently hard-coded and not configurable (PRD `QTA-001` requires full configurability).
-- **TLS handshake failures produce no metrics and no logs.** A client certificate not issued by this CA, an ALPN mismatch, a missing SNI, a handshake timeout — none of these leave any record server-side (PRD `OBS-021` is not implemented). MQTT-level connection and authorization denials **are** logged.
+- **TLS handshake failures produce metrics but no logs.** `openiot_tls_handshakes_total{result=...}` plus `tls_handshake_in_flight` / `tls_handshake_peak` / `tls_handshake_capacity` now distinguish success, resumption, failure and throttling — but the **reason** a handshake failed (certificate not issued by this CA, ALPN mismatch, missing SNI, handshake timeout) is still not logged, so debugging one means watching a counter go up (the remaining half of PRD `OBS-021`). MQTT-level connection and authorization denials **are** logged.
 
 **Scope of verification**
 
-- **There is no published throughput or latency baseline**, and neither is a merge gate — numbers that cannot be reproduced will not be published. What is committed is the memory baseline (`docs/baseline/memory.json`).
+- **Throughput and latency are not a merge gate** (timings vary with the machine). The published baseline is the [Benchmarks](#-benchmarks) section above: one command on one laptop, with the raw data committed. Connects that include the TLS handshake, and six-figure connection density, are measured separately (`docs/baseline/throughput/connect-mtls.jsonl` and `connect-linux-docker.jsonl` — the latter held 200,000 concurrent connections inside a Docker Linux VM); neither is part of the main results table. **Cross-machine runs have still not been measured** — this repository has no multi-machine environment, so any claim about "what N machines can do" is an inference and no number is published for it.
 - **The Kubernetes manifests have only been verified on a single-node cluster** (Docker Desktop, v1.34.1): certificates and Secrets, PVC permissions, each Pod taking its own replication certificate, three-node election, follower write forwarding, failover after a hard kill of the leader, **recovery of any deleted Pod with a restart count of 0**, and **persistent sessions and offline queues across Pods (including deleting the Pod that did the enqueueing first)** all passed; the **cross-failure-domain half remains unverified** — a single-node cluster requires removing the anti-affinity constraint to run at all. See [`deploy/cluster/k8s/README.md`](deploy/cluster/k8s/README.md), which also records the conclusion the previous round got wrong and the two defects it hid.
 
 ## 💻 CLI
@@ -351,7 +406,7 @@ this is a deviation between implementation and baseline, not a deliberate trade-
 | [`docs/TODO.md`](docs/TODO.md) | Progress ledger; records what has been implemented, does not define what should be |
 | [`docs/tutorial/`](docs/tutorial/) | Source of the in-console tutorial (parallel Chinese and English trees) |
 | [`deploy/README.md`](deploy/README.md) | Required reading before deployment |
-| [`docs/baseline/`](docs/baseline/) | Published memory baseline data |
+| [`docs/baseline/`](docs/baseline/) | Published baselines: memory (compared by the gate) and end-to-end throughput (outside the gate) |
 | [`CLAUDE.md`](CLAUDE.md) | Working notes for this repository |
 
 ## 🧪 Development
@@ -361,6 +416,7 @@ make gate      # Merge gate; must be entirely green
 make test      # Fast regression
 make console   # Required after changing web/console/src/ or docs/tutorial/
 make sim       # Deep random-seed sweep of the deterministic simulation
+make bench-e2e # End-to-end benchmarks (real processes; single node and cluster)
 make help      # All targets
 ```
 
@@ -378,6 +434,7 @@ network access sit outside it and are run individually:
 | [`tests/cluster`](tests/cluster/) | A cluster of three real processes: a hard kill of the leader, membership changes, and **persistent sessions and offline queues across all three nodes** | `make cluster-test` |
 | [`tests/console-e2e`](tests/console-e2e/) | One full pass of the console in real Chromium, with no browser errors permitted | `make console-e2e` |
 | `tests/examples` | The three SDK examples referenced by the tutorial, run against a temporary node | `make examples-test` |
+| [`tests/bench`](tests/bench/) | End-to-end benchmarks: one scenario set per deployment shape, with results and environment written out | `make bench-e2e` |
 
 Before contributing, read the corresponding chapter under `docs/prd/`: an implementation may not
 bypass the interface contracts and behavioural boundaries defined there. **Any behavioural

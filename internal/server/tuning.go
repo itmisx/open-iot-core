@@ -68,4 +68,6 @@ func brokerOptions(c *config.BrokerConfig, opt *broker.Options) {
 	opt.ReadBufferSize = c.ReadBuffer
 	opt.MaxWriteBatch = c.MaxWriteBatch
 	opt.WriteTimeout = c.WriteTimeout.D()
+	opt.TCPKeepAlive = c.TCPKeepAlive.D()
+	opt.TLSHandshakeConcurrency = c.TLSHandshakeConcurrency
 }

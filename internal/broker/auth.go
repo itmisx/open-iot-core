@@ -68,7 +68,7 @@ func (a CertAuthenticator) Authenticate(v *meta.View, info ConnInfo, clientID st
 			ClientID:      clientID,
 			Thing:         cert.Thing,
 			ThingAttached: cert.Thing != "",
-			Cert: authz.CertContext{
+			Cert: &authz.CertContext{
 				SerialNumber: info.CertSerial,
 				Subject:      info.CertSubject,
 				Issuer:       info.CertIssuer,

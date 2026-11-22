@@ -1,0 +1,6 @@
+{"scenario":"stage-ab/clean-n3-s8","nodes":3,"clients":1500,"qos":0,"payloadBytes":64,"connectPerSec":27935.366872845196,"connectP50Ms":8.212041999999999,"connectP99Ms":15.566417000000001,"heldConns":1500,"seconds":0.053695375}
+{"scenario":"stage-ab/persistent-n3-s8","nodes":3,"clients":1500,"qos":0,"payloadBytes":64,"connectPerSec":205.1031778564409,"connectP50Ms":594.853917,"connectP99Ms":3568.111834,"heldConns":1500,"seconds":7.313392292}
+{"scenario":"stage-ab/clean-n3-s8","nodes":3,"clients":1500,"qos":0,"payloadBytes":64,"connectPerSec":25920.76295795789,"connectP50Ms":7.752542,"connectP99Ms":19.814709,"heldConns":1500,"seconds":0.057868667}
+{"scenario":"stage-ab/persistent-n3-s8","nodes":3,"clients":1500,"qos":0,"payloadBytes":64,"connectPerSec":202.55031208675942,"connectP50Ms":1006.4095829999999,"connectP99Ms":3012.952459,"heldConns":1500,"seconds":7.405567459}
+{"scenario":"stage-ab/clean-n3-s8","nodes":3,"clients":1500,"qos":0,"payloadBytes":64,"connectPerSec":26027.771632331696,"connectP50Ms":7.570875,"connectP99Ms":20.564167,"heldConns":1500,"seconds":0.05763075}
+{"scenario":"stage-ab/persistent-n3-s8","nodes":3,"clients":1500,"qos":0,"payloadBytes":64,"connectPerSec":281.2485102793751,"connectP50Ms":541.839042,"connectP99Ms":2476.770459,"heldConns":1500,"seconds":5.333361583}

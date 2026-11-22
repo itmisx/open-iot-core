@@ -392,6 +392,63 @@ func TestInsecureAuthNeedsTwoAcknowledgements(t *testing.T) {
 	}
 }
 
+func TestProxyV2ListenerRequiresExplicitTrustBoundary(t *testing.T) {
+	base := Default()
+	base.Listeners.MQTTTLS.Enabled = false
+	base.Listeners.MQTTPlain = PlainListener{
+		Enabled: true, Addr: "0.0.0.0:1883",
+		ProxyProtocol: "v2", ProxyHeaderTimeout: Duration(3 * time.Second),
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		field  string
+	}{
+		{"empty allowlist", func(*Config) {}, "listeners.mqtt_plain.trusted_proxies"},
+		{"invalid cidr", func(c *Config) {
+			c.Listeners.MQTTPlain.TrustedProxies = []string{"127.0.0.1"}
+		}, "listeners.mqtt_plain.trusted_proxies[0]"},
+		{"zero timeout", func(c *Config) {
+			c.Listeners.MQTTPlain.TrustedProxies = []string{"127.0.0.1/32"}
+			c.Listeners.MQTTPlain.ProxyHeaderTimeout = 0
+		}, "listeners.mqtt_plain.proxy_header_timeout"},
+		{"unknown protocol", func(c *Config) {
+			c.Listeners.MQTTPlain.ProxyProtocol = "v1"
+		}, "listeners.mqtt_plain.proxy_protocol"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			var fe *FieldError
+			if !errors.As(err, &fe) || fe.Field != tc.field {
+				t.Fatalf("error = %v, want field %s", err, tc.field)
+			}
+		})
+	}
+
+	base.Listeners.MQTTPlain.TrustedProxies = []string{"127.0.0.1/32", "10.0.0.0/8"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid trusted proxy config rejected: %v", err)
+	}
+}
+
+func TestPlainListenerRejectsTrustedProxiesWithoutProxyMode(t *testing.T) {
+	cfg := Default()
+	cfg.Listeners.MQTTTLS.Enabled = false
+	cfg.Listeners.MQTTPlain = PlainListener{
+		Enabled: true, Addr: "127.0.0.1:1883",
+		TrustedProxies: []string{"127.0.0.1/32"},
+	}
+	err := cfg.Validate()
+	var fe *FieldError
+	if !errors.As(err, &fe) || fe.Field != "listeners.mqtt_plain.trusted_proxies" {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestLoadFileErrors(t *testing.T) {
 	f := NewFlags("t", io.Discard)
 	if err := f.Parse([]string{"--config", "/no/such/file.yaml"}); err != nil {
@@ -430,6 +487,7 @@ func TestEncodeRoundTrip(t *testing.T) {
 	cfg := Default()
 	cfg.Node.ID = "node-7"
 	cfg.Cluster.MaxViewStaleness = Duration(30 * time.Second)
+	cfg.Listeners.MQTTTLS.SessionTicketKeysFile = "/run/secrets/ticket.keys"
 
 	var buf bytes.Buffer
 	if err := cfg.Encode(&buf); err != nil {
@@ -445,6 +503,9 @@ func TestEncodeRoundTrip(t *testing.T) {
 	}
 	if back.Node.ID != "node-7" || back.Cluster.MaxViewStaleness != cfg.Cluster.MaxViewStaleness {
 		t.Error("往返后配置不一致")
+	}
+	if back.Listeners.MQTTTLS.SessionTicketKeysFile != cfg.Listeners.MQTTTLS.SessionTicketKeysFile {
+		t.Error("往返后 TLS session ticket 密钥文件丢失")
 	}
 	if err := back.Validate(); err != nil {
 		t.Errorf("往返后应仍合法: %v", err)

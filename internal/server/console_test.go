@@ -1042,6 +1042,9 @@ func TestMetricsEndpoint(t *testing.T) {
 		`result="denied"`,
 		"openiot_certificates{",
 		"openiot_goroutines{",
+		"openiot_stack_inuse_bytes{",
+		"openiot_runtime_sys_bytes{",
+		"openiot_runtime_memory_limit_bytes{",
 		"openiot_meta_revision{",
 		"openiot_events_dropped_total{",
 	} {

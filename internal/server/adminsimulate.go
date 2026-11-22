@@ -206,12 +206,10 @@ func (a *adminServer) resolveSubject(in *simulateRequest) (
 		// ThingAttached 为真：干跑的前提是"这台设备用它绑定的证书连进来"。
 		// 置假会让全部 Thing 类变量解析失败，那不是用户想问的问题。
 		ThingAttached: thing != "",
-		Cert:          cert,
+		Cert:          &cert,
 	}
 	if thing != "" {
-		ctx.ThingAttr = func(attr string) (string, bool) {
-			return view.ThingAttr(thing, attr)
-		}
+		ctx.ThingAttrs = view
 	}
 	return sets, used, ctx, nil
 }

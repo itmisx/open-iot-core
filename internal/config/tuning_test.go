@@ -11,11 +11,13 @@ import (
 func TestDecodeBrokerAndQuota(t *testing.T) {
 	cfg, err := Decode(strings.NewReader(`
 broker:
+  tls_handshake_concurrency: 512
   writer_workers: 32
   outbound_buffer: 256
   read_buffer: 8192
   max_write_batch: 131072
   write_timeout: 2s
+  tcp_keepalive: 10m
 quota:
   connections: 1000000
   connect_rate: 20000
@@ -24,8 +26,9 @@ quota:
 		t.Fatalf("解析失败: %v", err)
 	}
 	b := cfg.Broker
-	if b.WriterWorkers != 32 || b.OutboundBuffer != 256 || b.ReadBuffer != 8192 ||
-		b.MaxWriteBatch != 131072 || b.WriteTimeout.D() != 2*time.Second {
+	if b.TLSHandshakeConcurrency != 512 || b.WriterWorkers != 32 || b.OutboundBuffer != 256 || b.ReadBuffer != 8192 ||
+		b.MaxWriteBatch != 131072 || b.WriteTimeout.D() != 2*time.Second ||
+		b.TCPKeepAlive.D() != 10*time.Minute {
 		t.Fatalf("broker 小节解出来是 %+v", b)
 	}
 	if cfg.Quota["connections"] != 1_000_000 || cfg.Quota["connect_rate"] != 20_000 {
@@ -56,10 +59,13 @@ func TestValidateBrokerRejects(t *testing.T) {
 	}{
 		{"协程数为负", func(c *Config) { c.Broker.WriterWorkers = -1 }, "broker.writer_workers"},
 		{"协程数过大", func(c *Config) { c.Broker.WriterWorkers = maxWriterWorkers + 1 }, "broker.writer_workers"},
+		{"握手并发为负", func(c *Config) { c.Broker.TLSHandshakeConcurrency = -1 }, "broker.tls_handshake_concurrency"},
+		{"握手并发过大", func(c *Config) { c.Broker.TLSHandshakeConcurrency = maxTLSHandshakeConcurrency + 1 }, "broker.tls_handshake_concurrency"},
 		{"出站队列为负", func(c *Config) { c.Broker.OutboundBuffer = -8 }, "broker.outbound_buffer"},
 		{"读缓冲过小", func(c *Config) { c.Broker.ReadBuffer = 8 }, "broker.read_buffer"},
 		{"合并上限过小", func(c *Config) { c.Broker.MaxWriteBatch = 16 }, "broker.max_write_batch"},
 		{"刷写超时过短", func(c *Config) { c.Broker.WriteTimeout = Duration(time.Millisecond) }, "broker.write_timeout"},
+		{"TCP 保活过短", func(c *Config) { c.Broker.TCPKeepAlive = Duration(time.Second) }, "broker.tcp_keepalive"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Default()

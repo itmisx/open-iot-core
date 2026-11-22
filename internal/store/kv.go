@@ -49,9 +49,44 @@ type KV interface {
 	Scan(prefix []byte, fn func(key, value []byte) bool) error
 	// Batch 原子地应用一组写入。
 	Batch(ops []Op, sync bool) error
+	// InTx 在**一个**写事务里执行 fn，fn 返回错误则整个事务回滚。
+	//
+	// 它与 Batch 的区别是 fn 能**边读边写**：事务内的读看得见自己
+	// 尚未提交的写。需要它的地方是会话分片的 apply（CLU-125）——一批
+	// 已提交日志要进同一个事务，而批内后一条命令必须看得见前一条的
+	// 效果（入队序号在 apply 时由当前状态推出，CLU-115）。用 Batch
+	// 就得先把全批的 ops 算完，那时后一条读到的还是批前的状态。
+	//
+	// sync 为假时允许与别的并发 InTx/Batch 合并进同一个事务，因此
+	// **fn 可能被调用多次**（bbolt 的 Batch 语义）：fn 必须幂等，
+	// 且不得在 fn 之外累积状态——它每次都从事务里重新读。
+	//
+	// fn 里**不得回头调用本 KV 的方法**，一律走传进来的 Tx：内存实现
+	// 在 InTx 期间持着写锁，而 Go 的 RWMutex 不可重入，于是 fn 里一次
+	// Get 就是死锁。这个坑踩过——把会话的整批 apply 故意改成从 KV 读，
+	// 表现不是断言失败而是用例卡死（`panic: test timed out`）。
+	InTx(sync bool, fn func(Tx) error) error
 	// Flush 把内存中的写入落盘。
 	Flush() error
 	Close() error
+}
+
+// Tx 是一个写事务的句柄。
+//
+// 只有读与写两组方法，没有 Commit/Rollback：提交与回滚由 InTx 按 fn
+// 的返回值决定。把它们暴露出来就等于让调用方有机会把事务留着不关，
+// 而 bbolt 同一时刻只容得下一个写事务——那是一次全库停写。
+type Tx interface {
+	// Get 读取一个键，看得见本事务内已写入的值。不存在时返回 ErrNotFound。
+	Get(key []byte) ([]byte, error)
+	// Set 在本事务内写入一个键。
+	Set(key, value []byte) error
+	// Delete 在本事务内删除一个键。
+	Delete(key []byte) error
+	// Scan 按前缀升序遍历，看得见本事务内已写入的值。
+	//
+	// key 与 value 只在 fn 执行期间有效（与 KV.Scan 同一条约定）。
+	Scan(prefix []byte, fn func(key, value []byte) bool) error
 }
 
 // OpKind 是批量写入中的操作类型。

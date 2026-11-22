@@ -325,6 +325,28 @@ func TestAdminThingEndpoints(t *testing.T) {
 	if code != http.StatusNoContent {
 		t.Fatalf("= %d: %s", code, body)
 	}
+	code, body = r.adminReq(t, "POST", adminAPIPrefix+"/things:batch", map[string]any{
+		"things": []map[string]any{
+			{"name": "batch-api-a", "policyName": "p"},
+			{"name": "batch-api-b", "policyName": "p"},
+		},
+	})
+	var batchResult struct {
+		Written int `json:"written"`
+	}
+	if err := json.Unmarshal(body, &batchResult); code != http.StatusOK || err != nil || batchResult.Written != 2 {
+		t.Fatalf("批量写 = %d: %s", code, body)
+	}
+	for _, name := range []string{"batch-api-a", "batch-api-b"} {
+		if code, body = r.adminReq(t, "GET", adminAPIPrefix+"/things/"+name, nil); code != http.StatusOK {
+			t.Fatalf("读取批量设备 %s = %d: %s", name, code, body)
+		}
+	}
+	code, body = r.adminReq(t, "POST", adminAPIPrefix+"/things:batch",
+		map[string]any{"things": []map[string]any{{"name": "x", "unknown": true}}})
+	if code != http.StatusBadRequest {
+		t.Fatalf("批接口未知字段应拒绝，得到 %d: %s", code, body)
+	}
 	code, body = r.adminReq(t, "GET", adminAPIPrefix+"/things/dev-api", nil)
 	if code != http.StatusOK {
 		t.Fatalf("= %d: %s", code, body)

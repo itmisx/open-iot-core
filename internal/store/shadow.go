@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/itmisx/open-iot-core/internal/shadow"
@@ -38,28 +40,24 @@ const shadowRecordVersion = 1
 type ShadowStore struct {
 	kv KV
 
-	// 每 thing 一把锁，实现契约 06 的分区单写者。
-	//
-	// 锁的粒度是 thing 而不是全局：不同设备之间没有共享状态，
-	// 用一把全局锁会让影子吞吐与设备数无关。
-	mu    sync.Mutex
-	lanes map[string]*sync.Mutex
+	// 固定条带锁实现同 thing 单写者。map[thing]*Mutex 会让写过一次的
+	// 百万设备永久留下百万个键与 mutex；条带使这部分常驻内存固定。
+	lanes [256]sync.Mutex
 }
 
 // NewShadowStore 创建持久化影子存储。
 func NewShadowStore(kv KV) *ShadowStore {
-	return &ShadowStore{kv: kv, lanes: make(map[string]*sync.Mutex)}
+	return &ShadowStore{kv: kv}
 }
 
 func (s *ShadowStore) lane(thing string) *sync.Mutex {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m := s.lanes[thing]
-	if m == nil {
-		m = &sync.Mutex{}
-		s.lanes[thing] = m
+	// FNV-1a 的低 8 位用于选 256 条带；手写循环不构造 hasher。
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(thing); i++ {
+		h ^= uint64(thing[i])
+		h *= 1099511628211
 	}
-	return m
+	return &s.lanes[byte(h)]
 }
 
 func shadowKey(thing, name string) []byte {
@@ -106,10 +104,34 @@ func (s *ShadowStore) Apply(_ context.Context, cmd shadow.Command) (*shadow.Resu
 	lane := s.lane(cmd.Thing)
 	lane.Lock()
 	defer lane.Unlock()
+	return applyShadowTo(shadowKVReadWriter{KV: s.kv}, cmd)
+}
+
+// ApplyTx 在调用方已有的写事务里应用影子命令。
+// 调用方负责事务的提交与同步；批内后续命令能读到这里尚未提交的写入。
+func (s *ShadowStore) ApplyTx(tx Tx, cmd shadow.Command) (*shadow.Result, error) {
+	lane := s.lane(cmd.Thing)
+	lane.Lock()
+	defer lane.Unlock()
+	return applyShadowTo(tx, cmd)
+}
+
+type shadowReadWriter interface {
+	Get([]byte) ([]byte, error)
+	Set([]byte, []byte) error
+	Delete([]byte) error
+}
+
+type shadowKVReadWriter struct{ KV }
+
+func (w shadowKVReadWriter) Set(key, value []byte) error { return w.KV.Set(key, value, true) }
+func (w shadowKVReadWriter) Delete(key []byte) error     { return w.KV.Delete(key, true) }
+
+func applyShadowTo(dst shadowReadWriter, cmd shadow.Command) (*shadow.Result, error) {
 
 	key := shadowKey(cmd.Thing, cmd.Shadow)
 	var cur *shadow.Document
-	raw, err := s.kv.Get(key)
+	raw, err := dst.Get(key)
 	switch {
 	case err == nil:
 		if cur, err = decodeShadow(raw); err != nil {
@@ -130,7 +152,7 @@ func (s *ShadowStore) Apply(_ context.Context, cmd shadow.Command) (*shadow.Resu
 	// 状态已被接受。此时若因进程崩溃丢失，设备不会重发，
 	// 云端与设备的认知就永久分叉了。
 	if next == nil {
-		if err := s.kv.Delete(key, true); err != nil {
+		if err := dst.Delete(key); err != nil {
 			return nil, err
 		}
 	} else {
@@ -138,7 +160,7 @@ func (s *ShadowStore) Apply(_ context.Context, cmd shadow.Command) (*shadow.Resu
 		if err != nil {
 			return nil, err
 		}
-		if err := s.kv.Set(key, enc, true); err != nil {
+		if err := dst.Set(key, enc); err != nil {
 			return nil, err
 		}
 	}
@@ -157,6 +179,165 @@ func (s *ShadowStore) CountShadows() int {
 		return true
 	})
 	return n
+}
+
+// PruneNonLocal 在 RF=all -> RF<N 切换后删除本节点不再承载的历史影子。
+// layout 由已持久化的 Raft 放置表派生；同一布局只扫描一次。
+func (s *ShadowStore) PruneNonLocal(layout string, keep func(thing []byte) bool) (
+	deleted int, already bool, err error,
+) {
+	if layout == "" || keep == nil {
+		return 0, false, errors.New("store: 影子裁剪缺少布局或归属函数")
+	}
+	marker := Key(PrefixSystem, "shadow-pruned-v1-"+layout)
+	pruner, ok := s.kv.(interface {
+		PruneMarked([]byte, []byte, func([]byte) (bool, error)) (int, bool, error)
+	})
+	if !ok {
+		return 0, false, errors.New("store: 当前 KV 不支持原子影子裁剪")
+	}
+	return pruner.PruneMarked([]byte{byte(PrefixShadow)}, marker, func(key []byte) (bool, error) {
+		if len(key) < 2 || key[0] != byte(PrefixShadow) {
+			return false, nil
+		}
+		body := key[1:]
+		sep := -1
+		for i, b := range body {
+			if b != KeySep {
+				continue
+			}
+			if sep >= 0 {
+				return false, nil
+			}
+			sep = i
+		}
+		// 损坏或未来版本的键不可因迁移被静默删除。
+		return sep > 0 && !keep(body[:sep]), nil
+	})
+}
+
+// ShadowAppliedKey 是独立影子 Raft 分片的持久化进度键。
+func ShadowAppliedKey(shard uint64) []byte {
+	return Key(PrefixSystem, fmt.Sprintf("shadow-applied-%d", shard))
+}
+
+func (s *ShadowStore) ShadowAppliedIndex(shard uint64) uint64 {
+	raw, err := s.kv.Get(ShadowAppliedKey(shard))
+	if err != nil || len(raw) != 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(raw)
+}
+
+// ShadowEntry 是一批已提交影子命令中的一条。Result/Err 在事务提交成功后
+// 才可交付给请求方；Err 只承载确定性的影子 4xx，存储错误直接返回。
+type ShadowEntry struct {
+	Index  uint64
+	Data   []byte
+	Result *shadow.Result
+	Err    error
+}
+
+// ApplyShadowBatch 在一个事务里顺序应用同一分片的一批命令，并把最终
+// applied index 与文档一同提交。owns 防止错误路由让一个日志改写别组键。
+func (s *ShadowStore) ApplyShadowBatch(shard uint64, ents []ShadowEntry,
+	owns func(string) bool,
+) error {
+	if len(ents) == 0 {
+		return nil
+	}
+	cmds := make([]shadow.Command, len(ents))
+	for i := range ents {
+		cmd, err := shadow.DecodeCommand(ents[i].Data)
+		if err != nil {
+			return err
+		}
+		if cmd.Thing == "" || owns == nil || !owns(cmd.Thing) {
+			return fmt.Errorf("store: 影子命令 %q 不属于分片 %d", cmd.Thing, shard)
+		}
+		cmds[i] = cmd
+	}
+	return s.kv.InTx(false, func(tx Tx) error {
+		for i := range ents {
+			ents[i].Result, ents[i].Err = nil, nil
+		}
+		for i := range cmds {
+			lane := s.lane(cmds[i].Thing)
+			lane.Lock()
+			res, err := applyShadowTo(tx, cmds[i])
+			lane.Unlock()
+			var domain *shadow.Error
+			if err != nil && !errors.As(err, &domain) {
+				return err
+			}
+			ents[i].Result, ents[i].Err = res, err
+		}
+		var applied [8]byte
+		binary.BigEndian.PutUint64(applied[:], ents[len(ents)-1].Index)
+		return tx.Set(ShadowAppliedKey(shard), applied[:])
+	})
+}
+
+// SnapshotShadowShard 只输出由该分片拥有的 thing。命名影子与经典影子
+// 共享 thingName 分区，因此 List 不需要跨分片扫描。
+func (s *ShadowStore) SnapshotShadowShard(shard uint64, owns func(string) bool,
+	w io.Writer,
+) error {
+	var head [8]byte
+	binary.BigEndian.PutUint64(head[:], s.ShadowAppliedIndex(shard))
+	if _, err := w.Write(head[:]); err != nil {
+		return err
+	}
+	var recordHeader [8]byte
+	var writeErr error
+	err := s.kv.Scan([]byte{byte(PrefixShadow)}, func(key, value []byte) bool {
+		parts, ok := SplitKey(key, PrefixShadow, 2)
+		if !ok || owns == nil || !owns(parts[0]) {
+			return true
+		}
+		writeErr = writeKVHeader(w, key, value, &recordHeader)
+		return writeErr == nil
+	})
+	if err != nil {
+		return err
+	}
+	return writeErr
+}
+
+// RestoreShadowShard 用快照完整替换本分片键，并拒绝夹带其他分片的键。
+func (s *ShadowStore) RestoreShadowShard(shard uint64, owns func(string) bool,
+	r io.Reader,
+) error {
+	var head [8]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return fmt.Errorf("store: 影子快照缺少头部: %w", err)
+	}
+	var ops []Op
+	if err := s.kv.Scan([]byte{byte(PrefixShadow)}, func(key, _ []byte) bool {
+		parts, ok := SplitKey(key, PrefixShadow, 2)
+		if ok && owns != nil && owns(parts[0]) {
+			ops = append(ops, Op{Kind: OpDelete, Key: append([]byte(nil), key...)})
+		}
+		return true
+	}); err != nil {
+		return err
+	}
+	for {
+		key, value, err := readKV(r)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		parts, ok := SplitKey(key, PrefixShadow, 2)
+		if !ok || owns == nil || !owns(parts[0]) {
+			return fmt.Errorf("store: 影子快照含分片 %d 不拥有的键", shard)
+		}
+		ops = append(ops, Op{Kind: OpSet, Key: key, Value: value})
+	}
+	ops = append(ops, Op{Kind: OpSet, Key: ShadowAppliedKey(shard), Value: head[:]})
+	return s.kv.Batch(ops, true)
 }
 
 func encodeShadow(d *shadow.Document) ([]byte, error) {

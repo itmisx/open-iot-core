@@ -5,6 +5,14 @@
 
 GO        ?= go
 PKGS      := ./...
+# 整体覆盖率的分母是**随二进制发布的**包（TST-166）。
+#
+# tools/ 下的两样东西（契约检查器与压测器）不进二进制：把一个没有行覆盖的
+# 开发工具算进分母，等于用门禁的余量去抵一件与产品行为无关的事——压测器
+# 一加进来，整体覆盖率从 85.2% 掉到 82.2%，而产品代码一行没改。
+# 它们该有的那种验证是另一类：vet、fmt 与「量出来的数对不对」的用例
+# （tools/mqttbench/main_test.go 盯的是算错了也没有现象的那几处）。
+COVER_PKGS := ./cmd/... ./internal/...
 MQTT_PKGS  := ./internal/mqtt/...
 # TST-010 要求 95% 覆盖率的包：协议层与策略层
 # 严格档：语义保真度直接决定兼容性的包。
@@ -78,7 +86,8 @@ cover-check:
 		printf "%-24s 覆盖率: %s%%（门槛 95%%）\n" "$$pkg" "$$pct"; \
 		awk -v p=$$pct -v n=$$pkg 'BEGIN { if (p+0 < 95) { print n" 低于门槛 95%"; exit 1 } }' || exit 1; \
 	done
-	@$(GO) test -coverprofile=$(COVERFILE) -coverpkg=$(PKGS) $(PKGS) >/dev/null
+	@$(GO) test -coverprofile=$(COVERFILE) \
+		-coverpkg=$$(echo $(COVER_PKGS) | tr ' ' ,) $(COVER_PKGS) >/dev/null
 	@pct=$$($(GO) tool cover -func=$(COVERFILE) | tail -1 | awk '{gsub("%","",$$3); print $$3}'); \
 	echo "整体覆盖率:        $$pct%（门槛 85%）"; \
 	awk -v p=$$pct 'BEGIN { if (p+0 < 85) { print "低于门槛 85%"; exit 1 } }'
@@ -149,6 +158,17 @@ SIM_OPS   ?= 3000
 bench:
 	@$(GO) test $(BENCH_PKGS) -run=XXX -bench=. -benchmem
 
+# TST-060、TST-061、TST-163：端到端基准测试。
+#
+# 与上面的 bench 不是一回事：bench 量的是函数（编解码、匹配、策略求值），
+# 这个起真进程、按真 MQTT 连接压，量的是「一台机器上端到端能跑多少」。
+# 不进 gate：要起进程、要 openssl（集群的复制证书）、要 python3，一轮几分钟。
+#
+# 参数与结果位置见 tests/bench/README.md；入库的那份在 docs/baseline/throughput/。
+.PHONY: bench-e2e
+bench-e2e:
+	@bash tests/bench/run.sh
+
 # TST-072：依赖漏洞扫描
 .PHONY: vuln
 vuln:
@@ -180,7 +200,8 @@ image:
 .PHONY: clean
 clean:
 	@rm -f $(COVERFILE) $(COVERFILE).strict coverage.html
-	@rm -f openiotd openiotctl
+	@rm -f openiotd openiotctl mqttbench
+	@find . -name '*.test' -not -path '*/node_modules/*' -delete
 	@rm -rf $(CONSOLE_DIR)/dist
 	@find . -name .DS_Store -not -path '*/node_modules/*' -delete
 	@rm -rf deploy/cluster/compose/pki deploy/cluster/k8s/pki
@@ -249,6 +270,8 @@ help:
 	@echo "  make console-e2e   在真实浏览器里点一遍控制台（需要 Node 与 Chromium）"
 	@echo "  make examples-test 教程里的 SDK 示例真跑一遍（需要 Python/JDK 与网络）"
 	@echo "  make cluster-test  三个真进程组成元数据集群的验收（需要 openssl 与 python3）"
+	@echo "  make bench         微基准（编解码、主题匹配、策略求值）"
+	@echo "  make bench-e2e     端到端基准：单节点与三节点集群各跑一组场景"
 	@echo "  make gate          完整门禁（fmt/vet/契约/竞态/覆盖率/交叉编译/fuzz）"
 	@echo ""
 	@echo "演示环境可用环境变量覆盖端口与产物目录："

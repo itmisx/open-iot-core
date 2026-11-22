@@ -16,6 +16,52 @@ var ErrDetached = errors.New("session: 运行时已解绑")
 // 而不是让服务端无界积压（PRD MQTT-035）。
 var ErrOutboundFull = errors.New("session: 出站队列已满")
 
+// 常见队列深度的环形缓冲跨连接复用。缓冲一旦排空就从 Runtime 解除引用，
+// 因而一次历史突发不会让百万空闲连接永久恢复到完整队列的内存水位。
+// sync.Pool 在 GC 时可自行丢弃缓存，不形成新的全局常驻上限。
+var outboundRingPools = map[int]*sync.Pool{
+	32:  {},
+	64:  {},
+	128: {},
+	256: {},
+}
+
+type outboundQueue struct {
+	one  Outbound
+	ring []Outbound
+	head int
+	len  int
+}
+
+var outboundQueuePool sync.Pool
+
+func acquireOutboundQueue() *outboundQueue {
+	if v := outboundQueuePool.Get(); v != nil {
+		return v.(*outboundQueue)
+	}
+	return new(outboundQueue)
+}
+
+func releaseOutboundQueue(q *outboundQueue) {
+	*q = outboundQueue{}
+	outboundQueuePool.Put(q)
+}
+
+func acquireOutboundRing(n int) []Outbound {
+	if p := outboundRingPools[n]; p != nil {
+		if v := p.Get(); v != nil {
+			return v.([]Outbound)
+		}
+	}
+	return make([]Outbound, n)
+}
+
+func releaseOutboundRing(ring []Outbound) {
+	if p := outboundRingPools[len(ring)]; p != nil {
+		p.Put(ring)
+	}
+}
+
 // Outbound 是一条待写出的报文。
 //
 // 它只携带已编码的字节与少量元信息：编码在投递决策时一次完成，
@@ -45,8 +91,13 @@ type Runtime struct {
 
 	mu       sync.Mutex
 	conn     net.Conn
-	out      chan Outbound
 	detached bool
+
+	// 出站队列把第一条消息内联；第二条并发积压时才分配完整环形缓冲。
+	// 绝大多数空闲 IoT 连接只发一次 CONNACK，旧的 buffered channel 却会
+	// 永久常驻 outCap 个槽。inline-first 保留相同有界背压而不预付突发内存。
+	out    *outboundQueue
+	outCap int
 	// closeOnce 保证 Close 幂等，重复断开不会重复触发遗嘱与事件。
 	closeOnce sync.Once
 	onClose   func(reason cluster.EvictReason)
@@ -59,9 +110,9 @@ func NewRuntime(st *State, conn net.Conn, outBuf int) *Runtime {
 		outBuf = 64
 	}
 	return &Runtime{
-		state: st,
-		conn:  conn,
-		out:   make(chan Outbound, outBuf),
+		state:  st,
+		conn:   conn,
+		outCap: outBuf,
 	}
 }
 
@@ -84,11 +135,42 @@ func (r *Runtime) Conn() net.Conn {
 	return r.conn
 }
 
-// Outbound 返回出站队列，供共享 writer 池消费。
-//
-// 按 PRD LANG-005，每连接只有一个读 goroutine，写出不占用独立 goroutine，
-// 而是由 writer 池从本通道取出并写入连接。
-func (r *Runtime) Outbound() <-chan Outbound { return r.out }
+// Dequeue 取出最早的一条出站报文。共享 writer pool 是唯一消费者。
+func (r *Runtime) Dequeue() (Outbound, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	q := r.out
+	if q == nil || q.len == 0 {
+		return Outbound{}, false
+	}
+	if q.ring == nil {
+		out := q.one
+		r.out = nil
+		releaseOutboundQueue(q)
+		return out, true
+	}
+	out := q.ring[q.head]
+	q.ring[q.head] = Outbound{}
+	q.head = (q.head + 1) % r.outCap
+	q.len--
+	if q.len == 0 {
+		ring := q.ring
+		r.out = nil
+		releaseOutboundRing(ring)
+		releaseOutboundQueue(q)
+	}
+	return out, true
+}
+
+// OutboundLen 返回当前积压，供 writer 清除 queued 标记后复查唤醒竞态。
+func (r *Runtime) OutboundLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.out == nil {
+		return 0
+	}
+	return r.out.len
+}
 
 // Enqueue 把一条报文放入出站队列。队列满时立即返回 ErrOutboundFull，
 // 不阻塞调用方——投递路径不能被单个慢客户端拖住。
@@ -100,9 +182,9 @@ func (r *Runtime) Outbound() <-chan Outbound { return r.out }
 // ——panic，而全仓库没有任何 recover，于是一条正常的"客户端在别人正给
 // 它投消息时断开"把 broker 整个带走。
 //
-// 放在同一个临界区里之后就不可能了：能看到 detached 为假的调用方，
-// 必然在 Close 的临界区之前就持有了锁，入队也就发生在 close(r.out)
-// 之前。锁的次数没有增加——原来那次读 detached 本来也要取锁。
+// 现在解绑判定与环形队列写入仍在同一个临界区，且 Close 不再关闭 channel
+// （队列已经不是 channel），因此这类 send/close 竞态从结构上消失。锁的
+// 次数没有增加——原来那次读 detached 本来也要取锁。
 func (r *Runtime) Enqueue(e cluster.Epoch, o Outbound) error {
 	if err := r.state.CheckEpoch(e); err != nil {
 		return err
@@ -112,13 +194,27 @@ func (r *Runtime) Enqueue(e cluster.Epoch, o Outbound) error {
 	if r.detached {
 		return ErrDetached
 	}
-	// 持锁期间的发送不会阻塞：通道有界，且 default 分支兜住队列满。
-	select {
-	case r.out <- o:
-		return nil
-	default:
+	q := r.out
+	if q != nil && q.len >= r.outCap {
 		return ErrOutboundFull
 	}
+	if q == nil {
+		q = acquireOutboundQueue()
+		q.one = o
+		q.len = 1
+		r.out = q
+		return nil
+	}
+	if q.ring == nil {
+		q.ring = acquireOutboundRing(r.outCap)
+		q.ring[0] = q.one
+		q.one = Outbound{}
+		q.head = 0
+	}
+	idx := (q.head + q.len) % r.outCap
+	q.ring[idx] = o
+	q.len++
+	return nil
 }
 
 // Subscribe 记录一条订阅。同一过滤器重复订阅时替换其选项（MQTT-3.8.4）。
@@ -439,7 +535,6 @@ func (r *Runtime) Close(nowUnixMs int64, why cluster.EvictReason) error {
 		if conn != nil {
 			err = conn.Close()
 		}
-		close(r.out)
 		if fn != nil {
 			fn(why)
 		}
@@ -464,6 +559,13 @@ type Store interface {
 	Load(ctx context.Context, clientID string) (*State, bool, error)
 	// Save 保存会话状态。实现须校验 epoch，拒绝来自已被接管会话的写入。
 	Save(ctx context.Context, st *State) error
+	// Replace 原子地删掉既有记录并写入 st。与 Save 一样，
+	// 实现须校验 epoch，拒绝来自已被接管会话的替换。
+	//
+	// 持久会话的 clean start 用它，而不是 Delete 再 Save：后者在集群下
+	// 是**两条**复制日志，而且中间那一瞬存储里没有这个会话——此时另一个
+	// 节点的读会判定"没有会话"。一条命令就没有那个中间态。
+	Replace(ctx context.Context, st *State) error
 	// Delete 删除会话状态。
 	Delete(ctx context.Context, clientID string, e cluster.Epoch) error
 	// Expire 清理已过期的会话，返回清理条数。

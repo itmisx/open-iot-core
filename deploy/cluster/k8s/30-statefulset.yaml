@@ -111,7 +111,10 @@ spec:
                 export OPENIOTD_SEEDS="openiotd-0.openiotd-peers:7946"
               fi
               export OPENIOTD_NODE_ID="$POD_NAME"
-              exec openiotd serve --config /etc/openiotd/openiotd.yaml
+              # command 会覆盖镜像 ENTRYPOINT；必须显式重新经过入口脚本，
+              # 否则它按 cgroup 自动设置 GOMEMLIMIT 的保护在 k8s 完全失效，
+              # 大连接堆会直接撞到 cgroup OOM。
+              exec /usr/local/bin/docker-entrypoint.sh serve --config /etc/openiotd/openiotd.yaml
           env:
             - name: POD_NAME
               valueFrom:

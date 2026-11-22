@@ -104,16 +104,18 @@ func (ft *fakeTimers) fire() {
 // 它把前面各个横切面真实地接起来——这正是端到端测试的意义：
 // 单元测试证明每个契约自身成立，集成测试证明它们协同成立。
 type rig struct {
-	t      *testing.T
-	clk    *testClock
-	store  *meta.LocalStore
-	rt     *router.Router
-	sess   *session.MemStore
-	owners *cluster.LocalOwnership
-	lim    *quota.Local
-	bus    *events.Bus
-	b      *Broker
-	timers *fakeTimers
+	t     *testing.T
+	clk   *testClock
+	store *meta.LocalStore
+	rt    *router.Router
+	sess  *session.MemStore
+	// sessFault 是套在 sess 外面的故障注入层，默认透传。
+	sessFault *faultySessions
+	owners    *cluster.LocalOwnership
+	lim       *quota.Local
+	bus       *events.Bus
+	b         *Broker
+	timers    *fakeTimers
 
 	nextPolicy atomic.Int32
 	wg         sync.WaitGroup
@@ -183,11 +185,13 @@ func newRig(t *testing.T, auth Authenticator, overrides map[quota.ID]int) *rig {
 				return authz.CompileJSON(name, doc, authz.DefaultEnv())
 			},
 		}),
-		sess:   session.NewMemStore(),
-		owners: cluster.NewLocalOwnership("node-1", 64),
-		lim:    quota.NewLocal(quota.Options{Now: clk.now, Overrides: overrides}),
-		bus:    events.New(events.Options{Node: "node-1", Now: clk.now}),
+		sess:      session.NewMemStore(),
+		sessFault: &faultySessions{},
+		owners:    cluster.NewLocalOwnership("node-1", 64),
+		lim:       quota.NewLocal(quota.Options{Now: clk.now, Overrides: overrides}),
+		bus:       events.New(events.Options{Node: "node-1", Now: clk.now}),
 	}
+	r.sessFault.MemStore = r.sess
 	r.timers = &fakeTimers{clk: clk}
 	r.rt = router.New(router.Options{Self: "node-1", Limits: limits, Now: clk.now})
 
@@ -195,7 +199,7 @@ func newRig(t *testing.T, auth Authenticator, overrides map[quota.ID]int) *rig {
 		Node:               "node-1",
 		Meta:               r.store,
 		Router:             r.rt,
-		Sessions:           r.sess,
+		Sessions:           r.sessFault,
 		Owners:             r.owners,
 		Limiter:            r.lim,
 		Bus:                r.bus,
@@ -222,6 +226,66 @@ func newRig(t *testing.T, auth Authenticator, overrides map[quota.ID]int) *rig {
 		_ = r.owners.Close()
 	})
 	return r
+}
+
+// faultySessions 给会话存储加一层可控的写入失败。
+//
+// 为什么要它：集群下每一次会话写入都是一轮共识，它会因为分片没选出
+// leader、失去多数派或超时而失败，而那条路径在单机测试里永远不出现
+// ——于是"写入失败时 CONNECT 怎么办"这个问题在 Go 测试里不可观测，
+// 只能等到真集群的某次 leader 选举（CLU-130）。
+//
+// 默认透传：armWriteFailure 之前它与 MemStore 完全一样，因此所有既有
+// 用例不受影响。
+type faultySessions struct {
+	*session.MemStore
+	failRead atomic.Bool
+	fail     atomic.Bool
+	stale    atomic.Bool
+}
+
+// errSessionWriteFailed 模拟复制层写不进去。
+var errSessionWriteFailed = errors.New("test: 会话写入失败（注入）")
+var errSessionReadFailed = errors.New("test: 会话读取失败（注入）")
+
+func (f *faultySessions) armWriteFailure(on bool) { f.fail.Store(on) }
+func (f *faultySessions) armReadFailure(on bool)  { f.failRead.Store(on) }
+func (f *faultySessions) armStaleWrite(on bool)   { f.stale.Store(on) }
+
+func (f *faultySessions) Load(ctx context.Context, clientID string) (*session.State, bool, error) {
+	if f.failRead.Load() {
+		return nil, false, errSessionReadFailed
+	}
+	return f.MemStore.Load(ctx, clientID)
+}
+
+func (f *faultySessions) Save(ctx context.Context, st *session.State) error {
+	if f.fail.Load() {
+		return errSessionWriteFailed
+	}
+	if f.stale.Load() {
+		return cluster.ErrStaleEpoch
+	}
+	return f.MemStore.Save(ctx, st)
+}
+
+func (f *faultySessions) Replace(ctx context.Context, st *session.State) error {
+	if f.fail.Load() {
+		return errSessionWriteFailed
+	}
+	if f.stale.Load() {
+		return cluster.ErrStaleEpoch
+	}
+	return f.MemStore.Replace(ctx, st)
+}
+
+func (f *faultySessions) Delete(ctx context.Context, clientID string,
+	e cluster.Epoch,
+) error {
+	if f.fail.Load() {
+		return errSessionWriteFailed
+	}
+	return f.MemStore.Delete(ctx, clientID, e)
 }
 
 // addPolicy 编译一份策略并写入元数据，返回其策略集编号。

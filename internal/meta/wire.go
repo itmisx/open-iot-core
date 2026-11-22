@@ -27,6 +27,7 @@ type wireCmd struct {
 	RequestedRevision Revision     `json:"requestedRevision,omitempty"`
 	Cert              *wireCert    `json:"cert,omitempty"`
 	Thing             *ThingCmd    `json:"thing,omitempty"`
+	Things            []ThingCmd   `json:"things,omitempty"`
 	Policy            *PolicyCmd   `json:"policy,omitempty"`
 	AttrSlots         []string     `json:"attrSlots,omitempty"`
 	Records           []wireRecord `json:"records,omitempty"`
@@ -64,7 +65,8 @@ func EncodeCommand(cmd Command) ([]byte, error) {
 	w := wireCmd{
 		V: wireVersion, ID: cmd.ID, Kind: cmd.Kind,
 		RequestedRevision: cmd.RequestedRevision,
-		Thing:             cmd.Thing, Policy: cmd.Policy, AttrSlots: cmd.AttrSlots,
+		Thing:             cmd.Thing, Things: cmd.Things,
+		Policy: cmd.Policy, AttrSlots: cmd.AttrSlots,
 		Shadow: cmd.Shadow,
 	}
 	if cmd.Cert != nil {
@@ -92,7 +94,7 @@ func DecodeCommand(raw []byte) (Command, error) {
 	}
 	cmd := Command{
 		ID: w.ID, Kind: w.Kind, RequestedRevision: w.RequestedRevision,
-		Thing: w.Thing, Policy: w.Policy, AttrSlots: w.AttrSlots,
+		Thing: w.Thing, Things: w.Things, Policy: w.Policy, AttrSlots: w.AttrSlots,
 		Shadow: w.Shadow,
 	}
 	if w.Cert != nil {

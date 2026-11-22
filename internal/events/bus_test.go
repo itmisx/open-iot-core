@@ -1,6 +1,7 @@
 package events
 
 import (
+	"strings"
 	"sync"
 	"testing"
 
@@ -696,5 +697,77 @@ func TestReasonCodesSeenSkipsZero(t *testing.T) {
 	}
 	if len(disconnects) != 0 {
 		t.Errorf("无断开却返回了原因码: %v", disconnects)
+	}
+}
+
+// TestConnStageDimensionCoversAllStages 与上面那条同一个理由：分段也用
+// 定长数组，上界与枚举脱钩时新增的那一段会静默落进 0 号桶（OBS-148）。
+func TestConnStageDimensionCoversAllStages(t *testing.T) {
+	b := New(Options{})
+	b.Emit(&Event{Kind: KindConn, Conn: ConnFields{
+		Result: ConnAccepted,
+		// 四段给四个互不相同的值，这样某一段落错桶时不会被另一段的
+		// 读数掩盖——全给 1 的话四个直方图都是 1，换错了也看不出来。
+		AuthMS: 1, SessionLoadMS: 2, OwnerClaimMS: 3, SessionWriteMS: 4,
+	}})
+	want := []float64{1, 2, 3, 4}
+	for st := ConnStage(0); st < NumConnStages; st++ {
+		snap := b.ConnStage(st)
+		if snap.Count != 1 {
+			t.Errorf("分段 %s 的观测数 = %d，应为 1", st, snap.Count)
+			continue
+		}
+		if int(st) < len(want) && snap.Sum != want[st] {
+			t.Errorf("分段 %s 的和 = %v，应为 %v", st, snap.Sum, want[st])
+		}
+		if st.String() == "unknown" {
+			t.Errorf("分段 %d 没有名字，connStageName 与枚举脱钩了", st)
+		}
+	}
+	if n := len(connStageName); n != int(NumConnStages) {
+		t.Errorf("名字数组长度 %d 与 NumConnStages=%d 不符", n, NumConnStages)
+	}
+}
+
+func TestConnStageExcludesStoreFailureBeforeSessionWrite(t *testing.T) {
+	b := New(Options{})
+	// 远程 Load 失败同样归类 StoreFailed，但只走到前三段，不能用它的
+	// session_write=0 污染“走完全程”分位数。
+	b.Emit(&Event{Kind: KindConn, Conn: ConnFields{
+		Result: ConnStoreFailed, AuthMS: 1, OwnerClaimMS: 2, SessionLoadMS: 3,
+	}})
+	if got := b.ConnStage(StageAuth).Count; got != 0 {
+		t.Fatalf("读失败被计入完整 CONNECT 分段，count=%d", got)
+	}
+	b.Emit(&Event{Kind: KindConn, Conn: ConnFields{
+		Result: ConnStoreFailed, SessionWrites: 1, SessionWriteFailed: true,
+		AuthMS: 1, OwnerClaimMS: 2, SessionLoadMS: 3, SessionWriteMS: 4,
+	}})
+	if got := b.ConnStage(StageSessionWrite).Count; got != 1 {
+		t.Fatalf("写失败未计入完整 CONNECT 分段，count=%d", got)
+	}
+}
+
+// TestParseKindIgnoresCase 钉住事件类型名的大小写无关解析。
+//
+// 它来自 Admin 面事件流的 URL 查询参数（`?kind=conn`），要求用户记住
+// 大小写只会制造无谓的失败——而失败的表现是「筛选之后一条都没有」，
+// 看上去像没有事件，不像参数写错了。
+func TestParseKindIgnoresCase(t *testing.T) {
+	for k := Kind(0); k < NumKinds(); k++ {
+		name := k.String()
+		for _, variant := range []string{name, strings.ToLower(name), strings.ToUpper(name)} {
+			got, ok := ParseKind(variant)
+			if !ok || got != k {
+				t.Fatalf("ParseKind(%q) = %v %v，期望 %v", variant, got, ok, k)
+			}
+		}
+	}
+	// 长度不同与同长度但不同名的都要拒绝：前者走的是快速退出，后者走
+	// 的是逐字符比较，两条分支都得验。
+	for _, bad := range []string{"", "conn ", "xonn", "不存在"} {
+		if _, ok := ParseKind(bad); ok {
+			t.Fatalf("ParseKind(%q) 不该成功", bad)
+		}
 	}
 }

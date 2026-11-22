@@ -1,0 +1,3 @@
+{"scenario":"probe/n3-shards8-conc256","nodes":3,"clients":6000,"qos":0,"payloadBytes":64,"connectPerSec":115.75401873596476,"connectP50Ms":1899.752333,"connectP99Ms":5943.607375,"heldConns":6000,"seconds":51.8340535}
+{"scenario":"probe/n3-shards8-conc256","nodes":3,"clients":6000,"qos":0,"payloadBytes":64,"connectPerSec":119.15762095871179,"connectP50Ms":1943.389333,"connectP99Ms":5241.276625,"heldConns":6000,"seconds":50.353472583}
+{"scenario":"probe/n3-shards8-conc256","nodes":3,"clients":6000,"qos":0,"payloadBytes":64,"connectPerSec":125.08713252503694,"connectP50Ms":1808.1641670000001,"connectP99Ms":4761.042667,"heldConns":6000,"seconds":47.966564417}

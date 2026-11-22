@@ -80,7 +80,7 @@ func signedQuery(t *testing.T, host, keyID, service string) string {
 	return q + "&X-Amz-Signature=" + sig
 }
 
-func testCert(t *testing.T) tls.Certificate {
+func testCert(t testing.TB) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

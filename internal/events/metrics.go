@@ -43,6 +43,48 @@ type counters struct {
 
 	// handshake 是 TLS 握手耗时分布（OBS-021）。
 	handshake *metrics.Histogram
+
+	// connStage 是 CONNECT 路径各段的耗时分布（OBS-148）。
+	//
+	// 按阶段定长数组而不是 map：阶段是编译期封死的枚举，而这些观测
+	// 在建连热路径上。
+	connStage [NumConnStages]*metrics.Histogram
+	// connWriteFail 是累计的会话存储写入失败次数。
+	connWriteFail atomic.Uint64
+	// connWriteStale 是累计被 epoch 围栏判为陈旧的会话写入次数。
+	connWriteStale atomic.Uint64
+	// connWrites 是累计的会话存储写入次数。
+	//
+	// 分母用 connections_total{result="accepted"}，商即"一次建连提了
+	// 几条复制日志"。不做成直方图：取值只有 0、1、2 三种，一个计数器
+	// 配已有的连接计数就够，而直方图要十个桶。
+	connWrites atomic.Uint64
+}
+
+// ConnStage 是 CONNECT 路径的分段。
+type ConnStage uint8
+
+const (
+	// StageAuth 是认证与 iot:Connect 鉴权，只读本地热视图。
+	StageAuth ConnStage = iota
+	// StageSessionLoad 是从本地存储恢复会话，集群下也是本地读（契约 05）。
+	StageSessionLoad
+	// StageOwnerClaim 是抢占 clientId 所有权。
+	StageOwnerClaim
+	// StageSessionWrite 是会话落盘；集群下每次都是一轮共识。
+	StageSessionWrite
+	// NumConnStages 是分段数，用于维度展开。
+	NumConnStages
+)
+
+var connStageName = [NumConnStages]string{"auth", "session_load", "owner_claim", "session_write"}
+
+// String 返回分段名，用作指标标签。
+func (s ConnStage) String() string {
+	if s >= NumConnStages {
+		return "unknown"
+	}
+	return connStageName[s]
 }
 
 // MaxProtoVer 是协议版本维度的上限。
@@ -52,7 +94,11 @@ type counters struct {
 const MaxProtoVer = 5
 
 func newCounters() *counters {
-	return &counters{handshake: metrics.NewHistogram(metrics.LatencyBuckets()...)}
+	c := &counters{handshake: metrics.NewHistogram(metrics.LatencyBuckets()...)}
+	for i := range c.connStage {
+		c.connStage[i] = metrics.NewHistogram(metrics.LatencyBuckets()...)
+	}
+	return c
 }
 
 // record 累加一条事件的指标。
@@ -64,6 +110,30 @@ func (c *counters) record(e *Event) {
 		f := &e.Conn
 		if f.Result < NumConnResults && f.AuthMethod < NumAuthMethods && f.ProtoVer <= MaxProtoVer {
 			c.conn[f.Result][f.AuthMethod][f.ProtoVer].Add(1)
+		}
+		// 分段耗时取走完全部四段的那些连接：被接受的，以及因为会话
+		// 写不进去而被拒的（CLU-130）。
+		//
+		// 为什么后者也要：它那一段恰恰是最慢的一次（通常是共识超时），
+		// 把它排除掉会让 session_write 的分位数在复制层出问题时反而
+		// 变好看。而半路返回的拒绝（认证失败、限流）一律不记——它的
+		// "会话写入耗时"是 0 而不是"很快"，混进分布会把分位数拉向零。
+		//
+		// 零值也记：一个真的零（非持久会话不写会话）与"这一段没走到"
+		// 在走完的路径上是同一件事，而把零排除掉会让 count 在不同
+		// 阶段之间不可比——那恰恰是定位瓶颈时第一个要看的东西。
+		if f.Result == ConnAccepted || (f.Result == ConnStoreFailed && f.SessionWrites > 0) {
+			c.connStage[StageAuth].Observe(f.AuthMS)
+			c.connStage[StageSessionLoad].Observe(f.SessionLoadMS)
+			c.connStage[StageOwnerClaim].Observe(f.OwnerClaimMS)
+			c.connStage[StageSessionWrite].Observe(f.SessionWriteMS)
+			c.connWrites.Add(uint64(f.SessionWrites))
+			if f.SessionWriteFailed {
+				c.connWriteFail.Add(1)
+			}
+			if f.SessionWriteStale {
+				c.connWriteStale.Add(1)
+			}
 		}
 		switch {
 		case f.Result == ConnAccepted:
@@ -133,6 +203,30 @@ func (b *Bus) SubCount(unsub, granted bool) uint64 {
 
 // Handshake 返回握手耗时分布。
 func (b *Bus) Handshake() metrics.Snapshot { return b.c.handshake.Snapshot() }
+
+// ConnStage 返回某一段 CONNECT 耗时的分布（OBS-148）。
+func (b *Bus) ConnStage(s ConnStage) metrics.Snapshot {
+	if s >= NumConnStages {
+		return metrics.Snapshot{}
+	}
+	return b.c.connStage[s].Snapshot()
+}
+
+// SessionWrites 返回累计的会话存储写入次数（OBS-148）。
+func (b *Bus) SessionWrites() uint64 { return b.c.connWrites.Load() }
+
+// SessionWriteFailures 返回累计的会话存储写入失败次数（OBS-148）。
+//
+// 它只统计被接受的连接——被拒的那些在 connections_total{result="StoreFailed"}
+// 里，两处相加才是复制层写入失败的全量。
+func (b *Bus) SessionWriteFailures() uint64 { return b.c.connWriteFail.Load() }
+
+// SessionWriteStale 返回被 epoch 围栏判为陈旧的会话写入次数（CLU-131）。
+//
+// 集群下它非零是正常的，而且正是要暴露的那件事：设备换节点重连时新节点
+// 发出的 epoch 可能比旧节点小。单节点下它应当恒为 0——那里的序号严格
+// 递增，非零意味着围栏或所有权表出了问题。
+func (b *Bus) SessionWriteStale() uint64 { return b.c.connWriteStale.Load() }
 
 // ReasonCodesSeen 返回出现过的原因码，供采集端只导出非零的那些。
 //

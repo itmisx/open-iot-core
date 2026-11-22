@@ -50,7 +50,13 @@ EXT
   rm -f "${OUT}/${id}.csr" "${OUT}/${id}.ext"
 done
 
+echo "==> 生成集群共享的 TLS session ticket 密钥"
+openssl rand -hex 32 > "${OUT}/session-ticket.keys"
+
 # 私钥给容器里的 uid 10001 读。
 chmod 644 "${OUT}"/*.pem
 chmod 644 "${OUT}"/*.key
+# ticket key 不是 PEM 私钥，但同样由宿主机生成、由 uid 10001 的容器读取。
+# 显式列出来，避免以后收紧 *.key 权限时把跨节点 session 恢复悄悄弄坏。
+chmod 644 "${OUT}/session-ticket.keys"
 echo "==> 完成，见 ${OUT}/"

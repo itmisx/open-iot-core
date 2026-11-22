@@ -3,6 +3,7 @@ package shadow
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/itmisx/open-iot-core/internal/cluster"
 	"github.com/itmisx/open-iot-core/internal/quota"
@@ -52,6 +53,13 @@ type Options struct {
 	// （契约 06）。事后插入它等于把本服务重写一遍：它会改变
 	// 每一个写入方法的错误路径与返回时机。
 	Forward func(ctx context.Context, owner cluster.NodeID, cmd Command) (*Result, error)
+	// LocalGet/LocalList 可在读取本地副本前执行线性一致 Barrier。
+	// ForwardGet/ForwardList 用于非 owner 节点；读是幂等的，可由装配层
+	// 在多个副本间回退。留空保持单机直接读 Store 的行为。
+	LocalGet    func(context.Context, string, string) (*Document, bool, error)
+	LocalList   func(context.Context, string) ([]string, error)
+	ForwardGet  func(context.Context, cluster.NodeID, string, string) (*Document, bool, error)
+	ForwardList func(context.Context, cluster.NodeID, string) ([]string, error)
 	// OnForward 在真正转发前后被调用，用来包一层追踪。
 	// 返回的函数在转发结束后调用。单机不进入转发分支，因此不会调用它。
 	OnForward func(ctx context.Context, owner, thing string) (context.Context, func(error))
@@ -64,13 +72,18 @@ type Options struct {
 
 // Service 是 MQTT 与 REST 共用的影子状态机（PRD SHDW-044）。
 type Service struct {
-	store    Store
-	part     cluster.Partitioner
-	lim      quota.Limiter
-	now      func() int64
-	fwd      func(ctx context.Context, owner cluster.NodeID, cmd Command) (*Result, error)
-	onFwd    func(ctx context.Context, owner, thing string) (context.Context, func(error))
-	onChange func(thing, op string)
+	store     Store
+	partMu    sync.RWMutex
+	part      cluster.Partitioner
+	lim       quota.Limiter
+	now       func() int64
+	fwd       func(ctx context.Context, owner cluster.NodeID, cmd Command) (*Result, error)
+	localGet  func(context.Context, string, string) (*Document, bool, error)
+	localList func(context.Context, string) ([]string, error)
+	fwdGet    func(context.Context, cluster.NodeID, string, string) (*Document, bool, error)
+	fwdList   func(context.Context, cluster.NodeID, string) ([]string, error)
+	onFwd     func(ctx context.Context, owner, thing string) (context.Context, func(error))
+	onChange  func(thing, op string)
 }
 
 // New 创建影子服务。
@@ -88,8 +101,34 @@ func New(opt Options) (*Service, error) {
 	return &Service{
 		store: opt.Store, part: opt.Partitioner,
 		lim: opt.Limiter, now: opt.Now, fwd: opt.Forward, onFwd: opt.OnForward,
+		localGet: opt.LocalGet, localList: opt.LocalList,
+		fwdGet: opt.ForwardGet, fwdList: opt.ForwardList,
 		onChange: opt.OnChange,
 	}, nil
+}
+
+// UsePartitioner 在启动期把兼容的本地分区器切到持久化 shard 布局。
+// 管理端点可能已经监听，因此用锁保证切换与并发读写无数据竞争。
+func (s *Service) UsePartitioner(p cluster.Partitioner) error {
+	return s.UsePartitionerAndActivate(p, nil)
+}
+
+// UsePartitionerAndActivate 在阻止全部在途影子读写的同一临界区内执行
+// activate 并切换路由。装配层用它原子地把命令日志与分区表一起切到新组，
+// 避免一条请求按旧 owner 判定、却写入新日志。
+func (s *Service) UsePartitionerAndActivate(p cluster.Partitioner, activate func() error) error {
+	if p == nil {
+		return fmt.Errorf("shadow: 缺少 Partitioner")
+	}
+	s.partMu.Lock()
+	defer s.partMu.Unlock()
+	if activate != nil {
+		if err := activate(); err != nil {
+			return err
+		}
+	}
+	s.part = p
+	return nil
 }
 
 // nowSec 返回当前 Unix 秒。
@@ -198,11 +237,36 @@ func (s *Service) Get(ctx context.Context, req Request, payload []byte) *Outcome
 	if e := s.precheck(ctx, req); e != nil {
 		return s.reject(req, token, e)
 	}
-	doc, ok := s.store.Get(req.Thing, req.Shadow)
+	doc, ok, err := s.get(ctx, req.Thing, req.Shadow)
+	if err != nil {
+		return s.reject(req, token, ErrInternal)
+	}
 	if !ok {
 		return s.reject(req, token, errNotFound(req.Shadow))
 	}
 	return s.accept(req, doc.get(token, s.nowSec()))
+}
+
+func (s *Service) get(ctx context.Context, thing, name string) (*Document, bool, error) {
+	s.partMu.RLock()
+	defer s.partMu.RUnlock()
+	owner, local := s.part.Owner(thing), s.part.IsLocal(thing)
+	if !local {
+		if s.fwdGet == nil {
+			// ForwardGet 是分片集群装配才提供的能力。留空时保持旧版
+			// 单机/全量副本语义：即使写 owner 在远端，本节点仍可读取
+			// 自己的完整物化视图。这样滚动升级期间不会把正常的 404
+			// 误报成 500；真正的 RF=3 装配始终会注入 ForwardGet。
+			doc, ok := s.store.Get(thing, name)
+			return doc, ok, nil
+		}
+		return s.fwdGet(ctx, owner, thing, name)
+	}
+	if s.localGet != nil {
+		return s.localGet(ctx, thing, name)
+	}
+	doc, ok := s.store.Get(thing, name)
+	return doc, ok, nil
 }
 
 // Update 更新影子（PRD SHDW-012、SHDW-041）。
@@ -352,7 +416,29 @@ func (s *Service) ListNamedShadows(ctx context.Context, thing string) ([]string,
 	if !s.lim.AllowGlobal(ctx, quota.ShadowAPIRate, "", 1) {
 		return nil, ErrTooManyRequests
 	}
-	return s.store.List(thing), nil
+	s.partMu.RLock()
+	defer s.partMu.RUnlock()
+	owner, local := s.part.Owner(thing), s.part.IsLocal(thing)
+	var names []string
+	var err error
+	switch {
+	case !local && s.fwdList == nil:
+		// 与 get 相同，未装配远程读表示旧版全量物化视图。
+		names = s.store.List(thing)
+	case !local:
+		names, err = s.fwdList(ctx, owner, thing)
+	case s.localList != nil:
+		names, err = s.localList(ctx, thing)
+	default:
+		names = s.store.List(thing)
+	}
+	if err != nil {
+		if e, ok := err.(*Error); ok {
+			return nil, e
+		}
+		return nil, ErrInternal
+	}
+	return names, nil
 }
 
 // apply 落实一条命令，必要时转发给分区 owner。
@@ -362,9 +448,11 @@ func (s *Service) ListNamedShadows(ctx context.Context, thing string) ([]string,
 // 它决定了本函数的签名带 ctx、返回 error，以及调用方必须处理
 // "写入可能发生在别的节点上"这件事。
 func (s *Service) apply(ctx context.Context, cmd Command) (*Result, *Error) {
+	s.partMu.RLock()
+	defer s.partMu.RUnlock()
 	key := cmd.Thing
-	if !s.part.IsLocal(key) {
-		owner := s.part.Owner(key)
+	owner, local := s.part.Owner(key), s.part.IsLocal(key)
+	if !local {
 		if s.fwd == nil {
 			return nil, errForwardFailed(string(owner))
 		}

@@ -50,6 +50,7 @@ const (
 type WebSocketOptions struct {
 	Certificate      tls.Certificate
 	MinVersion       uint16
+	CurvePreferences []tls.CurveID
 	RequireSNI       bool
 	HandshakeTimeout time.Duration
 	// Checker 校验查询串里的 SigV4。Region 与 Secret 必填。
@@ -94,19 +95,22 @@ func (b *Broker) ListenWebSocket(addr string, opt WebSocketOptions) (*Listener, 
 		opt.HandshakeTimeout = defaultHandshakeTimeout
 	}
 	cfg := &tls.Config{
-		Certificates: []tls.Certificate{opt.Certificate},
-		ClientAuth:   tls.NoClientCert,
-		MinVersion:   opt.MinVersion,
-		NextProtos:   []string{"http/1.1"},
+		Certificates:     []tls.Certificate{opt.Certificate},
+		ClientAuth:       tls.NoClientCert,
+		MinVersion:       opt.MinVersion,
+		CurvePreferences: opt.CurvePreferences,
+		NextProtos:       []string{"http/1.1"},
 	}
-	ln, err := net.Listen("tcp", addr)
+	ln, err := b.listenTCP(addr)
 	if err != nil {
 		return nil, fmt.Errorf("broker: 监听 %s 失败: %w", addr, err)
 	}
 	return &Listener{
-		b:    b,
-		ln:   ln,
-		tlsc: cfg,
+		b:             b,
+		ln:            ln,
+		tlsc:          cfg,
+		handshakeGate: make(chan struct{}, b.opt.TLSHandshakeConcurrency),
+		stop:          make(chan struct{}),
 		opt: TLSOptions{
 			MinVersion:       opt.MinVersion,
 			RequireSNI:       opt.RequireSNI,
@@ -131,7 +135,7 @@ func (l *Listener) acceptWebSocket(ctx context.Context, tc net.Conn, info ConnIn
 	info.AccessKeyID = accessKey
 	info.MaxLifetime = l.wss.maxLifetime
 	info.RedirectTo = l.wss.redirectTo
-	_ = l.b.Serve(ctx, ws, info)
+	l.serveBrokerHandoff(ctx, ws, info)
 }
 
 func (l *Listener) upgradeWebSocket(tc net.Conn) (*wsConn, string, error) {

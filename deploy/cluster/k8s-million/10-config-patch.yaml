@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openiotd-config
+  namespace: open-iot-core
+data:
+  openiotd.yaml: |
+    node:
+      data_dir: /var/lib/openiotd
+
+    cluster:
+      voters: 5
+      max_view_staleness: 10s
+      replication:
+        addr: "0.0.0.0:7946"
+        cert_file: /etc/openiotd/repl/tls.crt
+        key_file: /etc/openiotd/repl/tls.key
+        ca_file: /etc/openiotd/repl/ca.crt
+        pump_interval: 200ms
+        session_shards: 8
+        session_replication_factor: 3
+        shadow_shards: 8
+        shadow_replication_factor: 3
+        peers:
+          openiotd-0: "openiotd-0.openiotd-peers:7946"
+          openiotd-1: "openiotd-1.openiotd-peers:7946"
+          openiotd-2: "openiotd-2.openiotd-peers:7946"
+          openiotd-3: "openiotd-3.openiotd-peers:7946"
+          openiotd-4: "openiotd-4.openiotd-peers:7946"
+        replicas:
+          openiotd-0: 1
+          openiotd-1: 2
+          openiotd-2: 3
+          openiotd-3: 4
+          openiotd-4: 5
+
+    listeners:
+      mqtt_tls:
+        enabled: true
+        addr: 0.0.0.0:8883
+        require_client_cert: true
+        session_ticket_keys_file: /var/lib/openiotd/pki/session-ticket.keys
+        post_quantum_key_exchange: false
+      admin:
+        enabled: true
+        addr: 0.0.0.0:9090
+        acknowledge_public_exposure: true
+
+    pki:
+      enabled: true
+
+    # 容量验收必须走证书状态、吊销、Thing与策略热视图，不能依赖默认值，
+    # 更不能把“TLS要求客户端证书但应用层insecure-none”冒充真实mTLS认证。
+    auth:
+      mode: cert
+
+    quota:
+      connections: 250000
+      connect_rate: 10000
+      subscriptions: 1000000
+
+    broker:
+      tls_handshake_concurrency: 256
+      outbound_buffer: 64
+      tcp_keepalive: 5m
+
+    log:
+      level: info
+      format: json

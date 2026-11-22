@@ -160,13 +160,31 @@ quota:
 
 # 接入层运行参数。
 broker:
+  tls_handshake_concurrency: 0 # 0 = GOMAXPROCS × 64，下限 256、上限 4096
   writer_workers: 0          # 0 = 按 CPU 核数自适应（GOMAXPROCS × 2，下限 8）
   outbound_buffer: 64        # 每连接出站队列深度，满了即判为慢客户端并断开
   write_timeout: 5s          # 单次刷写上限，不要配到秒级以下
+  tcp_keepalive: 5m          # 内核死链路兜底；MQTT keepalive 是主保活，不要用 Go 默认 15s
+
+# TLS 监听器默认使用 X25519/P-256，容量优先。需要抵抗“先收集、后解密”的
+# 后量子威胁模型时可显式开启 Go 默认的 X25519+ML-KEM 混合密钥交换。
+listeners:
+  mqtt_tls:
+    post_quantum_key_exchange: false
 ```
 
 调高 `connections` 之前先确认两件事：文件描述符上限（每连接一个）与
 内存（连接数乘以约 40 KB，再留 GC 余量；发布制品请设 `GOMEMLIMIT`）。
+`tls_handshake_concurrency` 限制的是短命密码学工作集，不是长连接数；
+达到上限后新连接留在 listen backlog 背压，不再无界创建 TLS goroutine。
+`post_quantum_key_exchange: true` 提高长期机密性，但会增加冷握手 CPU、报文和
+短命分配；它不影响 TLS ticket 恢复后的重新认证、吊销与策略检查。
+
+官方容器入口在没有显式 `GOMEMLIMIT` 时读取 cgroup memory limit 与物理内存，
+取较小者的 75% 作为 Go soft memory limit，余下四分之一留给内核 socket、
+page cache、mmap 与非 Go 内存。编排显式设置的值始终优先，包括 `off`。裸二进制
+部署没有容器入口，须由 systemd/启动脚本设置，例如 16 GiB 节点从
+`GOMEMLIMIT=12GiB` 起步，再以 Linux 密度轮的 RSS/VmHWM/GC 数据校准。
 
 ## 四处踩进去不报错的地方
 

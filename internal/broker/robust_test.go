@@ -71,7 +71,8 @@ func TestNewValidatesDependencies(t *testing.T) {
 	defer func() { _ = b.Close() }()
 	if b.opt.WriterWorkers == 0 || b.opt.OutboundBuffer == 0 ||
 		b.opt.MaxWriteBatch == 0 || b.opt.ReadBufferSize == 0 ||
-		b.opt.KeepAliveGraceFactor == 0 {
+		b.opt.KeepAliveGraceFactor == 0 || b.opt.TCPKeepAlive == 0 ||
+		b.opt.TLSHandshakeConcurrency == 0 {
 		t.Errorf("默认参数未填充: %+v", b.opt)
 	}
 	if b.opt.Limits.MaxNameLen == 0 {
@@ -114,6 +115,35 @@ func TestOversizePacketRejected(t *testing.T) {
 	big := strings.Repeat("x", 4096)
 	c.send(&packet.Publish{Topic: []byte("a/b"), Payload: []byte(big)})
 	c.expectClosed(2 * time.Second)
+}
+
+func TestReadBufferGrowsPastSmallDefault(t *testing.T) {
+	clk := newClock()
+	b := &Broker{}
+	b.opt.ReadBufferSize = defaultReadBuffer
+	b.opt.Limiter = quota.NewLocal(quota.Options{Now: clk.now})
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	c := newConn(b, server, ConnInfo{})
+	c.ver = packet.V5
+	want := strings.Repeat("payload-", 100)
+	raw, err := packet.Encode(&packet.Publish{Topic: []byte("a/b"), Payload: []byte(want)}, packet.V5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = client.Write(raw) }()
+	p, err := c.readPacket(context.Background())
+	if err != nil {
+		t.Fatalf("跨初始缓冲读取失败: %v", err)
+	}
+	pub, ok := p.(*packet.Publish)
+	if !ok || string(pub.Payload) != want {
+		t.Fatalf("解码结果 = %#v", p)
+	}
+	if len(c.rbuf) <= defaultReadBuffer {
+		t.Fatalf("%d 字节报文没有触发 %d 字节初始缓冲扩容", len(raw), defaultReadBuffer)
+	}
 }
 
 // TestOversizePayloadRejectedByQuota 验证负载超限以准确原因码断开。

@@ -80,6 +80,9 @@ func (g *TLSGroup) askPeer(to NodeID, q wireQuery) ([][]byte, string, error) {
 // 单个节点失败体现在对应 AdminResult.Err 上，整体仍返回 nil error
 // （ARCH-041）。并发发出：扇出的耗时是最慢那个节点的，而不是累加。
 func (t *MeshTransport) Query(ctx context.Context, to []NodeID, q AdminQuery) ([]AdminResult, error) {
+	if t.isClosed() {
+		return nil, ErrClosed
+	}
 	if len(to) == 0 {
 		return nil, nil
 	}

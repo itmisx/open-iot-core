@@ -64,7 +64,9 @@ type bucket struct {
 
 type bucketShard struct {
 	mu sync.Mutex
-	m  map[bucketKey]*bucket
+	// bucket 按值内联，避免每个唯一 clientId 再分配一个独立小对象。
+	// 更新时取值、修改、写回；锁已覆盖整个过程。
+	m map[bucketKey]bucket
 }
 
 type bucketKey struct {
@@ -96,6 +98,10 @@ type Local struct {
 		rejected atomicU64
 		current  atomicI64
 	}
+	// rateBucketCount/swept 使容量与回收效果可观测；不在指标采集时遍历 map。
+	rateBucketCount  atomicI64
+	rateBucketsSwept atomicU64
+	sweepCursor      atomicU64
 }
 
 // Options 是 Local 的构造参数。
@@ -124,7 +130,7 @@ func NewLocal(opt Options) *Local {
 		}
 	}
 	for i := range l.buckets {
-		l.buckets[i].m = make(map[bucketKey]*bucket)
+		l.buckets[i].m = make(map[bucketKey]bucket)
 		l.counters[i].m = make(map[bucketKey]int64)
 	}
 	return l
@@ -182,8 +188,8 @@ func (l *Local) allow(id ID, subject string, n int, wantScope Scope) bool {
 	sh.mu.Lock()
 	b, ok := sh.m[key]
 	if !ok {
-		b = &bucket{tokens: capTokens, lastMs: now}
-		sh.m[key] = b
+		b = bucket{tokens: capTokens, lastMs: now}
+		l.rateBucketCount.add(1)
 	}
 	// 懒补充：经过的毫秒数乘以每秒速率，正好是千分之一令牌的增量。
 	if elapsed := now - b.lastMs; elapsed > 0 {
@@ -197,6 +203,7 @@ func (l *Local) allow(id ID, subject string, n int, wantScope Scope) bool {
 	if ok {
 		b.tokens -= want
 	}
+	sh.m[key] = b
 	sh.mu.Unlock()
 
 	if ok {
@@ -206,6 +213,67 @@ func (l *Local) allow(id ID, subject string, n int, wantScope Scope) bool {
 	}
 	return ok
 }
+
+// SweepRateBuckets 增量回收已经恢复到满额的令牌桶。
+//
+// 满桶被删除与保留的下一次判定完全等价：两者都会以完整 burst 接受请求。
+// 每次只扫 maxShards 个分片，避免百万设备时一次长时间持有所有 shard 锁。
+func (l *Local) SweepRateBuckets(maxShards int) int {
+	if maxShards <= 0 {
+		return 0
+	}
+	if maxShards > bucketShards {
+		maxShards = bucketShards
+	}
+	now := l.nowUnixMs()
+	start := int(l.sweepCursor.load() % bucketShards)
+	l.sweepCursor.add(uint64(maxShards))
+	removed := 0
+	for off := 0; off < maxShards; off++ {
+		sh := &l.buckets[(start+off)%bucketShards]
+		sh.mu.Lock()
+		removedInShard := 0
+		for key, b := range sh.m {
+			d := l.defs[key.id]
+			if d.Kind != Rate || d.Limit <= 0 {
+				continue
+			}
+			burst := d.Burst
+			if burst <= 0 {
+				burst = d.Limit
+			}
+			capTokens := int64(burst) * milliScale
+			if b.tokens >= capTokens ||
+				(now > b.lastMs && b.tokens+(now-b.lastMs)*int64(d.Limit) >= capTokens) {
+				delete(sh.m, key)
+				removed++
+				removedInShard++
+			}
+		}
+		// Go map 删除键不会缩小 backing buckets。若本轮删掉的比剩下的
+		// 还多，重建小 map 才能真的把百万设备峰值归还给 GC；只 delete
+		// 会让对象数下降而 RSS/HeapInuse 仍长期停在峰值。
+		if removedInShard > len(sh.m) {
+			compact := make(map[bucketKey]bucket, len(sh.m))
+			for key, b := range sh.m {
+				compact[key] = b
+			}
+			sh.m = compact
+		}
+		sh.mu.Unlock()
+	}
+	if removed > 0 {
+		l.rateBucketCount.add(-int64(removed))
+		l.rateBucketsSwept.add(uint64(removed))
+	}
+	return removed
+}
+
+// RateBucketCount 返回当前常驻的速率桶数。
+func (l *Local) RateBucketCount() int64 { return l.rateBucketCount.load() }
+
+// RateBucketsSwept 返回启动以来回收的速率桶数。
+func (l *Local) RateBucketsSwept() uint64 { return l.rateBucketsSwept.load() }
 
 func (l *Local) Acquire(id ID, subject string, n int) bool {
 	if id >= numQuotas || l.defs[id].Kind != Count {

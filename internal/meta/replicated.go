@@ -175,19 +175,39 @@ func (s *ReplicatedStore) Apply(ctx context.Context, cmd Command) (Revision, err
 // 本节点应用不了意味着状态机分叉。组会据此停掉本节点的写入
 // （cluster.ErrApplyFailed），而不是跳过这一条继续跑。
 func (s *ReplicatedStore) ApplyCommitted(index uint64, data []byte) error {
-	cmd, err := DecodeCommand(data)
-	if err != nil {
-		// 解不开不能跳过：跳过之后本节点的视图比别人少一条变更，
-		// 而没有任何报错（CLU-066）。
-		return fmt.Errorf("meta: 第 %d 条已提交日志无法解析: %w", index, err)
+	return s.ApplyCommittedBatch([]CommittedData{{Index: index, Data: data}})
+}
+
+// CommittedData 是共识层交付的一条原始已提交日志。
+type CommittedData struct {
+	Index uint64
+	Data  []byte
+}
+
+// ApplyCommittedBatch 先解码整批，再以一个持久化事务交给 LocalStore。
+// 预先解码保证坏条目不会在前半批已经改变热视图之后才被发现。
+func (s *ReplicatedStore) ApplyCommittedBatch(batch []CommittedData) error {
+	entries := make([]CommittedEntry, len(batch))
+	for i := range batch {
+		cmd, err := DecodeCommand(batch[i].Data)
+		if err != nil {
+			return fmt.Errorf("meta: 第 %d 条已提交日志无法解析: %w", batch[i].Index, err)
+		}
+		entries[i] = CommittedEntry{Revision: Revision(batch[i].Index), Command: cmd}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.local.ApplyCommitted(cmd, Revision(index)); err != nil {
-		return fmt.Errorf("meta: 应用第 %d 条已提交日志失败: %w", index, err)
+	if err := s.local.ApplyCommittedBatch(entries); err != nil {
+		if len(batch) == 0 {
+			return err
+		}
+		return fmt.Errorf("meta: 应用第 %d..%d 条已提交日志失败: %w",
+			batch[0].Index, batch[len(batch)-1].Index, err)
 	}
-	if int(index) > s.nextIdx {
-		s.nextIdx = int(index)
+	for i := range batch {
+		if int(batch[i].Index) > s.nextIdx {
+			s.nextIdx = int(batch[i].Index)
+		}
 	}
 	return nil
 }

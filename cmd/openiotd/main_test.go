@@ -557,7 +557,6 @@ func TestSamplePolicyGrantsWhatItClaims(t *testing.T) {
 	sets := []*authz.CompiledSet{set}
 	ctx := &authz.Context{
 		ClientID: "dev-001", Thing: "dev-001", ThingAttached: true,
-		ThingAttr: func(string) (string, bool) { return "", false },
 	}
 
 	for _, c := range []struct {

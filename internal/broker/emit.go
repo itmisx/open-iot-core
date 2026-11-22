@@ -16,9 +16,13 @@ import (
 
 // emitConn 产出连接事件。
 func (c *conn) emitConn(res events.ConnResult, rc reason.Code, text string) {
+	stages := connectStages{}
+	if c.aux != nil {
+		stages = c.aux.stages
+	}
 	e := events.Event{
 		Kind:     events.KindConn,
-		ClientID: c.clientID,
+		ClientID: c.clientID(),
 		Thing:    c.princ.AuthzCtx.Thing,
 		Conn: events.ConnFields{
 			Result:      res,
@@ -27,24 +31,39 @@ func (c *conn) emitConn(res events.ConnResult, rc reason.Code, text string) {
 			Epoch:       c.epoch,
 			AuthMethod:  c.princ.AuthMethod,
 			ProtoVer:    byte(c.ver),
-			Remote:      c.info.Remote,
+			Remote:      c.remote(),
 			TLSVersion:  c.info.TLSVersion,
-			ALPN:        c.info.ALPN,
-			HandshakeMS: c.info.HandshakeMS,
+			ALPN:        c.alpn(),
+			HandshakeMS: stages.handshakeMS,
+			// CONNECT 分段耗时（OBS-148）。被拒的连接也带：半路返回的
+			// 那些各段为 0，而消费侧只取走完全部四段的（见 events/metrics.go）。
+			AuthMS:             stages.authMS,
+			SessionLoadMS:      stages.sessionLoadMS,
+			OwnerClaimMS:       stages.ownerClaimMS,
+			SessionWriteMS:     stages.sessionWriteMS,
+			SessionWrites:      stages.sessionWrites,
+			SessionWriteFailed: stages.writeFailed,
+			SessionWriteStale:  stages.writeStale,
 		},
 	}
 	if c.princ.HasFP {
 		e.Conn.CertFP = c.princ.CertFP.String()
-		e.Conn.CertCN = c.princ.AuthzCtx.Cert.Subject.CommonName
+		e.Conn.CertCN = stages.certCN
+		if e.Conn.CertCN == "" && c.princ.AuthzCtx.Cert != nil {
+			e.Conn.CertCN = c.princ.AuthzCtx.Cert.Subject.CommonName
+		}
 	}
 	c.b.opt.Bus.Emit(&e)
+	// 分段耗时只服务这一条 CONNECT 结果事件。成功连接会长期存活，不能
+	// 让这份建连期临时状态继续占住 conn 的主对象分配档。
+	c.releaseConnectStages()
 }
 
 // emitDisconnect 产出断开事件，含连接存续时长。
 func (c *conn) emitDisconnect(rc reason.Code, nowMs int64) {
 	e := events.Event{
 		Kind:     events.KindConn,
-		ClientID: c.clientID,
+		ClientID: c.clientID(),
 		Thing:    c.princ.AuthzCtx.Thing,
 		Conn: events.ConnFields{
 			Result:     events.ConnClosed,
@@ -53,7 +72,7 @@ func (c *conn) emitDisconnect(rc reason.Code, nowMs int64) {
 			Epoch:      c.epoch,
 			AuthMethod: c.princ.AuthMethod,
 			ProtoVer:   byte(c.ver),
-			Remote:     c.info.Remote,
+			Remote:     c.remote(),
 			DurationMS: nowMs - c.connectedAtMs,
 		},
 	}
@@ -70,7 +89,7 @@ func (c *conn) emitDisconnect(rc reason.Code, nowMs int64) {
 func (c *conn) emitMetaKick(fp meta.CertFingerprint, why string) {
 	e := events.Event{
 		Kind:     events.KindMeta,
-		ClientID: c.clientID,
+		ClientID: c.clientID(),
 		Thing:    c.princ.AuthzCtx.Thing,
 		Meta: events.MetaFields{
 			CertFP:             fp.String(),
@@ -87,7 +106,7 @@ func (c *conn) emitSub(filter string, qos uint8, unsub bool, granted reason.Code
 	share, inner := splitShared(filter)
 	e := events.Event{
 		Kind:     events.KindSubscription,
-		ClientID: c.clientID,
+		ClientID: c.clientID(),
 		Thing:    c.princ.AuthzCtx.Thing,
 		Sub: events.SubFields{
 			Filter:      inner,
@@ -107,7 +126,7 @@ func (c *conn) emitSub(filter string, qos uint8, unsub bool, granted reason.Code
 func (c *conn) emitAuthz(act authz.Action, resource string, tr *authz.Trace) {
 	e := events.Event{
 		Kind:     events.KindAuthz,
-		ClientID: c.clientID,
+		ClientID: c.clientID(),
 		Thing:    c.princ.AuthzCtx.Thing,
 		Authz: events.AuthzFields{
 			Action:         mapAction(act),
@@ -141,7 +160,7 @@ func (c *conn) emitQuota(id quota.ID, subject string) {
 	}
 	e := events.Event{
 		Kind:     events.KindQuota,
-		ClientID: c.clientID,
+		ClientID: c.clientID(),
 		Thing:    c.princ.AuthzCtx.Thing,
 		Quota: events.QuotaFields{
 			QuotaName: d.Name,

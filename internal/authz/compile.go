@@ -79,6 +79,9 @@ type CompiledSet struct {
 	env        Env
 	// attrRefs 是本策略引用的设备属性名，去重且已排序。
 	attrRefs []string
+	// certVars 表示资源模板引用了任一证书变量。broker 据此只让确实需要
+	// 证书字段的长连接保留 CertContext。
+	certVars bool
 }
 
 // AttrRefs 返回本策略引用的设备属性名。
@@ -94,6 +97,9 @@ func (c *CompiledSet) AttrRefs() []string {
 	copy(out, c.attrRefs)
 	return out
 }
+
+// UsesCertificateVariables 报告策略是否引用证书序列号、Subject 或 Issuer。
+func (c *CompiledSet) UsesCertificateVariables() bool { return c != nil && c.certVars }
 
 // Compile 把一份策略文档编译为匹配器。
 func Compile(name string, d *Document, env Env) (*CompiledSet, error) {
@@ -124,7 +130,22 @@ func Compile(name string, d *Document, env Env) (*CompiledSet, error) {
 		cs.Statements = append(cs.Statements, c)
 	}
 	cs.attrRefs = collectAttrRefs(cs.Statements)
+	cs.certVars = usesCertificateVariables(cs.Statements)
 	return cs, nil
+}
+
+func usesCertificateVariables(sts []CompiledStatement) bool {
+	for i := range sts {
+		for _, res := range sts[i].resources {
+			for _, tok := range res.id {
+				if tok.kind == tokVar && (tok.v.kind == varCertSerial ||
+					tok.v.kind == varSubject || tok.v.kind == varIssuer) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // collectAttrRefs 收集策略引用的设备属性名。

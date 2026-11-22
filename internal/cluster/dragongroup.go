@@ -36,6 +36,8 @@ type DragonOptions struct {
 
 	// Apply 由状态机调用，index 是 raft 日志序号。
 	Apply func(index uint64, data []byte) error
+	// ApplyBatch 整批应用一次 Dragonboat Update；非空时取代 Apply。
+	ApplyBatch func(entries []ShardEntry) error
 	// AppliedIndex 回报已持久化到哪一条（CLU-109）。
 	AppliedIndex func() uint64
 	SnapshotTo   func(w io.Writer) error
@@ -49,6 +51,49 @@ type DragonOptions struct {
 	ElectionRTT  uint64
 	HeartbeatRTT uint64
 	ApplyTimeout time.Duration
+}
+
+// RTT 的默认值与按它折算出来的两个时长。
+//
+// 这三个数一起定住了故障检测的行为：选举超时 1 秒、心跳 100 毫秒。
+// RTT 变了之后由 ticksFor 保持这两个时长不变（见 newDragonGroup）。
+const (
+	defaultRTT               = 100 * time.Millisecond
+	defaultElectionTimeout   = time.Second
+	defaultHeartbeatInterval = 100 * time.Millisecond
+)
+
+// electionHeartbeatRatio 是选举超时至少要是心跳间隔的多少倍。
+//
+// 10 是 dragonboat 自己的建议值，也是默认配置的实际比例（10 : 1）。
+// 它是下限而不是等号：RTT 大到一个 tick 就超过心跳间隔时，两者都会被
+// 钳到 1 个刻度，于是"一次心跳晚到就触发选举"——那比慢一点严重得多。
+const electionHeartbeatRatio = 10
+
+// ticksFor 把一个时长折算成 tick 数，至少 1。
+//
+// 钳到 1 的那一支是必须的：0 在库那边表示"取默认值"，而这里的 0 意思
+// 恰好相反（时长比一个 tick 还短）。
+func ticksFor(d, rtt time.Duration) uint64 {
+	n := uint64(d / rtt)
+	if n == 0 {
+		return 1
+	}
+	return n
+}
+
+// raftTicks 按 RTT 折算出心跳与选举的刻度数。
+//
+// 两者一起算，因为它们之间有约束（见 electionHeartbeatRatio）。默认
+// RTT 下结果恰好是历史上的 1 与 10——既有部署的行为一个字节都不变，
+// 由 TestTicksForKeepsTimeoutsConstant 钉住。
+func raftTicks(rtt time.Duration) (heartbeat, election uint64) {
+	heartbeat = ticksFor(defaultHeartbeatInterval, rtt)
+	election = ticksFor(defaultElectionTimeout, rtt)
+	if min := heartbeat * electionHeartbeatRatio; election < min {
+		election = min
+	}
+	return heartbeat, election
 }
 
 // dragonGroup 是建在 dragonboat 上的元数据复制组。
@@ -96,9 +141,16 @@ func newDragonGroup(opt DragonOptions) (*dragonGroup, error) {
 		g.byReplica[n] = id
 	}
 
+	// RTT 是库的 tick 间隔，心跳与选举超时都按它的倍数计。
+	//
+	// 默认 100 毫秒是个保守值（选举超时 1 秒）。同机房里它偏粗：
+	// 一次心跳最快也要 100 毫秒，而真实 RTT 是百微秒级。调小它的代价
+	// 是 tick 的 CPU 开销，收益要实测——判据是
+	// tests/bench/connect-stage-ab.sh 的 session_write 那一段
+	// （CLU-132）。
 	rtt := opt.RTT
 	if rtt <= 0 {
-		rtt = 100 * time.Millisecond
+		rtt = defaultRTT
 	}
 	nhc := dbconfig.NodeHostConfig{
 		NodeHostDir:    opt.Dir,
@@ -120,6 +172,7 @@ func newDragonGroup(opt DragonOptions) (*dragonGroup, error) {
 		apply: func(index uint64, data []byte) (uint64, error) {
 			return 0, opt.Apply(index, data)
 		},
+		applyBatch:   opt.ApplyBatch,
 		appliedIndex: opt.AppliedIndex,
 		snapshotTo:   opt.SnapshotTo,
 		restoreFrom:  opt.RestoreFrom,
@@ -129,11 +182,22 @@ func newDragonGroup(opt DragonOptions) (*dragonGroup, error) {
 		ElectionRTT: opt.ElectionRTT, HeartbeatRTT: opt.HeartbeatRTT,
 		CheckQuorum: true,
 	}
-	if cfg.ElectionRTT == 0 {
-		cfg.ElectionRTT = 10
-	}
-	if cfg.HeartbeatRTT == 0 {
-		cfg.HeartbeatRTT = 1
+	// 心跳与选举的刻度数跟着 RTT 缩放，使**实际时长不随 RTT 变**。
+	//
+	// 这一步不能省：两者的单位是 tick，所以把 RTT 从 100 毫秒调到 5
+	// 毫秒、而刻度数留在 10 与 1 时，选举超时从 1 秒变成 50 毫秒、心跳
+	// 从 100 毫秒变成 5 毫秒。后果不是"更快",而是**节点一忙就开始换
+	// leader**——50 毫秒内收不到心跳在一台正在压测的机器上太常见了，
+	// 而每次换届都要重放未提交的日志。调小 RTT 的目的是让提案的调度
+	// 粒度变细，不是让故障检测变激进，所以这里按时长折算刻度数。
+	if cfg.ElectionRTT == 0 || cfg.HeartbeatRTT == 0 {
+		hb, el := raftTicks(rtt)
+		if cfg.HeartbeatRTT == 0 {
+			cfg.HeartbeatRTT = hb
+		}
+		if cfg.ElectionRTT == 0 {
+			cfg.ElectionRTT = el
+		}
 	}
 
 	// bootstrap 给初始成员，join 给空表加 join=true。

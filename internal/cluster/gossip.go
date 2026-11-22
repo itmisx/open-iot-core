@@ -8,32 +8,41 @@ import "sync"
 // 直接查出来，而不是靠订阅匹配。这是本项目相对通用 broker 的主要性能
 // 杠杆（ARCH-017）——百万条精确订阅不跨节点传播，只有这张归属表要。
 //
-// 目前的编码是**全量名字快照**（CLU-075）：每个节点周期性把自己承载的
-// 设备名列表发给别人，整体替换。节点数与设备数都不大时够用；到百万
-// 设备要换成摘要（bloom 或 cuckoo），而 ARCH-047 把编码留作可延后的
-// 实现细节，正是为了这次替换不牵动调用方。
-//
-// 换摘要时要注意一件事：摘要会有假阳性，于是消息会被转发给一个其实
-// 没有这台设备的节点。那是可接受的（对端找不到订阅者就丢掉），
-// 但假阴性不可接受——它会让消息静默丢失。
+// 归属在正常路径上按 epoch + 连续版本传播增量；只有新对端、进程重启、
+// 版本断档或发送失败后才安装一次精确全量快照。这样百万空闲连接不会每秒
+// 复制一遍全部设备名，而漏掉一批增量也会被版本缺口发现，不会永久偏离。
 type RemoteThings struct {
 	self NodeID
 
-	mu     sync.RWMutex
-	byNode map[NodeID]map[string]bool
-	// where 是反向索引：设备名到承载它的节点。
+	mu sync.RWMutex
+	// where 是唯一的权威索引：设备名到承载它的节点。
 	//
-	// 单独维护而不是每次遍历 byNode：这是消息路由的热路径，
-	// 而节点数虽小，每条消息都扫一遍所有节点的设备集合是 O(节点×设备)。
+	// 旧实现还为每个节点永久维护一份 map[string]bool，百万连接时会把每个
+	// 设备名再放进一套哈希桶。节点离开和快照替换是低频控制面操作，可以
+	// 扫描这张表；Locate 是逐消息热路径，仍然保持一次 O(1) 查表。
 	where map[string]NodeID
+	// counts 只保存每个节点当前拥有的设备数量，用来 O(1) 回答 Nodes，
+	// 也让首次快照不必创建临时集合。
+	counts map[NodeID]int
+	// cursors 使增量具备可验证的连续性；needSync 记录发现断档后要向谁
+	// 请求全量快照。两者都与归属表共用一把锁，快照替换是原子的。
+	cursors  map[NodeID]thingCursor
+	needSync map[NodeID]bool
+}
+
+type thingCursor struct {
+	epoch   uint64
+	version uint64
 }
 
 // NewRemoteThings 创建归属表。
 func NewRemoteThings(self NodeID) *RemoteThings {
 	return &RemoteThings{
-		self:   self,
-		byNode: make(map[NodeID]map[string]bool),
-		where:  make(map[string]NodeID),
+		self:     self,
+		where:    make(map[string]NodeID),
+		counts:   make(map[NodeID]int),
+		cursors:  make(map[NodeID]thingCursor),
+		needSync: make(map[NodeID]bool),
 	}
 }
 
@@ -45,44 +54,154 @@ func (t *RemoteThings) Advertise(node NodeID, things []string) {
 	if node == t.self {
 		return
 	}
-	next := make(map[string]bool, len(things))
-	for _, name := range things {
-		next[name] = true
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.replaceLocked(node, things)
+}
+
+// ApplySnapshot 原子地安装一份带进程 epoch 与版本的精确快照。
+func (t *RemoteThings) ApplySnapshot(node NodeID, epoch, version uint64, things []string) {
+	if node == t.self {
+		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	// 先撤掉这个节点上次通告的、这次不在里面的
-	for name := range t.byNode[node] {
-		if !next[name] && t.where[name] == node {
-			delete(t.where, name)
+	t.replaceLocked(node, things)
+	t.cursors[node] = thingCursor{epoch: epoch, version: version}
+	delete(t.needSync, node)
+}
+
+// ApplyDelta 在版本连续时应用增量。返回 false 表示发现重启或断档，调用方
+// 应在下一次发往该节点的心跳里设置 ThingSync。
+func (t *RemoteThings) ApplyDelta(node NodeID, epoch, from, version uint64, changes []ThingChange) bool {
+	if node == t.self {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	cur, ok := t.cursors[node]
+	if !ok || cur.epoch != epoch || cur.version != from || version < from {
+		t.needSync[node] = true
+		return false
+	}
+	for _, change := range changes {
+		if change.Name == "" {
+			continue
+		}
+		if change.Present {
+			t.assignLocked(change.Name, node)
+			continue
+		}
+		t.removeLocked(change.Name, node)
+	}
+	t.cursors[node] = thingCursor{epoch: epoch, version: version}
+	delete(t.needSync, node)
+	return true
+}
+
+// NeedsSync 报告本节点是否需要对端发一份全量快照。
+func (t *RemoteThings) NeedsSync(node NodeID) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.needSync[node]
+}
+
+func (t *RemoteThings) replaceLocked(node NodeID, things []string) {
+	// 首次快照是集群扩容和进程启动的常见路径。没有旧归属时直接安装，
+	// 避免为了判定“哪些旧项消失了”再分配一张同样大的临时 map。
+	if t.counts[node] == 0 {
+		if len(t.where) == 0 && len(things) > 0 {
+			// 全表首份快照可以精确预分配；让 map 从零逐级扩容会同时
+			// 保留新旧桶，10 万设备基准里这部分分配接近表本身大小。
+			t.where = make(map[string]NodeID, len(things))
+		}
+		for _, name := range things {
+			if name != "" {
+				t.assignLocked(name, node)
+			}
+		}
+		return
+	}
+
+	next := make(map[string]struct{}, len(things))
+	for _, name := range things {
+		if name != "" {
+			next[name] = struct{}{}
 		}
 	}
-	if len(next) == 0 {
-		delete(t.byNode, node)
-	} else {
-		t.byNode[node] = next
+	removed := 0
+	for name, owner := range t.where {
+		if owner == node {
+			if _, ok := next[name]; !ok {
+				t.removeLocked(name, node)
+				removed++
+			}
+		}
 	}
 	for name := range next {
-		// 同一台设备被两个节点同时声明：以后到的那条为准。
-		//
-		// 这是设备正在从一个节点迁到另一个节点的样子（重连到了别处），
-		// 而两边的通告有先后。按后到者更新会短暂指错，但指错的后果是
-		// 一条消息转给了旧节点并在那里被丢掉；反过来固守旧值则会让
-		// 新连上的设备一直收不到消息，直到旧节点的通告过期。
-		t.where[name] = node
+		t.assignLocked(name, node)
 	}
+	t.compactWhereLocked(removed)
+}
+
+// assignLocked 实现同一设备“后到者胜”，并同步节点计数。
+func (t *RemoteThings) assignLocked(name string, node NodeID) {
+	old, ok := t.where[name]
+	if ok && old == node {
+		return
+	}
+	if ok {
+		t.decNodeLocked(old)
+	}
+	t.where[name] = node
+	t.counts[node]++
+}
+
+func (t *RemoteThings) removeLocked(name string, node NodeID) bool {
+	if owner, ok := t.where[name]; !ok || owner != node {
+		return false
+	}
+	delete(t.where, name)
+	t.decNodeLocked(node)
+	return true
+}
+
+func (t *RemoteThings) decNodeLocked(node NodeID) {
+	if t.counts[node] <= 1 {
+		delete(t.counts, node)
+		return
+	}
+	t.counts[node]--
+}
+
+// compactWhereLocked 在大量删除后重建 map。Go map 删除键不会缩小哈希桶，
+// 若节点离开后保留原桶，百万连接的一大块内存仍无法归还。
+func (t *RemoteThings) compactWhereLocked(removed int) {
+	if removed <= len(t.where) {
+		return
+	}
+	next := make(map[string]NodeID, len(t.where))
+	for name, node := range t.where {
+		next[name] = node
+	}
+	t.where = next
 }
 
 // Forget 移除某节点的全部归属，用于成员离开。
 func (t *RemoteThings) Forget(node NodeID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for name := range t.byNode[node] {
-		if t.where[name] == node {
+	removed := 0
+	for name, owner := range t.where {
+		if owner == node {
 			delete(t.where, name)
+			removed++
 		}
 	}
-	delete(t.byNode, node)
+	delete(t.counts, node)
+	t.compactWhereLocked(removed)
+	delete(t.cursors, node)
+	delete(t.needSync, node)
 }
 
 // Locate 返回承载该设备的远端节点。
@@ -101,7 +220,7 @@ func (t *RemoteThings) Locate(thing []byte) (NodeID, bool) {
 func (t *RemoteThings) Nodes() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return len(t.byNode)
+	return len(t.counts)
 }
 
 // Len 返回已知的远端设备数。

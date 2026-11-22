@@ -175,3 +175,21 @@
 | --- | --- | --- |
 | OBS-146 | `/node` 须暴露本节点热视图的 revision。集群运维要靠它看出哪个节点落后了：三个节点的这个数字不一致，说明有人没追上已提交的日志。 | v0.1 |
 | OBS-147 | `/cluster/members` 须给出当前成员、各自的复制地址、哪一条是本节点，以及**多数派所需票数**。运维要据此判断「还能掉几个节点」，而那个数字在成员变更之后不再等于配置里的 voters。 | v0.1 |
+
+## CONNECT 路径的分段埋点（实现期补充，2026-11-21）
+
+| ID | 需求 | 状态 |
+| --- | --- | --- |
+| OBS-148 | CONNECT 路径须按**四段**暴露耗时（`connect_stage_duration_ms`，标签 `stage` 取 `auth` / `session_load` / `owner_claim` / `session_write`），并单独暴露「一次建连提了几条复制日志」（`session_writes_total`，分母用 `connections_total{result="accepted"}`）。理由是归因：此前这条路径只有一个端到端数字，于是 CLU-125 修完 apply 侧、端到端只涨 18% 之后，剩下的 25 至 48 倍无从下手——而四段里前三段都是本地操作，只有第四段在集群下是一轮共识，**分段的全部意义就是把这一刀切出来**。配套的还有提案侧三项：按发起时本节点是否为该分片 leader 分类的提案数（`session_proposals_total{leader="local|remote|unknown"}`）、提案耗时（`session_proposal_duration_ms`）与提案失败数。埋点仍然只有事件总线一处（契约 11、OBS-001）：四段耗时是连接事件的字段，由 `Emit` 在采样闸门之前累加；提案侧那三项是分片组自己的 `Stats()`，与既有的 `router.Stats()` 同一种读取。两条约定：**走完全程的连接才记**（被接受的，以及因为会话写不进去而被拒的 `StoreFailed`——后者那一段恰恰是最慢的一次，排除掉会让复制层出问题时分位数反而变好看），而半路返回的拒绝一律不记；**真的是 0 也要记**，否则各段的 `count` 之间不可比，而那是定位瓶颈时第一个要看的东西。 | v0.1 |
+| OBS-149 | CLU-134 之后 `session_writes_total` 表示 CONNECT 发出的**逻辑会话写**，而 `session_proposals_total` 才是物理 Raft 提案数。多个逻辑写可以合成一条日志，两者不得再当成同一计数。合批系数用前者除以后者；非持久会话的前者仍必须为 0。 | v0.1 |
+| OBS-150 | RF 小于节点数时须分别暴露非本地 session cell 的逻辑读取数 `session_remote_reads_total`、物理批量 RPC 数 `session_remote_read_batches_total` 与失败的逻辑请求数 `session_remote_read_errors_total`。CLU-147 的读合批是否生效只能由前两者的比值判断；只看 CONNECT/s 无法区分读取合批、ownership 合批和会话写合批。 | v0.2 |
+| OBS-151 | 配额层须暴露 `quota_rate_buckets` 与 `quota_rate_buckets_swept_total`。前者在重连风暴结束并经过一轮回收后应回到仍在消耗速率额度的活跃主体数量，而不是历史上见过的 clientId 总数；若只看 Go 总堆，map backing buckets 未压缩的问题会被其他连接对象淹没。 | v0.2 |
+| OBS-152 | CLU-137 之后 OBS-148 中「前三段都是本地操作」的描述已过时：`auth` 是本地，RF=3 非副本节点的 `session_load` 可走远程读或 Claim 携带，`owner_claim` 是可合批的分片 leader 内存 RPC（零 Raft 日志、零 fsync），`session_write` 才是一轮共识。读四段时必须区分 ownership RPC 背压与 session Raft 写入背压。权威 epoch 下的 stale session write 会拒绝 CONNECT 并记入 `StoreFailed`，不再是「只记数后接受」。 | v0.1 |
+| OBS-153 | `session_remote_reads_total` 仍统计全部非本地逻辑读取；其中由 Claim 应答直接携带、没有另发 SessionRead RPC 的数量须由 `session_remote_read_claim_piggyback_total` 单列。独立读取的合批系数应为 `(remote_reads - claim_piggyback) / remote_read_batches`，否则 Claim 携带比例高时会把“省掉 RPC”误报成超大合批。 | v0.2 |
+| OBS-154 | 启用影子分片时须暴露 `shadow_shard_count`、`shadow_proposals_total{leader}`、`shadow_raft_proposals_total`、`shadow_proposal_errors_total` 与 `shadow_proposal_duration_ms`。逻辑请求与物理 Raft 条数的差额用于验证 leader 二次合批；RF=3 后 remote 比例用于发现接入流量与 leader 放置失衡。 | v0.3 |
+| OBS-155 | Shadow RF=3 须分别暴露远程逻辑读、物理读 RPC、副本回退、最终读错误、远程写与远程写错误。读可依次回退到其他放置副本；写在结果模糊时不得换副本重试，因此两者不得共用一个 retry 计数。 | v0.3 |
+| OBS-156 | Ownership Claim 须暴露逻辑远程请求、物理 RPC、最终错误、入队时已饱和数，以及当前 queued / in-flight logical / in-flight RPC gauge。`remote_claims / claim_rpcs` 是合批系数；queued 与 in-flight RPC 上限同时顶高表示对端或网络背压，不得只用 `owner_claim` 端到端直方图推测。 | v0.3 |
+| OBS-157 | TLS listener 须在 MQTT CONNECT 之前单独暴露全握手、ticket 恢复、TLS 失败、握手限流、当前在途、历史在途峰值和 admission 容量。`handshake_duration_ms` 只能看到最终走到 MQTT 连接事件的成功握手，无法发现握手失败、限流或握手后不发 CONNECT 的客户端，因此不得用它代替 listener 计数。 | v0.2 |
+| OBS-158 | Access 侧 session proposal pipeline 须暴露饱和入队累计值、当前 queued / in-flight logical / in-flight batches、历史 queued / in-flight batches 峰值及有界缓存量；shard leader 二次合并另须暴露当前和历史的 queued / Raft in-flight。只有 Access 在途达到上限或 leader 排队增长，才能把 CONNECT 尾延迟归因到相应层；压测结束后的当前 gauge 为零不能替代峰值。 | v0.3 |
+| OBS-159 | 运行时指标须暴露 `runtime_memory_limit_bytes`，Linux 密度时间线必须采集它。仅在部署说明或环境变量中写了 `GOMEMLIMIT` 不足以证明运行进程实际生效；容量报告须同时给出该值、runtime Sys、RSS 与 cgroup/物理上限。 | v0.2 |
+| OBS-160 | session leader 二次合批须累计已消费 Access 批数、逻辑命令数和物理日志数，并把物理日志分为装满 64 条、未满但队列快照耗尽、未满且被下一 Access 批/字节上限/维护命令截断三类。仅有 `session_raft_proposals_total` 无法区分“到达不足”与“块太大装不下”，也无法评估 Access 分块上限。 | v0.3 |

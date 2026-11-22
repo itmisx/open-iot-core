@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -150,6 +151,93 @@ func TestRateLimitPerSubjectIsolated(t *testing.T) {
 	// c2 不受影响
 	if !l.AllowLocal(PublishRatePerConn, "c2", 1) {
 		t.Error("不同作用对象的额度应相互隔离")
+	}
+}
+
+func TestSweepRateBucketsRemovesOnlyRefilledBuckets(t *testing.T) {
+	l, clk := newTestLimiter(map[ID]int{PublishRatePerConn: 10})
+	for _, clientID := range []string{"c1", "c2"} {
+		if !l.AllowLocal(PublishRatePerConn, clientID, 1) {
+			t.Fatal("初次请求应通过")
+		}
+	}
+	if got := l.RateBucketCount(); got != 2 {
+		t.Fatalf("速率桶数 = %d", got)
+	}
+
+	// 99ms 只补回 0.99 个令牌，尚未满桶，不能提前删除并放宽限制。
+	clk.advance(99)
+	if got := l.SweepRateBuckets(bucketShards); got != 0 {
+		t.Fatalf("未满桶被回收 %d 个", got)
+	}
+	if l.RateBucketCount() != 2 {
+		t.Fatal("未满桶不应消失")
+	}
+
+	clk.advance(1)
+	if got := l.SweepRateBuckets(bucketShards); got != 2 {
+		t.Fatalf("满桶回收数 = %d，期望 2", got)
+	}
+	if l.RateBucketCount() != 0 || l.RateBucketsSwept() != 2 {
+		t.Fatalf("回收后 count=%d swept=%d", l.RateBucketCount(), l.RateBucketsSwept())
+	}
+
+	// 删除后的语义等于保留一个满桶：仍能完整使用 10 个 burst。
+	for i := 0; i < 10; i++ {
+		if !l.AllowLocal(PublishRatePerConn, "c1", 1) {
+			t.Fatalf("回收后第 %d 个令牌被拒", i+1)
+		}
+	}
+	if l.AllowLocal(PublishRatePerConn, "c1", 1) {
+		t.Fatal("回收后不应放宽 burst 上限")
+	}
+}
+
+func TestSweepRateBucketsIsIncremental(t *testing.T) {
+	l, clk := newTestLimiter(map[ID]int{PublishRatePerConn: 1})
+	for i := 0; i < 1000; i++ {
+		if !l.AllowLocal(PublishRatePerConn, fmt.Sprintf("device-%d", i), 1) {
+			t.Fatal("初次请求应通过")
+		}
+	}
+	clk.advance(1000)
+	first := l.SweepRateBuckets(1)
+	if first <= 0 || first >= 1000 {
+		t.Fatalf("单分片回收数 = %d，应只回收总量的一部分", first)
+	}
+	for i := 1; i < bucketShards; i++ {
+		l.SweepRateBuckets(1)
+	}
+	if got := l.RateBucketCount(); got != 0 {
+		t.Fatalf("扫完一轮仍有 %d 个桶", got)
+	}
+}
+
+func TestSweepRateBucketsConcurrentWithAllow(t *testing.T) {
+	l, clk := newTestLimiter(map[ID]int{ConnectRatePerClient: 1000})
+	for i := 0; i < 1000; i++ {
+		l.AllowGlobal(context.Background(), ConnectRatePerClient,
+			fmt.Sprintf("device-%d", i), 1)
+	}
+	clk.advance(1000)
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := worker; i < 1000; i += 8 {
+				l.AllowGlobal(context.Background(), ConnectRatePerClient,
+					fmt.Sprintf("device-%d", i), 1)
+			}
+		}()
+	}
+	for i := 0; i < bucketShards; i++ {
+		l.SweepRateBuckets(1)
+	}
+	wg.Wait()
+	if got := l.RateBucketCount(); got < 0 || got > 1000 {
+		t.Fatalf("并发回收后的桶数非法: %d", got)
 	}
 }
 
@@ -440,6 +528,45 @@ func BenchmarkAllowLocal(b *testing.B) {
 			b.Fatal("应通过")
 		}
 	}
+}
+
+func BenchmarkAllowLocalUniqueSubjects(b *testing.B) {
+	clk := &fakeClock{ms: 1}
+	l := NewLocal(Options{Now: clk.now, Overrides: map[ID]int{ConnectRatePerClient: 1}})
+	subjects := make([]string, b.N)
+	for i := range subjects {
+		subjects[i] = fmt.Sprintf("device-%d", i)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range subjects {
+		if !l.AllowGlobal(context.Background(), ConnectRatePerClient, subjects[i], 1) {
+			b.Fatal("初次连接应通过")
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(l.RateBucketCount()), "resident_buckets")
+}
+
+func BenchmarkSweepRateBuckets200K(b *testing.B) {
+	const subjects = 200_000
+	for n := 0; n < b.N; n++ {
+		b.StopTimer()
+		clk := &fakeClock{ms: 1}
+		l := NewLocal(Options{Now: clk.now, Overrides: map[ID]int{ConnectRatePerClient: 1}})
+		for i := 0; i < subjects; i++ {
+			l.AllowGlobal(context.Background(), ConnectRatePerClient,
+				fmt.Sprintf("device-%d", i), 1)
+		}
+		clk.advance(1000)
+		b.StartTimer()
+		removed := l.SweepRateBuckets(bucketShards)
+		b.StopTimer()
+		if removed != subjects || l.RateBucketCount() != 0 {
+			b.Fatalf("removed=%d remaining=%d", removed, l.RateBucketCount())
+		}
+	}
+	b.ReportMetric(subjects, "buckets/op")
 }
 
 func BenchmarkWithin(b *testing.B) {

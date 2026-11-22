@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 
 	"github.com/itmisx/open-iot-core/internal/authz"
 	"github.com/itmisx/open-iot-core/internal/cluster"
@@ -12,6 +13,57 @@ import (
 	"github.com/itmisx/open-iot-core/internal/router"
 	"github.com/itmisx/open-iot-core/internal/session"
 )
+
+// connectStages 是 CONNECT 路径各段的耗时与写入次数（OBS-148）。
+//
+// 为什么要这四个数：建连速率的归因此前只有一个端到端数字，于是
+// CLU-125 修完 apply 侧、端到端只涨 18% 之后，剩下的 25 至 48 倍
+// 无从下手（CLU-126）。四段里前三段都是本地操作（读热视图、读本地
+// 磁盘、一次内存互斥），只有第四段在集群下是一轮共识——**分段的
+// 全部意义就是把这一刀切出来**，否则"瓶颈在共识还是在别处"只能靠猜。
+type connectStages struct {
+	handshakeMS    float64
+	authMS         float64
+	sessionLoadMS  float64
+	ownerClaimMS   float64
+	sessionWriteMS float64
+	// sessionWrites 是本次 CONNECT 发出的会话存储写入次数。
+	// 非持久会话应当恒为 0，见 handleConnect 里的 persistSession。
+	sessionWrites uint8
+	// writeFailed 记下其中是否有一次**基础设施**失败（写不进去）。
+	writeFailed bool
+	// writeStale 记下其中是否有一次被 epoch 围栏判为陈旧。
+	//
+	// 与 writeFailed 分开是必须的：它表示「存储里已有更新的
+	// owner」而不是共识层故障。集群的 ShardOwnership 接入后 epoch
+	// 已全局有序，该判定会拒绝 CONNECT；兼容旧 LocalOwnership 时只记数。
+	writeStale bool
+	// certCN 只需活到 CONNECT 结果事件发出；不让它迫使完整 CertContext
+	// 在不引用证书变量的百万条空闲连接上常驻。
+	certCN string
+}
+
+// timedSessionWrite 执行一次会话存储写入，记下耗时、次数与成败。
+//
+// 为什么不在调用处直接丢弃错误：集群下这一次写入是一轮共识，它会因为
+// 分片还没选出 leader、失去多数派或超时而失败，而**失败后仍然回一个
+// 成功的 CONNACK 等于骗设备**——它以为自己的持久会话已经可以跨节点
+// 恢复了（CLU-130）。错误不在这里打日志：broker 的观测面只有事件总线
+// 一处（契约 11），所以失败经事件字段上报，由指标与事件流呈现。
+func (c *conn) timedSessionWrite(f func() error) error {
+	start := nowMonotonic()
+	err := f()
+	c.aux.stages.sessionWriteMS += msSince(start)
+	c.aux.stages.sessionWrites++
+	switch {
+	case err == nil:
+	case errors.Is(err, cluster.ErrStaleEpoch):
+		c.aux.stages.writeStale = true
+	default:
+		c.aux.stages.writeFailed = true
+	}
+	return err
+}
 
 // handleConnect 处理 CONNECT 报文。
 //
@@ -49,7 +101,7 @@ func (c *conn) handleConnect(ctx context.Context, cp *packet.Connect) error {
 		clientID = c.b.assignClientID()
 		assigned = true
 	}
-	c.clientID = clientID
+	c.princ.AuthzCtx.ClientID = clientID
 
 	// 接入速率配额。每 clientId 1/秒是防重连风暴的关键（PRD QTA-028）。
 	if !c.b.opt.Limiter.AllowGlobal(ctx, quota.ConnectRatePerClient, clientID, 1) {
@@ -76,11 +128,19 @@ func (c *conn) handleConnect(ctx context.Context, cp *packet.Connect) error {
 	}()
 
 	// 认证。只读热视图，不触网（契约 05）。
-	princ, rc := c.b.opt.Auth.Authenticate(v, c.info, clientID, cp.Username, cp.Password)
+	authStart := nowMonotonic()
+	princ, rc := c.b.opt.Auth.Authenticate(v, c.authenticationInfo(), clientID, cp.Username, cp.Password)
+	// 证书 DN/序列号与 AccessKeyID 已被认证器投影进 Principal；不再让
+	// 长连接通过 connAuthInfo 保留第二份字段头与短期认证载荷。
+	c.releaseAuthInfo()
 	if rc != reason.Success {
 		return c.rejectConnect(events.ConnAuthFailed, rc, "认证失败")
 	}
-	c.princ = princ
+	c.princ = livePrincipal{
+		Policies: princ.Policies, AuthzCtx: princ.AuthzCtx,
+		CertFP: princ.CertFP, Kind: princ.Kind, HasFP: princ.HasFP,
+		AuthMethod: princ.AuthMethod,
+	}
 
 	// 补全策略求值上下文：clientId 由连接决定，属性查询器接本地热视图。
 	c.princ.AuthzCtx.ClientID = clientID
@@ -89,9 +149,7 @@ func (c *conn) handleConnect(ctx context.Context, cp *packet.Connect) error {
 	}
 	thing := c.princ.AuthzCtx.Thing
 	if thing != "" {
-		c.princ.AuthzCtx.ThingAttr = func(name string) (string, bool) {
-			return c.b.opt.Meta.View().ThingAttr(thing, name)
-		}
+		c.princ.AuthzCtx.ThingAttrs = v
 	}
 	if len(c.princ.Policies) == 0 {
 		c.princ.Policies = policiesFor(v, princ.CertFP, princ.HasFP, thing)
@@ -102,9 +160,31 @@ func (c *conn) handleConnect(ctx context.Context, cp *packet.Connect) error {
 		return c.rejectConnect(events.ConnAuthFailed, reason.NotAuthorized,
 			"策略不允许该 clientId 连接")
 	}
+	// CONNECT 鉴权已经用完证书上下文。后续策略完全不引用证书变量时，
+	// 只把审计事件需要的 CN 留在短命 stages sidecar，随后释放 128 B
+	// CertContext。策略快照在连接期不变，因此不会漏掉后续引用。
+	if c.princ.AuthzCtx.Cert != nil {
+		c.aux.stages.certCN = c.princ.AuthzCtx.Cert.Subject.CommonName
+		keepCert := false
+		for _, ps := range c.princ.Policies {
+			if ps.UsesCertificateVariables() {
+				keepCert = true
+				break
+			}
+		}
+		if !keepCert {
+			c.princ.AuthzCtx.Cert = nil
+		}
+	}
+	// 认证与鉴权这一段到此结束（OBS-148）。两者合成一段而不是分开两个
+	// 直方图：它们读的是同一份热视图、量级也相同，而分段的用处是回答
+	// "时间花在本地还是花在共识上"，再细分不增加信息。
+	c.aux.stages.authMS = msSince(authStart)
 
 	// 抢占所有权。这是第一个有副作用的步骤，故放在最后。
+	claimStart := nowMonotonic()
 	epoch, err := c.b.opt.Owners.Claim(ctx, clientID, c.b.opt.Node)
+	c.aux.stages.ownerClaimMS = msSince(claimStart)
 	if err != nil {
 		return c.rejectConnect(events.ConnAuthFailed, reason.ServerUnavailable,
 			"无法取得会话所有权")
@@ -117,7 +197,44 @@ func (c *conn) handleConnect(ctx context.Context, cp *packet.Connect) error {
 	c.b.cancelWill(clientID)
 
 	// 恢复或新建会话。
-	st, present := c.restoreSession(ctx, cp, clientID, epoch)
+	loadStart := nowMonotonic()
+	st, present, storedEpoch, loadErr := c.restoreSession(ctx, cp, clientID, epoch)
+	c.aux.stages.sessionLoadMS = msSince(loadStart)
+	if loadErr != nil {
+		// 远端 session cell 不可读时不能把“未知”当成“不存在”，否则随后
+		// Save 会用一份空会话覆盖原订阅与离线队列。Claim 已经成功，拒绝
+		// 前尽力归还；epoch 围栏保证迟到 Release 不会删掉更新的 owner。
+		_ = c.b.opt.Owners.Release(ctx, clientID, epoch)
+		return c.rejectConnect(events.ConnStoreFailed, reason.ServerUnavailable,
+			"无法读取持久会话，拒绝连接以免覆盖未知状态")
+	}
+	// 过期间隔为 0 意味着这份状态只属于本次连接。这个判定要在运行时
+	// 登记之前落定，否则 DISCONNECT 那条路径会发出一条复制的 Delete。
+	c.persistSession = st.ExpiryInterval > 0
+	// 非持久会话顶掉一条旧的持久记录时，那条记录仍然要删；但全新的
+	// clientId 不该为此付一次写入——集群下它是一轮共识，而压测里
+	// 每条连接都是全新的 clientId（CLU-128）。持久会话的 clean start
+	// 由下面的 Replace 原子处理，不走这里。
+	if storedEpoch.Valid() && !c.persistSession {
+		// 删除要带**那条记录自己的 epoch**，不是刚抢到的新 epoch。
+		//
+		// 存储层的删除围栏用的是相等而非小于（见 store.SessionStore.Delete
+		// 的说明：删除是破坏性操作，只有持有当前 epoch 的连接才有权删），
+		// 所以拿新 epoch 去删永远返回 ErrStaleEpoch——记录留在那里，而
+		// 调用方把错误丢掉了，于是切到清洁会话的设备会在存储里留下一条
+		// 持久记录，它持有的订阅不在路由表里。确定性模拟报的"路由泄漏"
+		// 与"配额泄漏"就是它（CLU-129）。
+		//
+		// 带上旧 epoch 之后围栏仍然成立：Load 与 Delete 之间若有人写进
+		// 一条更新的记录，相等判定自然不成立，这一次删除就该被拒。
+		//
+		// 这一次失败不拒绝连接：本次会话是连接本地的，没有任何东西
+		// 依赖那条旧记录消失。留下的后果是一条过期记录多活一会儿，
+		// 由会话过期清理收走。失败本身经事件字段上报。
+		_ = c.timedSessionWrite(func() error {
+			return c.b.opt.Sessions.Delete(ctx, clientID, storedEpoch)
+		})
+	}
 	c.rt = session.NewRuntime(st, c.nc, c.b.opt.OutboundBuffer)
 	c.rt.SetOnClose(func(cluster.EvictReason) { _ = c.nc.Close() })
 
@@ -163,7 +280,66 @@ func (c *conn) handleConnect(ctx context.Context, cp *packet.Connect) error {
 	//
 	// 顺序颠倒会让旧连接的清理覆盖掉新会话：存储的 epoch 围栏比较的是
 	// 「已存储的 epoch」，只有新 epoch 先落盘，旧连接后到的写入才会被拒。
-	_ = c.b.opt.Sessions.Save(ctx, st)
+	if c.persistSession {
+		var werr error
+		if cp.CleanStart {
+			werr = c.timedSessionWrite(func() error {
+				return c.b.opt.Sessions.Replace(ctx, st)
+			})
+		} else {
+			werr = c.timedSessionWrite(func() error {
+				return c.b.opt.Sessions.Save(ctx, st)
+			})
+		}
+		// 写不进去必须拒绝；围栏判的「陈旧」在 epoch 全局有序时
+		// 同样必须拒绝。
+		//
+		// 这两者在集群下的含义完全不同。写不进去是复制层此刻不可用
+		// （没有 leader、失去多数派、提案超时），回成功的 CONNACK 就是
+		// 谎称会话已持久（CLU-130）。而「陈旧」是围栏说存储里那份更新
+		// ——旧实现中这个判定不可据以行动：epoch 由各节点的本地所有权表
+		// 发放，term 恒为 1、序号各自递增，所以设备从节点 a 换到节点 c
+		// 重连时会被误判成陈旧（CLU-131）。下面记录的是该缺陷的来路。
+		//
+		// 这正是三进程验收抓到的那一条：`tests/cluster/run.sh` 的持久
+		// 会话跨节点那一段里，设备重连到另一个节点时 CONNACK 回了原因码
+		// 3。此前这条路径上的错误被 `_ =` 丢掉了，所以它在功能上看不出
+		// 来——会话状态本来就在本地副本里读得到，队列也补发得出去，唯一
+		// 的后果是存储里那条记录的 epoch 与 owner 没更新，而那意味着围栏
+		// 从此失效。
+		//
+		// ShardOwnership（CLU-137）已使 epoch 全局有序，所以集群下
+		// 陈旧的真正含义就是「这个 clientId 已被别处的新连接接管」。
+		// AuthoritativeEpoch 仅为滚动升级与旧实现保留兼容开关。
+		staleWrite := errors.Is(werr, cluster.ErrStaleEpoch)
+		if werr != nil && (!staleWrite || c.b.opt.AuthoritativeEpoch) {
+			// 持久会话落盘失败就不能回成功的 CONNACK（CLU-130）。
+			//
+			// 拒绝之前先把本连接降级为非持久：接下来的 close 会走
+			// persist 的非持久分支，于是不会再发一次注定失败的写入，
+			// 并且会把所有权与订阅额度一起还掉——下一次 CONNECT 才
+			// 能干净地重新抢占。
+			//
+			// 不选"照常接受、只记一条指标"：那样设备以为自己的会话
+			// 已经跨节点可恢复，而这个节点一死它就不见了，而且不报错。
+			// 被拒的设备会按退避重连，而 connect_rate_per_client
+			// 本身就是 1/秒，不会形成风暴。
+			c.persistSession = false
+			// 被抢占的那条连接仍然要断开，尽管本次连接要被拒。
+			//
+			// register 已经把索引指向本连接，旧连接从此按 clientId
+			// 找不到了：不断开它就留下一条"活着但谁也找不到"的连接
+			// ——它继续收发消息，而下一次 CONNECT 的 lookup 查不到它，
+			// 于是不会再驱逐它，同一个 clientId 从此有两条活连接。
+			// 正常路径上这一步在落盘之后（见上面那段关于顺序的说明），
+			// 而这里没有落盘成功，那个顺序的理由不成立。
+			if prev != nil && prev != c {
+				prev.evict(reason.SessionTakenOver, cluster.EvictTakenOver)
+			}
+			return c.rejectConnect(events.ConnStoreFailed, reason.ServerUnavailable,
+				"会话无法持久化，拒绝连接以免谎称会话已持久")
+		}
+	}
 	if prev != nil && prev != c {
 		prev.evict(reason.SessionTakenOver, cluster.EvictTakenOver)
 	}
@@ -209,10 +385,12 @@ func (c *conn) rejectConnect(res events.ConnResult, rc reason.Code, text string)
 
 // restoreSession 恢复持久会话或新建一个。
 //
-// 返回的第二个值即 CONNACK 的 Session Present 标志。
+// 返回的第二个值即 CONNACK 的 Session Present 标志；第三个是存储里
+// 那条旧记录的 epoch（没有旧记录时为 ZeroEpoch），调用方据此决定要不要
+// 、以及用什么 epoch 去删它。
 func (c *conn) restoreSession(ctx context.Context, cp *packet.Connect,
 	clientID string, epoch cluster.Epoch,
-) (*session.State, bool) {
+) (*session.State, bool, cluster.Epoch, error) {
 	expiry := uint32(0)
 	if c.ver == packet.V5 {
 		if cp.Props.Has(packet.PropSessionExpiry) {
@@ -224,8 +402,15 @@ func (c *conn) restoreSession(ctx context.Context, cp *packet.Connect,
 		expiry = defaultSessionExpiry311
 	}
 
-	if old, ok, err := c.b.opt.Sessions.Load(ctx, clientID); err == nil && ok {
-		if !cp.CleanStart && !old.Expired(c.b.opt.Now()) {
+	storedEpoch := cluster.ZeroEpoch
+	old, ok, err := c.loadClaimedSession(ctx, clientID, epoch)
+	if err != nil {
+		return nil, false, cluster.ZeroEpoch, err
+	}
+	if ok {
+		// 先记下旧记录的 epoch：续上会话那一支马上就会把它改成新的。
+		storedEpoch = old.Epoch
+		if !cp.CleanStart && expiry > 0 && !old.Expired(c.b.opt.Now()) {
 			old.Epoch = epoch
 			old.Owner = c.b.opt.Node
 			old.ProtoVer = byte(c.ver)
@@ -234,7 +419,7 @@ func (c *conn) restoreSession(ctx context.Context, cp *packet.Connect,
 			old.KeepAlive = cp.KeepAlive
 			old.DisconnectUnixMs = 0
 			c.applyWill(old, cp)
-			return old, true
+			return old, true, storedEpoch, nil
 		}
 		// 会话不再续上（clean start 或已过期）。存储里还记着的在途额度
 		// 要在这里还：这两条路径都不会走到旧连接的 persist。进程重启后
@@ -245,9 +430,6 @@ func (c *conn) restoreSession(ctx context.Context, cp *packet.Connect,
 	//
 	// 路由表里的残留订阅不在这里摘：它与「会话已过期」是同一件事，
 	// 统一由 handleConnect 在接管判定之后处理（见那里的说明）。
-	if cp.CleanStart {
-		_ = c.b.opt.Sessions.Delete(ctx, clientID, epoch)
-	}
 	st := &session.State{
 		ClientID:       clientID,
 		Epoch:          epoch,
@@ -269,7 +451,20 @@ func (c *conn) restoreSession(ctx context.Context, cp *packet.Connect,
 		}
 	}
 	c.applyWill(st, cp)
-	return st, false
+	return st, false, storedEpoch, nil
+}
+
+type claimedSessionLoader interface {
+	LoadClaimed(context.Context, string, cluster.Epoch) (*session.State, bool, error)
+}
+
+func (c *conn) loadClaimedSession(ctx context.Context, clientID string,
+	epoch cluster.Epoch,
+) (*session.State, bool, error) {
+	if loader, ok := c.b.opt.Sessions.(claimedSessionLoader); ok {
+		return loader.LoadClaimed(ctx, clientID, epoch)
+	}
+	return c.b.opt.Sessions.Load(ctx, clientID)
 }
 
 // adoptLive 从被抢占的本地连接接过会话的订阅集，返回是否接管成功。
@@ -344,7 +539,7 @@ const defaultSessionExpiry311 = 3600
 //
 // 客户端请求小于 30 秒时提升到 30 秒；0 表示不启用保活。
 // 超时窗口按规范取 1.5 倍（MQTT-3.1.2.10）。
-func (c *conn) effectiveKeepAliveMs(requested uint16) int64 {
+func (c *conn) effectiveKeepAliveMs(requested uint16) uint32 {
 	ka := int64(requested)
 	if ka == 0 {
 		return 0
@@ -355,7 +550,12 @@ func (c *conn) effectiveKeepAliveMs(requested uint16) int64 {
 	if ka > maxKeepAliveSeconds {
 		ka = maxKeepAliveSeconds
 	}
-	return int64(float64(ka) * 1000 * c.b.opt.KeepAliveGraceFactor)
+	ms := float64(ka) * 1000 * c.b.opt.KeepAliveGraceFactor
+	const maxUint32 = ^uint32(0)
+	if ms >= float64(maxUint32) {
+		return maxUint32
+	}
+	return uint32(ms)
 }
 
 const (
@@ -451,7 +651,7 @@ func (c *conn) flushQueued() {
 	// Save 带的是 nil（约定：nil 表示不碰队列），正好不会清掉它们。
 	// 二是**不能漏投**：CONNECT 读盘与这里之间还可能有新的入队（设备刚
 	// 连上、登记完成之前的那个窗口），盘上那份包含它们，内存那份不包含。
-	queued, terr := c.b.opt.Sessions.TakeQueued(c.clientID)
+	queued, terr := c.b.opt.Sessions.TakeQueued(c.clientID())
 	if terr != nil {
 		// 取不出来只能放弃这一批：报错而不是重投（重投会把已经投过的
 		// 也再投一遍）。队列记录留在盘上，下次重连再试。
@@ -472,7 +672,7 @@ func (c *conn) flushQueued() {
 			QoS:          m.QoS,
 			Retain:       m.Retain,
 			ExpiryUnixMs: m.ExpiryUnixMs,
-		}, router.SubRef{ClientID: c.clientID, QoS: m.QoS}, m.SubIDs)
+		}, router.SubRef{ClientID: c.clientID(), QoS: m.QoS}, m.SubIDs)
 	}
 }
 

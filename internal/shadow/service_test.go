@@ -1,7 +1,10 @@
 package shadow
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -503,6 +506,106 @@ func TestForwardsToPartitionOwner(t *testing.T) {
 	}
 	acc := mustParse(t, out.Response)
 	jsonEq(t, "版本取自转发结果", pick(t, acc, "version"), `7`)
+}
+
+func TestGetAndListForwardToPartitionOwner(t *testing.T) {
+	clk := newClock()
+	svc, err := New(Options{
+		Store: NewMemStore(), Partitioner: remotePartitioner{},
+		Limiter: quota.NewLocal(quota.Options{Now: clk.now}), Now: clk.now,
+		Forward: func(context.Context, cluster.NodeID, Command) (*Result, error) {
+			return nil, ErrInternal
+		},
+		ForwardGet: func(_ context.Context, owner cluster.NodeID, thing, name string) (*Document, bool, error) {
+			if owner != "node-2" || thing != "d1" || name != "cfg" {
+				t.Fatalf("get route = %q %q/%q", owner, thing, name)
+			}
+			return &Document{Version: 7, Reported: Object{"n": 1}}, true, nil
+		},
+		ForwardList: func(_ context.Context, owner cluster.NodeID, thing string) ([]string, error) {
+			if owner != "node-2" || thing != "d1" {
+				t.Fatalf("list route = %q %q", owner, thing)
+			}
+			return []string{"cfg", "firmware"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := svc.Get(context.Background(), req("d1", "cfg", OpGet), nil)
+	if out.Err != nil || out.HTTPStatus != 200 {
+		t.Fatalf("remote get = %+v", out)
+	}
+	names, domain := svc.ListNamedShadows(context.Background(), "d1")
+	if domain != nil || !reflect.DeepEqual(names, []string{"cfg", "firmware"}) {
+		t.Fatalf("remote list = %v, %v", names, domain)
+	}
+}
+
+func TestUsePartitionerSwitchesReadsAndWritesAtomically(t *testing.T) {
+	clk := newClock()
+	local := NewMemStore()
+	if _, err := local.Apply(context.Background(), Command{
+		Kind: CmdUpdate, Thing: "d1", NowSec: 1,
+		Patch: Object{"reported": Object{"local": true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(Options{
+		Store: local, Partitioner: cluster.NewLocalPartitioner("node-1", 8),
+		Limiter: quota.NewLocal(quota.Options{Now: clk.now}), Now: clk.now,
+		Forward: func(context.Context, cluster.NodeID, Command) (*Result, error) {
+			return &Result{Current: &Document{Version: 2}, Version: 2}, nil
+		},
+		ForwardGet: func(context.Context, cluster.NodeID, string, string) (*Document, bool, error) {
+			return &Document{Version: 9}, true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := svc.Get(context.Background(), req("d1", "", OpGet), nil); out.Err != nil {
+		t.Fatalf("local get failed: %v", out.Err)
+	}
+	if err := svc.UsePartitioner(remotePartitioner{}); err != nil {
+		t.Fatal(err)
+	}
+	out := svc.Get(context.Background(), req("d1", "", OpGet), nil)
+	if out.Err != nil || !bytes.Contains(out.Response, []byte(`"version":9`)) {
+		t.Fatalf("switched get = %s, %v", out.Response, out.Err)
+	}
+}
+
+func TestUsePartitionerActivationFailureKeepsOldRouting(t *testing.T) {
+	clk := newClock()
+	local := NewMemStore()
+	defer func() { _ = local.Close() }()
+	if _, err := local.Apply(context.Background(), Command{
+		Kind: CmdUpdate, Thing: "d1", NowSec: 1,
+		Patch: Object{"reported": Object{"local": true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(Options{
+		Store: local, Partitioner: cluster.NewLocalPartitioner("node-1", 8),
+		Limiter: quota.NewLocal(quota.Options{Now: clk.now}), Now: clk.now,
+		ForwardGet: func(context.Context, cluster.NodeID, string, string) (*Document, bool, error) {
+			return &Document{Version: 99}, true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activationErr := errors.New("prune failed")
+	if err := svc.UsePartitionerAndActivate(remotePartitioner{}, func() error {
+		return activationErr
+	}); !errors.Is(err, activationErr) {
+		t.Fatalf("activation error = %v", err)
+	}
+	out := svc.Get(context.Background(), req("d1", "", OpGet), nil)
+	if out.Err != nil || bytes.Contains(out.Response, []byte(`"version":99`)) {
+		t.Fatalf("failed activation changed routing: %s, %v", out.Response, out.Err)
+	}
 }
 
 // TestForwardNotifiesHook 验证转发会通知追踪钩子。

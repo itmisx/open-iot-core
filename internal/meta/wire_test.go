@@ -22,6 +22,7 @@ func TestCommandWireRoundTripCoversEveryField(t *testing.T) {
 			Reason: "密钥泄露",
 		},
 		Thing:     &ThingCmd{Name: "lamp-1", PolicySet: 9, Attrs: []string{"sh", "a"}},
+		Things:    []ThingCmd{{Name: "lamp-2", PolicySet: 9, Attrs: []string{"sz"}}},
 		Policy:    &PolicyCmd{ID: 9, Name: "p1", Doc: []byte(`{"Version":"2012-10-17"}`)},
 		AttrSlots: []string{"site", "line"},
 		Records: []RecordOp{

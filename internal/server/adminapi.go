@@ -111,6 +111,7 @@ func (a *adminServer) mount(mux *http.ServeMux) {
 	mux.Handle("DELETE "+p+"/policies/{name}", a.auth(a.handleDeletePolicy))
 	// 设备
 	mux.Handle("GET "+p+"/things", a.auth(a.handleListThings))
+	mux.Handle("POST "+p+"/things:batch", a.auth(a.handlePutThingsBatch))
 	mux.Handle("GET "+p+"/things/{name}", a.auth(a.handleGetThing))
 	mux.Handle("PUT "+p+"/things/{name}", a.auth(a.handlePutThing))
 	mux.Handle("DELETE "+p+"/things/{name}", a.auth(a.handleDeleteThing))
@@ -371,6 +372,32 @@ func (a *adminServer) handlePutThing(w http.ResponseWriter, r *http.Request) {
 	}
 	a.audit(r, "PutThing", r.PathValue("name"))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *adminServer) handlePutThingsBatch(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Things []struct {
+			Name       string            `json:"name"`
+			Attributes map[string]string `json:"attributes"`
+			PolicyName string            `json:"policyName"`
+		} `json:"things"`
+	}
+	if !decodeBody(w, r, &in) {
+		return
+	}
+	things := make([]registry.Thing, len(in.Things))
+	for i := range in.Things {
+		things[i] = registry.Thing{
+			Name: in.Things[i].Name, Attributes: in.Things[i].Attributes,
+			PolicyName: in.Things[i].PolicyName,
+		}
+	}
+	if err := a.s.reg2.PutThings(r.Context(), things); err != nil {
+		writeRegistryError(w, err)
+		return
+	}
+	a.audit(r, "PutThingsBatch", strconv.Itoa(len(things)))
+	writeJSON(w, http.StatusOK, map[string]int{"written": len(things)})
 }
 
 func (a *adminServer) handleDeleteThing(w http.ResponseWriter, r *http.Request) {

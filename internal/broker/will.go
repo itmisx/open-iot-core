@@ -85,7 +85,7 @@ func (c *conn) flushWill() {
 		c.b.publishWill(c, w)
 		return
 	}
-	c.b.scheduleWill(c.clientID, c.epoch, w, delay)
+	c.b.scheduleWill(c.clientID(), c.epoch, w, delay)
 }
 
 // allowedWill 判定遗嘱主题是否被策略放行。

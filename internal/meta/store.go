@@ -56,9 +56,12 @@ type Store interface {
 type LocalStore struct {
 	view *View
 
-	cold     RecordWriter
-	compile  Compiler
-	applyShd func(string, []byte) error
+	cold         RecordWriter
+	compile      Compiler
+	applyShd     func(string, []byte) error
+	applyShdTx   func(string, []byte, Transaction) (func(), error)
+	applyRecords func([]RecordOp) error
+	inTx         func(func(Transaction) error) error
 	// revKey 是 applied index 在冷层里的键。为空表示不持久化它
 	// （单机的内存装配与大量用例都是这种）。见 ApplyCommitted 的说明。
 	revKey []byte
@@ -79,7 +82,38 @@ type LocalStore struct {
 	// group 是一副本 Raft 组。校验通过之后先追加日志再改视图。
 	// 删掉这一步，提交序号就不再等于视图 revision。
 	group *cluster.SingleReplica
+
+	// 单机写入的合批队列（CLU-190）。
+	//
+	// 为什么需要它：Apply 全程持 s.mu，而那把锁里包着一次同步落盘事务，
+	// 于是并发调用之间一条也合不了批——吞吐钉在 1 ÷ 单次服务时间上，加
+	// 并发只会加长队列。实测单机影子写入并发 1 到 100 都是 111 到 119
+	// 条/秒而延迟线性增长，同一份代码在三节点下却随并发上升到好几百：
+	// 差的不是共识，是这一层。探针 TestLocalApplyRate 量到并发 Apply
+	// 160 条/秒对整批 2,628 条/秒，16.4 倍的余量都在这里。
+	//
+	// 只在注入了整批事务（inTx）时启用。内存装配与大量用例没有 inTx，
+	// 那条路径保持原样——它本来也不落盘，没有合批可言。
+	batchMu  sync.Mutex
+	pending  []*applyRequest
+	batching bool
 }
+
+// applyRequest 是一次等待合批的单机写入。
+type applyRequest struct {
+	cmd  Command
+	rev  Revision
+	err  error
+	done chan struct{}
+}
+
+const (
+	// applyBatchMax 是一次事务里最多合多少条命令。
+	//
+	// 与会话分片那一层取同一个量级（store.sessionProposalBatchMax 是 64）。
+	// 取大了的代价是单次事务的尾延迟，而控制面写入本来就以百毫秒计。
+	applyBatchMax = 32
+)
 
 // RecordWriter 是冷层的写入口。
 //
@@ -88,6 +122,19 @@ type LocalStore struct {
 type RecordWriter interface {
 	Set(key, value []byte, sync bool) error
 	Delete(key []byte, sync bool) error
+}
+
+// Transaction 是元数据整批 apply 所需的最小事务面。
+//
+// 它故意与 store.Tx 结构兼容但不 import store，保持 ARCH-065 的包边界。
+// 集群装配层把底层 KV 的同步写事务适配进来；同步事务的回调只执行一次，
+// 因而允许状态机在回调里同步更新热视图。事务失败会使节点停止服务，热视图
+// 不会继续被使用（已提交日志无法安全地“跳过”后继续运行）。
+type Transaction interface {
+	Get(key []byte) ([]byte, error)
+	Set(key, value []byte) error
+	Delete(key []byte) error
+	Scan(prefix []byte, fn func(key, value []byte) bool) error
 }
 
 // Compiler 把策略文档编成匹配器。返回值对本包不透明。
@@ -111,6 +158,12 @@ type LocalOptions struct {
 	// Cold 是冷层写入口。为 nil 时带冷层记录的命令被拒绝——
 	// 静默丢掉它们会让控制面以为写成功了，而记录只在热视图里。
 	Cold RecordWriter
+	// ApplyRecords 可选地在一个持久化事务里写完命令的全部冷层记录。
+	// 未提供时保留逐条写的测试/兼容路径。
+	ApplyRecords func([]RecordOp) error
+	// InTransaction 在一个同步持久化事务里执行整批已提交命令。
+	// 为 nil 时保留逐条 apply 的兼容路径。
+	InTransaction func(func(Transaction) error) error
 	// Compile 编译策略文档。为 nil 时 CmdSetPolicySet 被拒绝。
 	Compile Compiler
 	// ApplyShadow 把一条影子命令作用到本地影子存储。
@@ -118,6 +171,9 @@ type LocalOptions struct {
 	// 为 nil 时带影子载荷的命令被拒绝：静默跳过会让这个节点的影子比
 	// 别人少一次更新，而没有任何报错（CLU-082）。
 	ApplyShadow func(id string, raw []byte) error
+	// ApplyShadowTx 在上述事务内应用影子命令。返回的回调只能在事务提交
+	// 成功后执行，用来向发起方交付确定性的影子结果。
+	ApplyShadowTx func(id string, raw []byte, tx Transaction) (func(), error)
 	// RevisionKey 是 applied index 写进冷层时用的键，由装配层给。
 	//
 	// 本包不认识冷层的前缀方案（ARCH-065：冷层引擎与它的键空间都关在
@@ -142,17 +198,20 @@ func NewLocalStore(opt LocalOptions) *LocalStore {
 		opt.ChangeBuffer = 256
 	}
 	s := &LocalStore{
-		view:      NewView(),
-		applied:   make(map[string]Revision),
-		window:    opt.DedupWindow,
-		changes:   make(chan Change, opt.ChangeBuffer),
-		nowUnixMs: opt.Now,
-		group:     cluster.NewSingleReplica(),
-		cold:      opt.Cold,
-		compile:   opt.Compile,
-		applyShd:  opt.ApplyShadow,
-		revKey:    opt.RevisionKey,
-		rev:       opt.InitialRevision,
+		view:         NewView(),
+		applied:      make(map[string]Revision),
+		window:       opt.DedupWindow,
+		changes:      make(chan Change, opt.ChangeBuffer),
+		nowUnixMs:    opt.Now,
+		group:        cluster.NewSingleReplica(),
+		cold:         opt.Cold,
+		applyRecords: opt.ApplyRecords,
+		inTx:         opt.InTransaction,
+		compile:      opt.Compile,
+		applyShd:     opt.ApplyShadow,
+		applyShdTx:   opt.ApplyShadowTx,
+		revKey:       opt.RevisionKey,
+		rev:          opt.InitialRevision,
 	}
 	// 视图的 revision 要跟着一起起步：就绪度按它判断本节点是否追平，
 	// 而一个刚从冷层恢复完、revision 却报 0 的节点看起来像永远陈旧。
@@ -200,10 +259,199 @@ func (s *LocalStore) MarkConfirmed(nowUnixMs int64) {
 	s.view.confirmedAtUnixMs.Store(nowUnixMs)
 }
 
-func (s *LocalStore) Apply(_ context.Context, cmd Command) (Revision, error) {
+// Apply 应用一条单机写入。
+//
+// 注入了整批事务时，并发调用会先进合批队列，由一个协程把它们装进**同一个**
+// 落盘事务（CLU-190）。每个调用方仍然拿到属于自己那条命令的 revision 与
+// 错误——合批只改变落盘的次数，不改变任何一条命令的语义：幂等窗口、乐观
+// 并发（RequestedRevision）与「日志已提交不能靠返回错误撤销」都照旧。
+func (s *LocalStore) Apply(ctx context.Context, cmd Command) (Revision, error) {
 	if err := cmd.Validate(); err != nil {
 		return 0, err
 	}
+	// 只有真的要落盘的命令才值得合批，而且**只有它们可以合批**。
+	//
+	// 不带冷层记录也不带影子的命令只重建热视图，旧路径对它们一个事务都
+	// 不开——而那不是巧合，是正确性要求：启动期的 Registry.Restore 在一个
+	// **打开的 bbolt 读游标**里逐条调 Apply（scanColdLocked），而 bbolt 的
+	// 写事务一旦需要扩文件就要拿 mmaplock，那把锁要求没有打开的读事务。
+	// 无条件开写事务会在这里死锁——实测节点起不来，worker 卡在 bbolt 的
+	// mmap 上（CLU-190）。
+	//
+	// 同理，这条路径也**不持久化 revision**：单机的 revision 来自
+	// SingleReplica 的内存计数器，启动时由重放冷层重建，旧路径从不写它。
+	if s.inTx == nil || !cmd.needsPersist() {
+		return s.applyOne(ctx, cmd)
+	}
+	req := &applyRequest{cmd: cmd, done: make(chan struct{})}
+	s.batchMu.Lock()
+	s.pending = append(s.pending, req)
+	if !s.batching {
+		s.batching = true
+		go s.runApplyBatches()
+	}
+	s.batchMu.Unlock()
+	<-req.done
+	return req.rev, req.err
+}
+
+// runApplyBatches 把排队的写入按批交给同一个事务。
+//
+// **不设合批窗口**：第一批拿到什么就立刻提交，事务期间到达的请求自然累积
+// 成下一批（组提交）。这一点是必须的——启动期的 Registry.Restore 逐条串行
+// 调 Apply，固定窗口会给每条记录都加一次等待，上万条记录直接把就绪预算吃
+// 光（实测节点 10 秒内起不来）。而串行调用本来就没有可合的批，等待换不来
+// 任何东西。
+//
+// 队列空了就退出，下一次 Apply 再起一个——常驻一个空转协程对单机装配
+// 没有意义，而本项目的后台协程都要由 shutdown 自身叫停（NFR-065b）。
+func (s *LocalStore) runApplyBatches() {
+	for {
+		s.batchMu.Lock()
+		if len(s.pending) == 0 {
+			s.batching = false
+			s.batchMu.Unlock()
+			return
+		}
+		n := min(len(s.pending), applyBatchMax)
+		batch := make([]*applyRequest, n)
+		copy(batch, s.pending[:n])
+		clear(s.pending[:n])
+		s.pending = s.pending[n:]
+		if len(s.pending) == 0 {
+			s.pending = nil
+		}
+		s.batchMu.Unlock()
+		s.applyBatch(batch)
+	}
+}
+
+// applyBatch 把一批写入装进一个事务。
+//
+// 失败时**逐条退回原路径**，而不是让整批一起失败：这些调用方互不相关，
+// 一条坏命令不该把同批的其他写入一起拖掉。集群那一侧可以整批失败，因为
+// 那条日志已经被多数派提交、节点停下来是正确反应（CLU-066）；这里不是。
+func (s *LocalStore) applyBatch(batch []*applyRequest) {
+	s.mu.Lock()
+	if s.closed || s.readOnly {
+		err := ErrStoreClosed
+		if !s.closed {
+			err = ErrReadOnly
+		}
+		s.mu.Unlock()
+		for _, req := range batch {
+			req.err = err
+			close(req.done)
+		}
+		return
+	}
+
+	// 先逐条定下处置：幂等命中与乐观并发冲突都不进事务，也不占日志序号。
+	// 这两条判定必须按批内顺序做，因为 RequestedRevision 比的是**此刻**的
+	// revision，而它随批内前一条命令推进。
+	type slot struct {
+		req *applyRequest
+		run bool
+	}
+	slots := make([]slot, 0, len(batch))
+	cur := s.rev
+	for _, req := range batch {
+		if req.cmd.ID != "" {
+			if rev, ok := s.applied[req.cmd.ID]; ok {
+				req.rev = rev
+				slots = append(slots, slot{req: req})
+				continue
+			}
+		}
+		if req.cmd.RequestedRevision != 0 && req.cmd.RequestedRevision != cur {
+			req.err = ErrRevisionConflict
+			slots = append(slots, slot{req: req})
+			continue
+		}
+		req.rev = Revision(s.group.Append())
+		cur = req.rev
+		slots = append(slots, slot{req: req, run: true})
+	}
+
+	posts := make([]func(), 0, len(slots))
+	changes := make([]Change, 0, len(slots))
+	last := s.rev
+	txErr := s.inTx(func(tx Transaction) error {
+		for i := range slots {
+			if !slots[i].run {
+				continue
+			}
+			ch, post, err := s.applyTx(slots[i].req.rev, slots[i].req.cmd, tx)
+			if err != nil {
+				return err
+			}
+			changes = append(changes, ch)
+			if post != nil {
+				posts = append(posts, post)
+			}
+			last = slots[i].req.rev
+		}
+		return nil
+	})
+	if txErr != nil {
+		// 整批回滚了：逐条重放。revision 已经分配出去，沿用它——序号的
+		// 判据是严格递增而不是连续，占掉一个不是问题（LANG-014 修订）。
+		s.mu.Unlock()
+		for i := range slots {
+			if !slots[i].run {
+				close(slots[i].req.done)
+				continue
+			}
+			s.applyFallback(slots[i].req)
+			close(slots[i].req.done)
+		}
+		return
+	}
+
+	s.rev = last
+	s.view.rev.Store(uint64(last))
+	if s.nowUnixMs != nil {
+		s.view.confirmedAtUnixMs.Store(s.nowUnixMs())
+	}
+	for i := range slots {
+		if slots[i].run {
+			s.remember(slots[i].req.cmd.ID, slots[i].req.rev)
+		}
+	}
+	for i := range changes {
+		s.publish(changes[i])
+	}
+	s.mu.Unlock()
+	for _, post := range posts {
+		post()
+	}
+	for i := range slots {
+		close(slots[i].req.done)
+	}
+}
+
+// applyFallback 在整批回滚之后单独应用一条命令，沿用已分配的 revision。
+func (s *LocalStore) applyFallback(req *applyRequest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		req.err = ErrStoreClosed
+		return
+	}
+	if req.rev > s.rev {
+		s.rev = req.rev
+	}
+	ch, err := s.apply(req.rev, req.cmd)
+	s.view.rev.Store(uint64(s.rev))
+	if s.nowUnixMs != nil {
+		s.view.confirmedAtUnixMs.Store(s.nowUnixMs())
+	}
+	s.remember(req.cmd.ID, req.rev)
+	s.publish(ch)
+	req.err = err
+}
+
+func (s *LocalStore) applyOne(_ context.Context, cmd Command) (Revision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -262,12 +510,101 @@ var errCommittedGap = errors.New("meta: 已提交日志的序号没有递增")
 // 这与原先那条检查防的是同一件事（CLU-066：解不开的条目不能跳过），
 // 只是责任从「调用方自己数序号」挪到了「库保证顺序 + 失败即停」。
 func (s *LocalStore) ApplyCommitted(cmd Command, rev Revision) error {
-	if err := cmd.Validate(); err != nil {
+	return s.ApplyCommittedBatch([]CommittedEntry{{Revision: rev, Command: cmd}})
+}
+
+// CommittedEntry 是一条已经由共识组按序提交的元数据命令。
+type CommittedEntry struct {
+	Revision Revision
+	Command  Command
+}
+
+// ApplyCommittedBatch 在一个同步事务里应用一批已提交日志（CLU-154）。
+//
+// 冷记录、影子文档和最后一条 applied index 一起提交，因此 Dragonboat
+// 一次 Update 只产生一次 fsync。热视图必须在事务回调里同步推进，才能让
+// 批内后一条看到前一条；若事务失败，共识状态机把错误视为致命并停掉节点，
+// 不会让这份可能已局部更新的热视图继续对外服务。
+func (s *LocalStore) ApplyCommittedBatch(entries []CommittedEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	for i := range entries {
+		if entries[i].Revision == 0 {
+			return errCommittedGap
+		}
+		if err := entries[i].Command.Validate(); err != nil {
+			return err
+		}
+	}
+	// 没有事务适配器的内存/兼容装配仍逐条走原有持久化语义。
+	if s.inTx == nil {
+		for i := range entries {
+			if err := s.applyCommittedOne(entries[i].Command, entries[i].Revision); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	type appliedEntry struct {
+		cmd Command
+		rev Revision
+		ch  Change
+	}
+	applied := make([]appliedEntry, 0, len(entries))
+	posts := make([]func(), 0, len(entries))
+	last := s.rev
+	err := s.inTx(func(tx Transaction) error {
+		for i := range entries {
+			e := entries[i]
+			if e.Revision <= last {
+				continue
+			}
+			ch, post, err := s.applyTx(e.Revision, e.Command, tx)
+			if err != nil {
+				return err
+			}
+			applied = append(applied, appliedEntry{cmd: e.Command, rev: e.Revision, ch: ch})
+			if post != nil {
+				posts = append(posts, post)
+			}
+			last = e.Revision
+		}
+		if last == s.rev {
+			return nil
+		}
+		return s.persistRevisionTx(tx, last)
+	})
+	if err != nil {
 		return err
 	}
-	if rev == 0 {
-		return errCommittedGap
+	if len(applied) == 0 {
+		return nil
 	}
+	s.rev = last
+	s.view.rev.Store(uint64(last))
+	if s.nowUnixMs != nil {
+		s.view.confirmedAtUnixMs.Store(s.nowUnixMs())
+	}
+	for i := range applied {
+		s.remember(applied[i].cmd.ID, applied[i].rev)
+		s.publish(applied[i].ch)
+	}
+	for _, post := range posts {
+		post()
+	}
+	return nil
+}
+
+// applyCommittedOne 是未注入整批事务时的兼容路径。
+func (s *LocalStore) applyCommittedOne(cmd Command, rev Revision) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -276,20 +613,9 @@ func (s *LocalStore) ApplyCommitted(cmd Command, rev Revision) error {
 	if rev <= s.rev {
 		return nil
 	}
-	// 这里只能是「比当前新」。相等与更旧的情况上面已经返回了。
 	s.rev = rev
 	ch, err := s.apply(rev, cmd)
 	if err == nil {
-		// applied index 落盘，**在记录之后**。
-		//
-		// 顺序是判据，不是风格（P1）：先记录后 revision 时，崩在中间
-		// 留下的是「revision 偏旧」——那一条会被重放一遍，而冷层写入
-		// 是覆盖语义，重放一遍的结果与应用一遍相同。反过来写留下的是
-		// 「revision 偏新、记录没落盘」，那一条**永远不会被重放**，
-		// 表现是重启之后控制面少一条记录，不报错。
-		//
-		// 每条命令都写，哪怕它没有冷层记录：不写的话 applied index 会
-		// 落在后面，日志就压不掉——而压不掉的后果要到快照那一步才显形。
 		if werr := s.persistRevision(rev); werr != nil {
 			return werr
 		}
@@ -316,6 +642,18 @@ func (s *LocalStore) persistRevision(rev Revision) error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(rev))
 	if err := s.cold.Set(s.revKey, buf[:], true); err != nil {
+		return fmt.Errorf("meta: applied index 落盘失败: %w", err)
+	}
+	return nil
+}
+
+func (s *LocalStore) persistRevisionTx(tx Transaction, rev Revision) error {
+	if len(s.revKey) == 0 || s.cold == nil {
+		return nil
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(rev))
+	if err := tx.Set(s.revKey, buf[:]); err != nil {
 		return fmt.Errorf("meta: applied index 落盘失败: %w", err)
 	}
 	return nil
@@ -350,6 +688,20 @@ var (
 // 冷层已经写着「已吊销」而热视图还在放行。先改热视图，最坏只是冷层落后，
 // 而安全判定已经生效。
 func (s *LocalStore) apply(rev Revision, cmd Command) (Change, error) {
+	ch, post, err := s.applyWithTx(rev, cmd, nil)
+	if post != nil {
+		post()
+	}
+	return ch, err
+}
+
+func (s *LocalStore) applyTx(rev Revision, cmd Command, tx Transaction) (Change, func(), error) {
+	return s.applyWithTx(rev, cmd, tx)
+}
+
+// applyWithTx 更新热视图，并把持久化写入可选的批事务。
+// 必须在持有 s.mu 时调用。
+func (s *LocalStore) applyWithTx(rev Revision, cmd Command, tx Transaction) (Change, func(), error) {
 	ch := Change{Revision: rev, Kind: cmd.Kind}
 	switch cmd.Kind {
 	case CmdNop:
@@ -373,19 +725,24 @@ func (s *LocalStore) apply(rev Revision, cmd Command) (Change, error) {
 		ch.PolicySet = cmd.Thing.PolicySet
 		s.view.putThing(cmd.Thing)
 
+	case CmdSetThings:
+		for i := range cmd.Things {
+			s.view.putThing(&cmd.Things[i])
+		}
+
 	case CmdDeleteThing:
 		ch.Thing = cmd.Thing.Name
 		s.view.deleteThing(cmd.Thing.Name)
 
 	case CmdSetPolicySet:
 		if s.compile == nil {
-			return ch, errNoCompiler
+			return ch, nil, errNoCompiler
 		}
 		compiled, err := s.compile(cmd.Policy.Name, cmd.Policy.Doc)
 		if err != nil {
 			// 到这一步才编译不过，说明这条命令在别的节点上编译得过
 			// （控制面写入前已经校验过一次）——那是真分叉，不是输入错误。
-			return ch, fmt.Errorf("meta: 策略 %s 在本节点编译失败: %w", cmd.Policy.Name, err)
+			return ch, nil, fmt.Errorf("meta: 策略 %s 在本节点编译失败: %w", cmd.Policy.Name, err)
 		}
 		ch.PolicySet = cmd.Policy.ID
 		s.view.putPolicySet(rev, cmd.Policy, compiled)
@@ -398,18 +755,50 @@ func (s *LocalStore) apply(rev Revision, cmd Command) (Change, error) {
 		s.view.setAttrSlots(cmd.AttrSlots)
 	}
 
+	var post func()
 	if len(cmd.Shadow) > 0 {
-		if s.applyShd == nil {
-			return ch, errNoShadow
-		}
-		if err := s.applyShd(cmd.ID, cmd.Shadow); err != nil {
-			return ch, fmt.Errorf("meta: 应用影子命令失败: %w", err)
+		if tx != nil {
+			if s.applyShdTx == nil {
+				return ch, nil, errNoShadow
+			}
+			var err error
+			post, err = s.applyShdTx(cmd.ID, cmd.Shadow, tx)
+			if err != nil {
+				return ch, nil, fmt.Errorf("meta: 事务内应用影子命令失败: %w", err)
+			}
+		} else {
+			if s.applyShd == nil {
+				return ch, nil, errNoShadow
+			}
+			if err := s.applyShd(cmd.ID, cmd.Shadow); err != nil {
+				return ch, nil, fmt.Errorf("meta: 应用影子命令失败: %w", err)
+			}
 		}
 	}
 
 	if len(cmd.Records) > 0 {
 		if s.cold == nil {
-			return ch, errNoColdWriter
+			return ch, nil, errNoColdWriter
+		}
+		if tx != nil {
+			for _, op := range cmd.Records {
+				var err error
+				if op.Delete {
+					err = tx.Delete(op.Key)
+				} else {
+					err = tx.Set(op.Key, op.Value)
+				}
+				if err != nil {
+					return ch, nil, fmt.Errorf("meta: 事务内冷层写入失败: %w", err)
+				}
+			}
+			return ch, post, nil
+		}
+		if s.applyRecords != nil {
+			if err := s.applyRecords(cmd.Records); err != nil {
+				return ch, nil, fmt.Errorf("meta: 冷层批量写入失败: %w", err)
+			}
+			return ch, post, nil
 		}
 		for _, op := range cmd.Records {
 			// 控制面的写入用 sync：它们是人工操作的结果，
@@ -421,11 +810,11 @@ func (s *LocalStore) apply(rev Revision, cmd Command) (Change, error) {
 				err = s.cold.Set(op.Key, op.Value, true)
 			}
 			if err != nil {
-				return ch, fmt.Errorf("meta: 冷层写入失败: %w", err)
+				return ch, nil, fmt.Errorf("meta: 冷层写入失败: %w", err)
 			}
 		}
 	}
-	return ch, nil
+	return ch, post, nil
 }
 
 // remember 把命令 ID 记入幂等窗口，并按 FIFO 淘汰。

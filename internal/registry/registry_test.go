@@ -66,6 +66,42 @@ func (g *rig) reopen() *rig {
 
 const simplePolicy = `{"Statement":[{"Effect":"Allow","Action":"iot:*","Resource":"*"}]}`
 
+func TestPutThingsIsOneAtomicRevision(t *testing.T) {
+	g := newRig(t)
+	ctx := context.Background()
+	if err := g.r.PutPolicy(ctx, "p1", []byte(simplePolicy)); err != nil {
+		t.Fatal(err)
+	}
+	before := g.meta.View().Revision()
+	if err := g.r.PutThings(ctx, []Thing{
+		{Name: "batch-a", PolicyName: "p1", Attributes: map[string]string{"site": "sh"}},
+		{Name: "batch-b", PolicyName: "p1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := g.meta.View().Revision(); got != before+1 {
+		t.Fatalf("批量写推进了 %d 条日志，期望 1", got-before)
+	}
+	for _, name := range []string{"batch-a", "batch-b"} {
+		got, err := g.r.GetThing(name)
+		if err != nil || got.Version != 1 || got.PolicyName != "p1" {
+			t.Fatalf("设备 %s = %+v, %v", name, got, err)
+		}
+	}
+
+	before = g.meta.View().Revision()
+	err := g.r.PutThings(ctx, []Thing{{Name: "would-write"}, {Name: "bad/name"}})
+	if err == nil {
+		t.Fatal("非法批次应失败")
+	}
+	if g.meta.View().Revision() != before {
+		t.Fatal("非法批次不应提交日志")
+	}
+	if _, err := g.r.GetThing("would-write"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("非法批次发生部分写入: %v", err)
+	}
+}
+
 // fp 构造一个合法且非全零的指纹，且必含字母，使大小写相关的用例有意义。
 //
 // 全零指纹会被 meta 正确拒绝（它是零值，用于区分"查不到"与"未激活"），

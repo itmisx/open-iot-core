@@ -118,15 +118,7 @@ func (tr *tlsRig) dialTLS(t *testing.T, certs []tls.Certificate, alpn []string,
 	serverName string,
 ) (*testClient, error) {
 	t.Helper()
-	pool := x509.NewCertPool()
-	pool.AddCert(tr.root.Cert)
-	cfg := &tls.Config{
-		Certificates: certs,
-		RootCAs:      pool,
-		ServerName:   serverName,
-		NextProtos:   alpn,
-		MinVersion:   tls.VersionTLS12,
-	}
+	cfg := tr.clientTLSConfig(certs, alpn, serverName)
 	d := &net.Dialer{Timeout: 3 * time.Second}
 	nc, err := tls.DialWithDialer(d, "tcp", tr.addr, cfg)
 	if err != nil {
@@ -134,6 +126,20 @@ func (tr *tlsRig) dialTLS(t *testing.T, certs []tls.Certificate, alpn []string,
 	}
 	t.Cleanup(func() { _ = nc.Close() })
 	return &testClient{t: t, nc: nc, ver: packet.V5}, nil
+}
+
+func (tr *tlsRig) clientTLSConfig(certs []tls.Certificate, alpn []string,
+	serverName string,
+) *tls.Config {
+	pool := x509.NewCertPool()
+	pool.AddCert(tr.root.Cert)
+	return &tls.Config{
+		Certificates: certs,
+		RootCAs:      pool,
+		ServerName:   serverName,
+		NextProtos:   alpn,
+		MinVersion:   tls.VersionTLS12,
+	}
 }
 
 // expectTLSRejected 断言服务端拒绝了这次握手。
@@ -370,6 +376,184 @@ func TestMTLSRevocationDisconnects(t *testing.T) {
 	}
 }
 
+// TestResumedMTLSStillChecksRegistry 钉住 session ticket 只省 TLS 公钥运算，
+// 不缓存 MQTT 认证结论。证书在两波之间被吊销时，恢复握手仍须把原证书
+// 身份带给 broker，并由最新元数据视图拒绝 CONNECT。
+func TestResumedMTLSStillChecksRegistry(t *testing.T) {
+	tr := newTLSRig(t, CertAuthenticator{}, TLSOptions{
+		RequireClientCert: true,
+		NextProtos:        []string{ALPNMQTTCert},
+	})
+	ps := tr.addPolicy(policyFull)
+	issued, err := tr.ca.IssueKeyPair(pki.IssueRequest{CommonName: "dev-resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := meta.CertFingerprint(issued.Fingerprint)
+	tr.addCert(fp, "dev-resume", ps, meta.CertActive)
+	cert, err := tls.X509KeyPair(concatPEM(issued.CertPEM, issued.ChainPEM), issued.KeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := tr.clientTLSConfig([]tls.Certificate{cert}, []string{ALPNMQTTCert}, "broker.local")
+	cfg.MinVersion = tls.VersionTLS13
+	cfg.MaxVersion = tls.VersionTLS13
+	cfg.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+	dial := func() (*tls.Conn, *testClient) {
+		t.Helper()
+		nc, derr := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second},
+			"tcp", tr.addr, cfg)
+		if derr != nil {
+			t.Fatalf("TLS 拨号失败: %v", derr)
+		}
+		return nc, &testClient{t: t, nc: nc, ver: packet.V5}
+	}
+
+	firstTLS, first := dial()
+	if firstTLS.ConnectionState().DidResume {
+		t.Fatal("第一波冷握手不应报告 session 恢复")
+	}
+	if ack := first.connect("dev-resume", true); ack.Code != reason.Success {
+		t.Fatalf("第一波连接被拒: %s", ack.Code)
+	}
+	_ = firstTLS.Close()
+
+	tr.revoke(fp, "dev-resume", ps, "ticket 期间吊销")
+	tr.clk.advance(2 * time.Second)
+	secondTLS, second := dial()
+	defer func() { _ = secondTLS.Close() }()
+	if !secondTLS.ConnectionState().DidResume {
+		t.Fatal("第二波没有恢复 TLS session，测试未覆盖 ticket 路径")
+	}
+	if ack := second.connect("dev-resume", true); ack.Code == reason.Success {
+		t.Fatal("恢复的 TLS session 绕过了最新证书吊销状态")
+	}
+}
+
+func TestSharedTicketKeysResumeAcrossListeners(t *testing.T) {
+	var ticketKey [32]byte
+	for i := range ticketKey {
+		ticketKey[i] = byte(i + 1)
+	}
+	tr := newTLSRig(t, CertAuthenticator{}, TLSOptions{
+		RequireClientCert: true,
+		NextProtos:        []string{ALPNMQTTCert},
+		SessionTicketKeys: [][32]byte{ticketKey},
+	})
+	// 第二个监听器模拟负载均衡后的另一个节点：独立 tls.Config，但使用
+	// 同一票据密钥环、证书信任与 MQTT broker 状态。
+	second, err := tr.b.ListenTLS("127.0.0.1:0", tr.ln.opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	tr.wg.Add(1)
+	go func() {
+		defer tr.wg.Done()
+		_ = second.Serve(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = second.Close()
+	})
+
+	ps := tr.addPolicy(policyFull)
+	cert := tr.issueDevice(t, "dev-cross", "dev-cross", ps)
+	cfg := tr.clientTLSConfig([]tls.Certificate{cert}, []string{ALPNMQTTCert}, "broker.local")
+	cfg.MinVersion = tls.VersionTLS13
+	cfg.MaxVersion = tls.VersionTLS13
+	cfg.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+	dial := func(addr string) (*tls.Conn, *testClient) {
+		t.Helper()
+		nc, derr := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, cfg)
+		if derr != nil {
+			t.Fatalf("TLS 拨号失败: %v", derr)
+		}
+		return nc, &testClient{t: t, nc: nc, ver: packet.V5}
+	}
+
+	firstTLS, first := dial(tr.addr)
+	if ack := first.connect("dev-cross", true); ack.Code != reason.Success {
+		t.Fatalf("第一节点 CONNECT 被拒: %s", ack.Code)
+	}
+	_ = firstTLS.Close()
+	tr.clk.advance(2 * time.Second)
+
+	secondTLS, client := dial(second.Addr().String())
+	defer func() { _ = secondTLS.Close() }()
+	if !secondTLS.ConnectionState().DidResume {
+		t.Fatal("共享 ticket key 后切换监听器仍未恢复 TLS session")
+	}
+	if ack := client.connect("dev-cross", true); ack.Code != reason.Success {
+		t.Fatalf("恢复后 CONNECT 被拒: %s", ack.Code)
+	}
+}
+
+func TestSessionTicketKeyRotationAcceptsOldAndIssuesNew(t *testing.T) {
+	var oldKey, newKey [32]byte
+	for i := range oldKey {
+		oldKey[i] = byte(i + 1)
+		newKey[i] = byte(255 - i)
+	}
+	tr := newTLSRig(t, CertAuthenticator{}, TLSOptions{
+		RequireClientCert: true,
+		NextProtos:        []string{ALPNMQTTCert},
+		SessionTicketKeys: [][32]byte{oldKey},
+	})
+	start := func(keys [][32]byte) *Listener {
+		t.Helper()
+		opt := tr.ln.opt
+		opt.SessionTicketKeys = keys
+		ln, err := tr.b.ListenTLS("127.0.0.1:0", opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		tr.wg.Add(1)
+		go func() {
+			defer tr.wg.Done()
+			_ = ln.Serve(ctx)
+		}()
+		t.Cleanup(func() { cancel(); _ = ln.Close() })
+		return ln
+	}
+	rotating := start([][32]byte{newKey, oldKey})
+	newOnly := start([][32]byte{newKey})
+
+	ps := tr.addPolicy(policyFull)
+	cert := tr.issueDevice(t, "dev-rotate", "dev-rotate", ps)
+	cfg := tr.clientTLSConfig([]tls.Certificate{cert}, []string{ALPNMQTTCert}, "broker.local")
+	cfg.MinVersion = tls.VersionTLS13
+	cfg.MaxVersion = tls.VersionTLS13
+	cfg.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+	dial := func(addr string) (*tls.Conn, *testClient) {
+		t.Helper()
+		nc, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return nc, &testClient{t: t, nc: nc, ver: packet.V5}
+	}
+	connect := func(addr string, wantResume bool) {
+		t.Helper()
+		tlsConn, client := dial(addr)
+		if got := tlsConn.ConnectionState().DidResume; got != wantResume {
+			t.Fatalf("DidResume=%v，期望 %v", got, wantResume)
+		}
+		if ack := client.connect("dev-rotate", true); ack.Code != reason.Success {
+			t.Fatalf("CONNECT 被拒: %s", ack.Code)
+		}
+		_ = tlsConn.Close()
+	}
+
+	connect(tr.addr, false) // old 签发
+	tr.clk.advance(2 * time.Second)
+	connect(rotating.Addr().String(), true) // [new, old] 解开 old，并签发 new
+	tr.clk.advance(2 * time.Second)
+	connect(newOnly.Addr().String(), true) // 只有 new 仍能恢复
+}
+
 // TestMTLSRequiresClientCert 验证未出示证书的客户端在 TLS 层即被拒。
 func TestMTLSRequiresClientCert(t *testing.T) {
 	tr := newTLSRig(t, CertAuthenticator{}, TLSOptions{
@@ -559,6 +743,37 @@ func TestHandshakeTimeout(t *testing.T) {
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
 		t.Error("连接未被服务端关闭，握手超时未生效")
+	}
+}
+
+func TestListenerCloseWaitsForHandedOffTLSConnection(t *testing.T) {
+	tr := newTLSRig(t, CertAuthenticator{}, TLSOptions{
+		RequireClientCert: true,
+		NextProtos:        []string{ALPNMQTTCert},
+	})
+	ps := tr.addPolicy(policyFull)
+	cert := tr.issueDevice(t, "dev-handoff", "dev-handoff", ps)
+	cfg := tr.clientTLSConfig([]tls.Certificate{cert}, []string{ALPNMQTTCert}, "broker.local")
+	nc, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", tr.addr, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- tr.ln.Close() }()
+	select {
+	case err := <-done:
+		t.Fatalf("TLS 长连接仍在时 Listener.Close 提前返回: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	_ = nc.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("交接后的 TLS goroutine 退出后 Listener.Close 仍未返回")
 	}
 }
 

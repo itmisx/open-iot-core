@@ -3,13 +3,34 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
+	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/itmisx/open-iot-core/internal/cluster"
 	"github.com/itmisx/open-iot-core/internal/session"
 )
+
+type gatedSessionProposer struct {
+	entered chan string
+	release chan struct{}
+}
+
+func (*gatedSessionProposer) ShardOf(string) uint64 { return 16 }
+func (*gatedSessionProposer) ShardIDs() []uint64    { return []uint64{16} }
+func (p *gatedSessionProposer) Propose(_ string, data []byte) (uint64, error) {
+	return p.ProposeShard(16, data)
+}
+func (p *gatedSessionProposer) ProposeShard(_ uint64, data []byte) (uint64, error) {
+	p.entered <- string(data)
+	<-p.release
+	return 0, nil
+}
 
 // loopProposer 是一条"立刻应用"的复制日志：提案即应用。
 //
@@ -20,9 +41,36 @@ import (
 // 可以挂多个 SessionStore：同一串命令喂给两个独立的库，用来验证
 // "各节点算出同一个结果"这件事（那是复制日志的硬要求）。
 type loopProposer struct {
+	mu     sync.Mutex
 	stores []*SessionStore
 	count  uint64
 	index  map[uint64]uint64
+}
+
+type remoteReadProposer struct {
+	*loopProposer
+	local        bool
+	raw          []byte
+	found        bool
+	err          error
+	reads        int
+	claimedRaw   []byte
+	claimedFound bool
+	claimedOK    bool
+	claimedEpoch cluster.Epoch
+}
+
+func (p *remoteReadProposer) HasLocalReplica(string) bool { return p.local }
+func (p *remoteReadProposer) ReadSession(string) ([]byte, bool, error) {
+	p.reads++
+	return append([]byte(nil), p.raw...), p.found, p.err
+}
+func (p *remoteReadProposer) TakeClaimedSession(_ string, epoch cluster.Epoch) ([]byte, bool, bool, error) {
+	if !p.claimedOK || epoch != p.claimedEpoch {
+		return nil, false, false, nil
+	}
+	p.claimedOK = false
+	return append([]byte(nil), p.claimedRaw...), p.claimedFound, true, nil
 }
 
 func newLoopProposer(count uint64, stores ...*SessionStore) *loopProposer {
@@ -48,6 +96,10 @@ func (p *loopProposer) Propose(clientID string, data []byte) (uint64, error) {
 }
 
 func (p *loopProposer) ProposeShard(shard uint64, data []byte) (uint64, error) {
+	// Dragonboat 允许并发提交，但同一 shard 的状态机 apply 仍然串行。
+	// 这个内存替身也保持该语义，避免测试把 map 并发写误当成复制层行为。
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.index[shard]++
 	idx := p.index[shard]
 	owns := func(id string) bool { return p.ShardOf(id) == shard }
@@ -113,6 +165,249 @@ func TestReplicatedSessionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReplicatedSessionLoadUsesRemoteOnlyWithoutLocalReplica(t *testing.T) {
+	local := NewSessionStore(NewMemKV())
+	want := replState("remote-device", 7)
+	want.Queued = []session.QueuedMsg{{Topic: "cmd", Payload: []byte("on"), QoS: 1}}
+	raw, err := json.Marshal(sessionReplicaSnapshot{State: want, Queue: want.Queued, QueueUpTo: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prop := &remoteReadProposer{
+		loopProposer: newLoopProposer(1, local), raw: raw, found: true,
+	}
+	r := NewReplicatedSessionStore(local, prop)
+	got, found, err := r.Load(context.Background(), want.ClientID)
+	if err != nil || !found {
+		t.Fatalf("远程 Load = found %v err %v", found, err)
+	}
+	if got.ClientID != want.ClientID || got.Epoch != want.Epoch || len(got.Queued) != 1 ||
+		string(got.Queued[0].Payload) != "on" {
+		t.Fatalf("远程会话 = %+v", got)
+	}
+	if prop.reads != 1 {
+		t.Fatalf("远程读取次数 = %d，期望 1", prop.reads)
+	}
+
+	prop.local = true
+	if got, found, err := r.Load(context.Background(), "missing-local"); err != nil || found || got != nil {
+		t.Fatalf("本地缺失 Load = %+v, %v, %v", got, found, err)
+	}
+	if prop.reads != 1 {
+		t.Fatal("有本地副本时仍发出了远程读取")
+	}
+}
+
+func TestReplicatedSessionLoadClaimedConsumesPiggybackWithoutReadRPC(t *testing.T) {
+	local := NewSessionStore(NewMemKV())
+	want := replState("remote-device", 7)
+	raw, err := json.Marshal(sessionReplicaSnapshot{State: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prop := &remoteReadProposer{
+		loopProposer: newLoopProposer(1, local),
+		claimedRaw:   raw, claimedFound: true, claimedOK: true, claimedEpoch: 99,
+	}
+	r := NewReplicatedSessionStore(local, prop)
+	got, found, err := r.LoadClaimed(context.Background(), want.ClientID, 99)
+	if err != nil || !found || got.ClientID != want.ClientID {
+		t.Fatalf("LoadClaimed = %+v found=%v err=%v", got, found, err)
+	}
+	if prop.reads != 0 {
+		t.Fatalf("命中 Claim 预读后仍发出 %d 次 SessionRead RPC", prop.reads)
+	}
+	// 一次性结果已经消费；下一次必须回到普通远程读取。
+	prop.raw, prop.found = raw, true
+	if _, found, err := r.LoadClaimed(context.Background(), want.ClientID, 99); err != nil || !found {
+		t.Fatalf("预读消费后的回退读取 = found %v err %v", found, err)
+	}
+	if prop.reads != 1 {
+		t.Fatalf("回退远程读取次数 = %d，期望 1", prop.reads)
+	}
+}
+
+func TestReplicatedSessionTakeQueuedUsesRemoteWithoutLocalReplica(t *testing.T) {
+	local := NewSessionStore(NewMemKV())
+	queue := []session.QueuedMsg{
+		{Topic: "cmd/1", Payload: []byte("one"), QoS: 1},
+		{Topic: "cmd/2", Payload: []byte("two"), QoS: 1},
+	}
+	raw, err := json.Marshal(sessionReplicaSnapshot{Queue: queue, QueueUpTo: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prop := &remoteReadProposer{
+		loopProposer: newLoopProposer(1, local), raw: raw, found: true,
+	}
+	r := NewReplicatedSessionStore(local, prop)
+	got, err := r.TakeQueued("remote-device")
+	if err != nil {
+		t.Fatalf("远程 TakeQueued: %v", err)
+	}
+	if len(got) != 2 || string(got[0].Payload) != "one" || string(got[1].Payload) != "two" {
+		t.Fatalf("远程队列 = %+v", got)
+	}
+	if prop.reads != 1 {
+		t.Fatalf("远程读取次数 = %d，期望 1", prop.reads)
+	}
+}
+
+func TestMergeSessionProposalsFlattensAccessBatches(t *testing.T) {
+	makeSave := func(id string, epoch cluster.Epoch) []byte {
+		raw, err := encodeSessionCmd(&sessionCmd{
+			Op: sessionOpSave, ClientID: id, State: replState(id, epoch),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	a, b, c := makeSave("a", 1), makeSave("b", 2), makeSave("c", 3)
+	left, err := encodeSessionCmd(&sessionCmd{
+		Op: sessionOpBatch, Batch: []json.RawMessage{a, b},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, widths, consumed, err := MergeSessionProposals([][]byte{left, c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed != 2 || !slices.Equal(widths, []uint8{2, 1}) {
+		t.Fatalf("consumed=%d widths=%v", consumed, widths)
+	}
+	cmd, err := decodeSessionCmd(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Op != sessionOpBatch || len(cmd.Batch) != 3 {
+		t.Fatalf("合并命令 op=%d 子命令=%d", cmd.Op, len(cmd.Batch))
+	}
+}
+
+func TestMergeSessionProposalsKeepsSameClientInLogOrder(t *testing.T) {
+	makeSave := func(epoch cluster.Epoch) []byte {
+		raw, err := encodeSessionCmd(&sessionCmd{
+			Op: sessionOpSave, ClientID: "same", State: replState("same", epoch),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	old, fresh := makeSave(4), makeSave(5)
+	merged, widths, consumed, err := MergeSessionProposals([][]byte{old, fresh})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed != 2 || !slices.Equal(widths, []uint8{1, 1}) {
+		t.Fatalf("same-client merge consumed=%d widths=%v", consumed, widths)
+	}
+	cmd, err := decodeSessionCmd(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Op != sessionOpBatch || len(cmd.Batch) != 2 {
+		t.Fatalf("same-client merged op=%d parts=%d", cmd.Op, len(cmd.Batch))
+	}
+	first, err := decodeSessionCmd(cmd.Batch[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := decodeSessionCmd(cmd.Batch[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State.Epoch != 4 || second.State.Epoch != 5 {
+		t.Fatalf("same-client order=%d,%d, want 4,5", first.State.Epoch, second.State.Epoch)
+	}
+}
+
+func TestSessionBatchFastEncoderMatchesWireFormatAndRejectsInvalidJSON(t *testing.T) {
+	parts := []json.RawMessage{
+		json.RawMessage(`{"v":1,"op":1,"c":"a"}`),
+		json.RawMessage(`{"v":1,"op":2,"c":"b","e":7}`),
+	}
+	want, err := encodeSessionCmd(&sessionCmd{Op: sessionOpBatch, Batch: parts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := encodeSessionRawBatch(parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("fast batch wire differs:\n got %s\nwant %s", got, want)
+	}
+	decoded, err := decodeSessionCmd(got)
+	if err != nil || len(decoded.Batch) != 2 {
+		t.Fatalf("decode fast batch = %#v, %v", decoded, err)
+	}
+	if _, err := encodeSessionRawBatch([]json.RawMessage{json.RawMessage(`{"v":`)}); err == nil {
+		t.Fatal("invalid raw command accepted")
+	}
+	if _, err := encodeSessionRequestBatch([]*sessionProposalRequest{{data: []byte(`{`)}}); err == nil {
+		t.Fatal("invalid proposal command accepted")
+	}
+}
+
+func TestSessionMergeZeroCopySplitterHandlesEscapesAndNestedState(t *testing.T) {
+	makeCmd := func(id, thing string) []byte {
+		raw, err := encodeSessionCmd(&sessionCmd{
+			Op: sessionOpSave, ClientID: id,
+			State: &session.State{ClientID: id, Thing: thing, Epoch: 1,
+				Subscriptions: []session.Subscription{{Filter: `a/"],[{}/b`, QoS: 1}}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	a := makeCmd(`dev"\a`, `thing"],[{\x`)
+	b := makeCmd("normal", "normal")
+	batch, err := encodeSessionRawBatch([]json.RawMessage{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := decodeSessionMergeView(batch, true, make([]json.RawMessage, 0, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.op != sessionOpBatch || len(view.batch) != 2 ||
+		!bytes.Equal(view.batch[0], a) || !bytes.Equal(view.batch[1], b) {
+		t.Fatalf("split batch = op %d parts %d", view.op, len(view.batch))
+	}
+	merged, widths, consumed, err := MergeSessionProposals([][]byte{batch})
+	if err != nil || consumed != 1 || !slices.Equal(widths, []uint8{2}) || !bytes.Equal(merged, batch) {
+		t.Fatalf("escaped merge consumed=%d widths=%v err=%v", consumed, widths, err)
+	}
+}
+
+func TestMergeSessionProposalsKeepsExpireSeparate(t *testing.T) {
+	expire, err := encodeSessionCmd(&sessionCmd{Op: sessionOpExpire, NowMs: 123})
+	if err != nil {
+		t.Fatal(err)
+	}
+	save, err := encodeSessionCmd(&sessionCmd{
+		Op: sessionOpSave, ClientID: "a", State: replState("a", 1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, widths, consumed, err := MergeSessionProposals([][]byte{expire, save})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := decodeSessionCmd(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed != 1 || !slices.Equal(widths, []uint8{1}) || cmd.Op != sessionOpExpire {
+		t.Fatalf("expire 被错误合并：consumed=%d widths=%v op=%d", consumed, widths, cmd.Op)
+	}
+}
+
 // TestReplicatedSaveFencesStaleEpoch 钉住契约 01：围栏在 apply 时判。
 func TestReplicatedSaveFencesStaleEpoch(t *testing.T) {
 	r, _ := newReplSession(t, 0)
@@ -144,6 +439,241 @@ func TestReplicatedDeleteFencesOnExactEpoch(t *testing.T) {
 	}
 	if _, ok, _ := r.Load(ctx, "dev-1"); ok {
 		t.Fatal("删除之后仍读到会话")
+	}
+}
+
+func TestReplicatedProposalBatchKeepsPerRequestResults(t *testing.T) {
+	r, _ := newReplSession(t, 0)
+	ctx := context.Background()
+	if err := r.Save(ctx, replState("dev-stale", 2)); err != nil {
+		t.Fatal(err)
+	}
+	encode := func(cmd *sessionCmd) []byte {
+		data, err := encodeSessionCmd(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	batch := []*sessionProposalRequest{
+		{clientID: "dev-stale", data: encode(&sessionCmd{
+			Op: sessionOpSave, ClientID: "dev-stale", State: replState("dev-stale", 1),
+		})},
+		{clientID: "dev-fresh", data: encode(&sessionCmd{
+			Op: sessionOpSave, ClientID: "dev-fresh", State: replState("dev-fresh", 1),
+		})},
+	}
+	shard := r.prop.ShardOf("dev-stale")
+	// 手工选一个同分片 id：合并器只会把同分片命令装一起。
+	for i := 0; r.prop.ShardOf(batch[1].clientID) != shard; i++ {
+		batch[1].clientID = fmt.Sprintf("dev-fresh-%d", i)
+		batch[1].data = encode(&sessionCmd{
+			Op: sessionOpSave, ClientID: batch[1].clientID,
+			State: replState(batch[1].clientID, 1),
+		})
+	}
+	res, err := r.proposeBatch(shard, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != 1 {
+		t.Fatalf("批提案结果位图 = %b，期望只有第 0 条 stale", res)
+	}
+	if _, ok, err := r.Load(ctx, batch[1].clientID); err != nil || !ok {
+		t.Fatalf("非 stale 子命令未落盘: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestReplicatedProposalBatchOrdersSameClientAndKeepsResults(t *testing.T) {
+	r, _ := newReplSession(t, 0)
+	ctx := context.Background()
+	if err := r.Save(ctx, replState("dev-same", 5)); err != nil {
+		t.Fatal(err)
+	}
+	encode := func(epoch cluster.Epoch) []byte {
+		data, err := encodeSessionCmd(&sessionCmd{
+			Op: sessionOpSave, ClientID: "dev-same", State: replState("dev-same", epoch),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	batch := []*sessionProposalRequest{
+		{clientID: "dev-same", data: encode(4)}, // stale，不能挡住后面的新连接
+		{clientID: "dev-same", data: encode(6)},
+	}
+	res, err := r.proposeBatch(r.prop.ShardOf("dev-same"), batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != 1 {
+		t.Fatalf("同 clientId 批结果位图=%b，期望第 0 条 stale", res)
+	}
+	st, found, err := r.Load(ctx, "dev-same")
+	if err != nil || !found || st.Epoch != 6 {
+		t.Fatalf("批后会话 found=%v epoch=%v err=%v，期望 epoch 6", found, st, err)
+	}
+	// 旧连接的断开写也可能在线程调度下晚于新 CONNECT 入队；围栏应让
+	// 后到的旧写 stale，而不是因为同批执行就覆盖新 owner。
+	batch = []*sessionProposalRequest{
+		{clientID: "dev-same", data: encode(7)},
+		{clientID: "dev-same", data: encode(6)},
+	}
+	res, err = r.proposeBatch(r.prop.ShardOf("dev-same"), batch)
+	if err != nil || res != 2 {
+		t.Fatalf("新后旧的结果位图=%b err=%v，期望第 1 条 stale", res, err)
+	}
+	st, found, err = r.Load(ctx, "dev-same")
+	if err != nil || !found || st.Epoch != 7 {
+		t.Fatalf("新后旧批后会话 found=%v epoch=%v err=%v，期望 epoch 7", found, st, err)
+	}
+}
+
+func TestReplicatedProposalBatchCoalescesConcurrentWrites(t *testing.T) {
+	r, _ := newReplSession(t, 0)
+	p := r.prop.(*loopProposer)
+	shard := p.ShardOf("seed")
+	// 故意超过单批 64 条，强制走「选一批、余下留队列」的
+	// 分支。这条曾因就地复用 pending 底层数组而丢请求。
+	ids := make([]string, 0, 256)
+	for i := 0; len(ids) < cap(ids); i++ {
+		id := fmt.Sprintf("batch-%d", i)
+		if p.ShardOf(id) == shard {
+			ids = append(ids, id)
+		}
+	}
+	start := make(chan struct{})
+	errCh := make(chan error, len(ids))
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			errCh <- r.Save(context.Background(), replState(id, 1))
+		}(id)
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if proposals := p.index[shard]; proposals >= uint64(len(ids)) {
+		t.Fatalf("%d 条并发写入仍发出 %d 次提案，未合并", len(ids), proposals)
+	}
+	for _, id := range ids {
+		if _, ok, err := r.Load(context.Background(), id); err != nil || !ok {
+			t.Fatalf("会话 %s 未落盘: ok=%v err=%v", id, ok, err)
+		}
+	}
+}
+
+func TestReplicatedProposalPipelineIsBounded(t *testing.T) {
+	const logical = sessionProposalBatchMax * (sessionProposalConcurrentMax + 1)
+	prop := &gatedSessionProposer{
+		// release 关闭后剩余批次会快速进入，channel 要能容纳它们；
+		// 测试只在 release 前断言在途上限。
+		entered: make(chan string, logical),
+		release: make(chan struct{}),
+	}
+	r := NewReplicatedSessionStore(NewSessionStore(NewMemKV()), prop)
+	start := make(chan struct{})
+	errCh := make(chan error, logical)
+	var wg sync.WaitGroup
+	for i := 0; i < logical; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errCh <- r.propose(fmt.Sprintf("pipeline-%04d", i),
+				[]byte(`{"v":1,"op":1,"c":"pipeline"}`))
+		}(i)
+	}
+	close(start)
+	for i := 0; i < sessionProposalConcurrentMax; i++ {
+		select {
+		case raw := <-prop.entered:
+			cmd, err := decodeSessionCmd([]byte(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cmd.Op == sessionOpBatch && len(cmd.Batch) > sessionAccessProposalBatchMax {
+				t.Fatalf("Access 批=%d，超过上限 %d", len(cmd.Batch),
+					sessionAccessProposalBatchMax)
+			}
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("只有 %d 个提案进入 pipeline，期望 %d", i, sessionProposalConcurrentMax)
+		}
+	}
+	st := r.ProposalQueueStats()
+	if st.InFlightBatches != sessionProposalConcurrentMax {
+		t.Fatalf("in-flight batches=%d，期望 %d", st.InFlightBatches,
+			sessionProposalConcurrentMax)
+	}
+	if st.PeakInFlightBatches != sessionProposalConcurrentMax {
+		t.Fatalf("peak in-flight batches=%d，期望 %d", st.PeakInFlightBatches,
+			sessionProposalConcurrentMax)
+	}
+	if st.InFlight == 0 || st.InFlight > sessionAccessProposalBatchMax*sessionProposalConcurrentMax {
+		t.Fatalf("in-flight logical=%d，超出有界范围", st.InFlight)
+	}
+	if st.CachedBatches > sessionProposalConcurrentMax {
+		t.Fatalf("cached batches=%d，超过硬上限", st.CachedBatches)
+	}
+	select {
+	case <-prop.entered:
+		t.Fatalf("单 shard 超过 %d 个物理提案在途", sessionProposalConcurrentMax)
+	case <-time.After(5 * time.Millisecond):
+	}
+	close(prop.release)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestReplicatedProposalPipelineSerializesSameClient(t *testing.T) {
+	prop := &gatedSessionProposer{
+		entered: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	r := NewReplicatedSessionStore(NewSessionStore(NewMemKV()), prop)
+	done := make(chan error, 2)
+	go func() { done <- r.propose("same-client", []byte("first")) }()
+	select {
+	case got := <-prop.entered:
+		if got != "first" {
+			t.Fatalf("首个提案=%q", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("首个提案没有进入 pipeline")
+	}
+	go func() { done <- r.propose("same-client", []byte("second")) }()
+	select {
+	case got := <-prop.entered:
+		t.Fatalf("前一提案未完成时同 clientId 的 %q 已进入 pipeline", got)
+	case <-time.After(5 * time.Millisecond):
+	}
+	close(prop.release)
+	select {
+	case got := <-prop.entered:
+		if got != "second" {
+			t.Fatalf("第二个提案=%q", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("首个提案完成后第二个仍未进入 pipeline")
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -483,5 +1013,34 @@ func TestCorruptSessionCmdIsFatal(t *testing.T) {
 		if _, err := s.ApplySessionCmd(16, 1, raw, owns); err == nil {
 			t.Fatalf("损坏的命令 %q 应当报错", raw)
 		}
+	}
+}
+
+type failSnapshotWriter struct{ remaining int }
+
+func (w *failSnapshotWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, errors.New("snapshot sink failed")
+	}
+	if len(p) > w.remaining {
+		p = p[:w.remaining]
+	}
+	w.remaining -= len(p)
+	if w.remaining == 0 {
+		return len(p), errors.New("snapshot sink failed")
+	}
+	return len(p), nil
+}
+
+func TestSessionShardSnapshotPropagatesWriterFailure(t *testing.T) {
+	s := NewSessionStore(NewMemKV())
+	st := replState("dev-1", 1)
+	if err := s.Save(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	err := s.SnapshotSessionShard(16, func(string) bool { return true },
+		&failSnapshotWriter{remaining: 12})
+	if err == nil {
+		t.Fatal("snapshot writer failure was silently accepted")
 	}
 }

@@ -148,6 +148,21 @@ type ReplicationConfig struct {
 	KeyFile  string `yaml:"key_file"`
 	// CAFile 是签发各节点复制证书的 CA，用于双向校验。
 	CAFile string `yaml:"ca_file"`
+	// RTT 是共识库的 tick 间隔。0 表示默认 100 毫秒（CLU-132）。
+	//
+	// 心跳与选举超时都按它的倍数计，而**本项目把那两个时长固定住**：
+	// 调小 RTT 只让提案的调度粒度变细，不让故障检测变激进（刻度数跟着
+	// 缩放，见 cluster.newDragonGroup）。所以这一项可以放心试小值。
+	//
+	// 为什么要可配：默认的 100 毫秒是跨机房也成立的保守值，而同机房的
+	// 真实 RTT 是百微秒级。它此前是编译期常量——"同机房该不该调小"这个
+	// 问题连实验都做不了。要调就 A/B，判据是
+	// tests/bench/connect-stage-ab.sh 的 session_write 那一段；别凭
+	// "数字更小看起来更快"去改。
+	//
+	// 上限 1 秒：再大的话选举超时要十几秒，一次 leader 故障的恢复窗口
+	// 会长到设备全部重连，而那比慢一点严重得多。
+	RTT Duration `yaml:"rtt"`
 	// PumpInterval 是追平已提交日志的间隔。0 表示默认 200 毫秒。
 	//
 	// 跟随者全靠它：那边没有写入调用，视图却必须跟上 leader。
@@ -172,6 +187,20 @@ type ReplicationConfig struct {
 	// 调大的收益是写入吞吐线性增长，代价是心跳与 fsync 的放大也线性
 	// 增长（dragonboat 按对端合批，但不是零成本）。
 	SessionShards uint64 `yaml:"session_shards"`
+	// SessionReplicationFactor 是每个会话分片的副本数。0 保持兼容行为：
+	// 所有初始投票节点承载全部分片。生产建议在至少 4 个节点时设为 3，
+	// 让会话写入不再随集群节点数等比例放大。
+	//
+	// 当前它与初始 Replicas 一起构成不可变放置输入；启用后，在 Raft
+	// 副本迁移流程完成前禁止在线增删成员。
+	SessionReplicationFactor uint64 `yaml:"session_replication_factor"`
+	// ShadowShards 把新影子写入从 metadata Raft 日志拆到独立日志。
+	// 0 保持旧路径，便于滚动升级；启用时所有节点必须同时配置相同值。
+	// 当前 shard ID 预留区允许 1..14，布局一经落盘不可更改。
+	ShadowShards uint64 `yaml:"shadow_shards"`
+	// ShadowReplicationFactor 是每个影子分片的副本数。0 保持 RF=all；
+	// 启用 shadow_shards 的新集群建议设为 3。
+	ShadowReplicationFactor uint64 `yaml:"shadow_replication_factor"`
 }
 
 // MetaConfig 是元数据后端。
@@ -216,6 +245,9 @@ type TLSListener struct {
 	ALPN []string `yaml:"alpn"`
 	// MinTLSVersion 取 "1.2" 或 "1.3"（PRD NET-010）。
 	MinTLSVersion string `yaml:"min_tls_version"`
+	// PostQuantumKeyExchange 启用 Go 默认的 X25519+ML-KEM 混合密钥交换。
+	// 默认 false 使用 X25519/P-256，降低大规模冷建连的 CPU 与短命分配。
+	PostQuantumKeyExchange bool `yaml:"post_quantum_key_exchange"`
 	// RequireSNI 在缺少 SNI 时拒绝连接（PRD NET-013）。
 	RequireSNI       bool     `yaml:"require_sni"`
 	HandshakeTimeout Duration `yaml:"handshake_timeout"`
@@ -224,6 +256,10 @@ type TLSListener struct {
 	KeyFile  string `yaml:"key_file"`
 	// ClientCAFile 为空时使用内嵌 CA 的信任池。
 	ClientCAFile string `yaml:"client_ca_file"`
+	// SessionTicketKeysFile 可选。文件每行一把 64 位十六进制（32 字节）密钥，
+	// 第一把签发新 ticket，其余用于无中断轮换。集群节点配置同一文件后，
+	// mTLS 重连经负载均衡切换节点仍可恢复；为空则仅原进程可恢复。
+	SessionTicketKeysFile string `yaml:"session_ticket_keys_file"`
 }
 
 // WSSListener 是 MQTT over WebSocket（NET-003、NET-020 至 NET-023）。
@@ -239,18 +275,28 @@ type WSSListener struct {
 	// MaxConnection 是单条连接的时长上限，零值表示 24 小时。
 	MaxConnection Duration `yaml:"max_connection"`
 	// RedirectTo 到期时发给 MQTT 5 客户端的 Server Reference。为空则只关连接。
-	RedirectTo       string   `yaml:"redirect_to"`
-	MinTLSVersion    string   `yaml:"min_tls_version"`
-	RequireSNI       bool     `yaml:"require_sni"`
-	HandshakeTimeout Duration `yaml:"handshake_timeout"`
-	CertFile         string   `yaml:"cert_file"`
-	KeyFile          string   `yaml:"key_file"`
+	RedirectTo             string   `yaml:"redirect_to"`
+	MinTLSVersion          string   `yaml:"min_tls_version"`
+	PostQuantumKeyExchange bool     `yaml:"post_quantum_key_exchange"`
+	RequireSNI             bool     `yaml:"require_sni"`
+	HandshakeTimeout       Duration `yaml:"handshake_timeout"`
+	CertFile               string   `yaml:"cert_file"`
+	KeyFile                string   `yaml:"key_file"`
 }
 
 // PlainListener 是一个明文监听端点。
 type PlainListener struct {
 	Enabled bool   `yaml:"enabled"`
 	Addr    string `yaml:"addr"`
+	// ProxyProtocol 为空时是普通明文 MQTT；取 "v2" 时只接受受信 TLS
+	// 终结器发送的 PROXY protocol v2 header，并从私有 TLV 恢复客户端
+	// 证书身份。两种模式不自动探测，避免无 header 回退造成认证绕过。
+	ProxyProtocol string `yaml:"proxy_protocol"`
+	// TrustedProxies 是原始 TCP peer 的 CIDR allowlist。proxy_protocol=v2
+	// 时必填；header 内声明的 source address 不参与此项判定。
+	TrustedProxies []string `yaml:"trusted_proxies"`
+	// ProxyHeaderTimeout 限制代理发送完整 header 的时长。
+	ProxyHeaderTimeout Duration `yaml:"proxy_header_timeout"`
 }
 
 // AdminListener 是管理端点。
@@ -301,6 +347,9 @@ type AdminListener struct {
 // 生效值由 `openiotd config print` 之外的指标暴露（写出池的 Pending 与
 // 工作协程数进 /metrics）。
 type BrokerConfig struct {
+	// TLSHandshakeConcurrency 是每个 TLS 端点同时执行的握手数。0 按
+	// GOMAXPROCS 自适应。这是重连风暴的 CPU/短命堆保护，不是连接配额。
+	TLSHandshakeConcurrency int `yaml:"tls_handshake_concurrency"`
 	// WriterWorkers 是共享写出池的工作协程数。
 	//
 	// 0 表示按 GOMAXPROCS 自适应。调高它的理由是慢客户端：一次刷写最长
@@ -326,6 +375,9 @@ type BrokerConfig struct {
 	// 停止读取的客户端不能永久占住工作协程，超时即断开它——这是对慢
 	// 客户端唯一正确的处置，服务端不能为它无界等待。
 	WriteTimeout Duration `yaml:"write_timeout"`
+	// TCPKeepAlive 是操作系统 TCP 探测周期；MQTT 应用层保活之外只用它兜底。
+	// 留空取 broker 的容量化默认值。
+	TCPKeepAlive Duration `yaml:"tcp_keepalive"`
 }
 
 // PKIConfig 是内嵌 CA 的配置。
@@ -457,7 +509,10 @@ func Default() Config {
 				MinTLSVersion:     "1.2",
 				HandshakeTimeout:  Duration(10 * time.Second),
 			},
-			MQTTPlain: PlainListener{Enabled: false, Addr: "127.0.0.1:1883"},
+			MQTTPlain: PlainListener{
+				Enabled: false, Addr: "127.0.0.1:1883",
+				ProxyHeaderTimeout: Duration(3 * time.Second),
+			},
 			MQTTWSS: WSSListener{
 				Enabled:          false,
 				Addr:             "0.0.0.0:443",

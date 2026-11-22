@@ -6,10 +6,13 @@ package server
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +97,12 @@ type Server struct {
 	// （CLU-101，见 forgetDepartedNodes）。
 	gossipMu   sync.Mutex
 	gossipSeen map[cluster.NodeID]bool
+	// thingEpoch 区分同一 node ID 的不同进程生命周期；thingSyncRequests
+	// 是对端发现增量断档后发来的快照请求。
+	thingEpoch        uint64
+	thingSyncMu       sync.Mutex
+	thingSyncRequests map[cluster.NodeID]bool
+	thingLegacyPeers  map[cluster.NodeID]bool
 	// retaineds 是待广播的保留消息变更（MQTT-122）。有界：发布路径上
 	// 只能入队不能等网络（契约 05），满了就丢并计数——边界见 MQTT-125。
 	retaineds chan cluster.RetainedUpdate
@@ -112,7 +121,7 @@ type Server struct {
 	replPeers map[cluster.NodeID]string
 	replDir   string
 	rt        *router.Router
-	owners    *cluster.LocalOwnership
+	owners    *cluster.SwitchableOwnership
 	// remoteThings 是通告来的设备归属表，只在集群模式下非 nil。
 	remoteThings *cluster.RemoteThings
 	lim          *quota.Local
@@ -128,11 +137,13 @@ type Server struct {
 	sessions     *sessionSwitch
 	sessionLocal *store.SessionStore
 	// shards 是会话分区组，只在集群模式下非空。
-	shards    *cluster.ShardGroup
-	retained  *store.RetainedStore
-	reg2      *registry.Registry
-	shadowSvc *shadow.Service
-	access    *access
+	shards       *cluster.ShardGroup
+	shadowShards atomic.Pointer[cluster.ShardGroup]
+	shadowRoute  shadowRouteStats
+	retained     *store.RetainedStore
+	reg2         *registry.Registry
+	shadowSvc    *shadow.Service
+	access       *access
 
 	listeners []*broker.Listener
 	admin     *adminServer
@@ -188,8 +199,19 @@ func New(opt Options) (*Server, error) {
 	limits := topic.DefaultLimits()
 	env := authzEnv(&s.cfg)
 
-	s.owners = cluster.NewLocalOwnership(cluster.NodeID(s.mf.NodeID), s.cfg.Cluster.ShardCount)
+	localOwners := cluster.NewLocalOwnership(cluster.NodeID(s.mf.NodeID), s.cfg.Cluster.ShardCount)
+	s.owners = cluster.NewSwitchableOwnership(localOwners, s.cfg.Cluster.ShardCount)
 	if s.cfg.Node.Mode != config.ModeStandalone {
+		var epochBytes [8]byte
+		if _, err := cryptorand.Read(epochBytes[:]); err != nil {
+			return nil, fmt.Errorf("server: 生成设备归属 epoch 失败: %w", err)
+		}
+		s.thingEpoch = binary.LittleEndian.Uint64(epochBytes[:])
+		if s.thingEpoch == 0 {
+			s.thingEpoch = 1
+		}
+		s.thingSyncRequests = make(map[cluster.NodeID]bool)
+		s.thingLegacyPeers = make(map[cluster.NodeID]bool)
 		s.remoteThings = cluster.NewRemoteThings(cluster.NodeID(s.mf.NodeID))
 		s.takeovers = make(chan string, 1024)
 		s.retaineds = make(chan cluster.RetainedUpdate, 1024)
@@ -299,6 +321,11 @@ func New(opt Options) (*Server, error) {
 		Partitioner: cluster.NewLocalPartitioner(cluster.NodeID(s.mf.NodeID), s.cfg.Cluster.ShardCount),
 		Limiter:     s.lim,
 		Now:         s.now,
+		Forward:     s.applyForwardedShadow,
+		LocalGet:    s.localShadowGet,
+		LocalList:   s.localShadowList,
+		ForwardGet:  s.forwardShadowGet,
+		ForwardList: s.forwardShadowList,
 		OnForward:   s.traceShadow,
 		OnChange: func(thing, op string) {
 			reason := "shadow-update"
@@ -335,6 +362,7 @@ func New(opt Options) (*Server, error) {
 		Router:             s.rt,
 		Sessions:           s.sessions,
 		Owners:             s.owners,
+		AuthoritativeEpoch: s.cfg.Node.Mode != config.ModeStandalone,
 		Limiter:            s.lim,
 		Bus:                s.bus,
 		Auth:               auth,
@@ -565,6 +593,18 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := s.startReplication(ctx); err != nil {
 			return err
 		}
+		// 显式启用的影子分片必须在 metadata Barrier 之后启动：旧路径里
+		// 可能还有已提交但未应用的影子命令，先起新日志会让新旧两条日志
+		// 对同一文档的顺序不确定。
+		if s.cfg.Cluster.Replication.ShadowShards != 0 {
+			replicas := make(map[cluster.NodeID]uint64, len(s.cfg.Cluster.Replication.Replicas))
+			for id, replica := range s.cfg.Cluster.Replication.Replicas {
+				replicas[cluster.NodeID(id)] = replica
+			}
+			if err := s.startShadowShards(replicas); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := s.Prepare(ctx); err != nil {
@@ -609,6 +649,13 @@ func (s *Server) Run(ctx context.Context) error {
 		defer s.wg.Done()
 		s.runRetainedSweep(s.bgCtx)
 	}()
+	// 速率桶在恢复满额后与“没有桶”等价。分片增量回收避免百万个
+	// clientId 的一次性 CONNECT 把限速器 map 永久留在峰值。
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runQuotaSweep(s.bgCtx)
+	}()
 	if s.tracer.Enabled() {
 		s.wg.Add(1)
 		go func() {
@@ -628,6 +675,23 @@ func (s *Server) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 	return s.shutdown()
+}
+
+const quotaSweepInterval = 100 * time.Millisecond
+
+// runQuotaSweep 每次只扫一个令牌桶分片；64 个分片约 6.4 秒一轮。
+// 这样百万设备重连后能及时回收，又不会一次长时间挡住 CONNECT 热路径。
+func (s *Server) runQuotaSweep(ctx context.Context) {
+	t := time.NewTicker(quotaSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.lim.SweepRateBuckets(1)
+		}
+	}
 }
 
 // startMQTTListeners 启动设备端口。只在就绪后调用（PRD CLU-032）。
@@ -689,12 +753,37 @@ func (s *Server) startMQTTListeners(ctx context.Context) error {
 		return err
 	}
 	if s.cfg.Listeners.MQTTPlain.Enabled {
-		ln, err := s.brk.ListenPlain(s.cfg.Listeners.MQTTPlain.Addr)
+		plain := &s.cfg.Listeners.MQTTPlain
+		var ln *broker.Listener
+		var err error
+		if plain.ProxyProtocol == "v2" {
+			trusted := make([]netip.Prefix, 0, len(plain.TrustedProxies))
+			for _, raw := range plain.TrustedProxies {
+				// Config.Validate 已经严格检查；这里仍返回错误而不是 panic，
+				// 使直接构造 Server 的调用方也拿到可诊断结果。
+				p, perr := netip.ParsePrefix(raw)
+				if perr != nil {
+					return fmt.Errorf("mqtt_plain trusted proxy %q: %w", raw, perr)
+				}
+				trusted = append(trusted, p)
+			}
+			ln, err = s.brk.ListenProxyV2(plain.Addr, broker.ProxyOptions{
+				TrustedProxies: trusted,
+				HeaderTimeout:  plain.ProxyHeaderTimeout.D(),
+			})
+		} else {
+			ln, err = s.brk.ListenPlain(plain.Addr)
+		}
 		if err != nil {
 			return err
 		}
 		s.serve(ctx, ln)
-		s.log.Warn("明文 MQTT 端点已监听（无传输加密）", "地址", ln.Addr().String())
+		if plain.ProxyProtocol == "v2" {
+			s.log.Info("可信 TLS 终结器 MQTT 端点已监听", "地址", ln.Addr().String(),
+				"trusted_proxies", plain.TrustedProxies)
+		} else {
+			s.log.Warn("明文 MQTT 端点已监听（无传输加密）", "地址", ln.Addr().String())
+		}
 	}
 	return nil
 }
@@ -709,6 +798,7 @@ func (s *Server) startTLSListener(ctx context.Context, name string, l *config.TL
 		RequireClientCert: l.RequireClientCert,
 		NextProtos:        l.ALPN,
 		MinVersion:        tlsVersion(l.MinTLSVersion),
+		CurvePreferences:  tlsCurvePreferences(l.PostQuantumKeyExchange),
 		RequireSNI:        l.RequireSNI,
 		HandshakeTimeout:  l.HandshakeTimeout.D(),
 	}
@@ -718,6 +808,13 @@ func (s *Server) startTLSListener(ctx context.Context, name string, l *config.TL
 			return fmt.Errorf("%s: %w", name, err)
 		}
 		opt.ClientCAs = pool
+	}
+	if l.SessionTicketKeysFile != "" {
+		keys, err := LoadSessionTicketKeys(l.SessionTicketKeysFile)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		opt.SessionTicketKeys = keys
 	}
 	ln, err := s.brk.ListenTLS(l.Addr, opt)
 	if err != nil {
@@ -744,6 +841,7 @@ func (s *Server) startWSSListener(ctx context.Context) error {
 	ln, err := s.brk.ListenWebSocket(l.Addr, broker.WebSocketOptions{
 		Certificate:      cert,
 		MinVersion:       tlsVersion(l.MinTLSVersion),
+		CurvePreferences: tlsCurvePreferences(l.PostQuantumKeyExchange),
 		RequireSNI:       l.RequireSNI,
 		HandshakeTimeout: l.HandshakeTimeout.D(),
 		Checker: sigv4.Checker{
@@ -760,6 +858,15 @@ func (s *Server) startWSSListener(ctx context.Context) error {
 	s.serve(ctx, ln)
 	s.log.Info("MQTT over WebSocket 已监听", "地址", ln.Addr().String(), "区域", l.Region)
 	return nil
+}
+
+func tlsCurvePreferences(postQuantum bool) []tls.CurveID {
+	if postQuantum {
+		// nil 明确交还 Go 的版本化默认值；Go 1.24 起客户端与服务端共同
+		// 支持时会选择 X25519+ML-KEM 混合组。
+		return nil
+	}
+	return []tls.CurveID{tls.X25519, tls.CurveP256}
 }
 
 func (s *Server) serve(ctx context.Context, ln *broker.Listener) {
@@ -834,8 +941,20 @@ func (s *Server) shutdown() error {
 		// 而 TLSGroup.Close 会把那个 NodeHost 一起停掉——反过来的顺序是
 		// 对着已停的 NodeHost 调 StopReplica，那只会得到一个没有意义的
 		// 错误（分片其实已经停了），把它当成关闭失败报出去。
+		if shadowShards := s.shadowShards.Load(); shadowShards != nil {
+			if err := shadowShards.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 		if s.shards != nil {
 			if err := s.shards.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		// broker 已在上面停止产生新帧；先停 mesh worker，避免它们
+		// 在复制组关闭后继续重试已经不可达的对端。
+		if s.mesh != nil {
+			if err := s.mesh.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

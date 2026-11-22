@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -183,7 +184,8 @@ func (c *Config) validateReplication() error {
 	standalone := c.Node.Mode == ModeStandalone
 	written := rep.Addr != "" || len(rep.Peers) > 0 ||
 		rep.CertFile != "" || rep.KeyFile != "" || rep.CAFile != "" ||
-		rep.SessionShards != 0
+		rep.SessionShards != 0 || rep.SessionReplicationFactor != 0 || rep.ShadowShards != 0 ||
+		rep.ShadowReplicationFactor != 0 || rep.RTT != 0
 	if standalone {
 		if written {
 			return fieldErr("cluster.replication",
@@ -229,6 +231,50 @@ func (c *Config) validateReplication() error {
 			fmt.Sprintf("%d 超出上限 64", rep.SessionShards),
 			"每个分片是一条独立的 raft 日志，分片数要与节点的核数相称")
 	}
+	if rep.ShadowShards > 14 {
+		return fieldErr("cluster.replication.shadow_shards",
+			fmt.Sprintf("%d 超出上限 14", rep.ShadowShards),
+			"影子分片使用 metadata 与 session 之间预留的 shard ID 区间")
+	}
+	if rf := rep.ShadowReplicationFactor; rf != 0 {
+		if rep.ShadowShards == 0 {
+			return fieldErr("cluster.replication.shadow_replication_factor",
+				"shadow_shards 为 0", "先启用影子分片")
+		}
+		if rf < 3 || rf%2 == 0 || rf > uint64(len(rep.Replicas)) {
+			return fieldErr("cluster.replication.shadow_replication_factor",
+				fmt.Sprintf("%d 不是可用的奇数副本因子", rf),
+				"设为 0 保持 RF=all，或设为不超过投票节点数的奇数（生产建议 3）")
+		}
+	}
+	if rf := rep.SessionReplicationFactor; rf != 0 {
+		if rf < 3 {
+			return fieldErr("cluster.replication.session_replication_factor",
+				fmt.Sprintf("%d 小于高可用下限 3", rf),
+				"设为 0 保持 RF=all，或在至少 4 个投票节点时设为 3")
+		}
+		if rf%2 == 0 {
+			return fieldErr("cluster.replication.session_replication_factor",
+				fmt.Sprintf("%d 为偶数", rf),
+				"Raft 副本因子须为奇数；偶数不增加可容忍故障数，只增加写放大")
+		}
+		if rf > uint64(len(rep.Replicas)) {
+			return fieldErr("cluster.replication.session_replication_factor",
+				fmt.Sprintf("%d 超出副本节点数 %d", rf, len(rep.Replicas)),
+				"副本因子不得大于 cluster.replication.replicas 的节点数")
+		}
+	}
+	// RTT 的两端都要拦。
+	//
+	// 下限 1 毫秒是库的要求（它的 tick 单位是毫秒，0 会被当成"没配"）；
+	// 上限 1 秒是运维上的：心跳与选举按它的倍数算，10 秒的 RTT 意味着
+	// 选举超时一百秒，一次 leader 故障期间所有设备都会重连完毕，而那
+	// 不像是配错了的样子——所以在这里拦住。
+	if d := time.Duration(rep.RTT); rep.RTT != 0 && (d < time.Millisecond || d > time.Second) {
+		return fieldErr("cluster.replication.rtt",
+			fmt.Sprintf("%s 超出 1ms 到 1s 的范围", d),
+			"它是共识库的 tick 间隔，心跳与选举超时按它的倍数计")
+	}
 	for _, f := range []struct {
 		name, val string
 	}{
@@ -273,6 +319,34 @@ func (c *Config) validateListeners() error {
 	if ls.MQTTPlain.Enabled {
 		if err := checkHostPort(ls.MQTTPlain.Addr); err != nil {
 			return fieldErr("listeners.mqtt_plain.addr", err.Error(), "须为 host:port")
+		}
+		switch ls.MQTTPlain.ProxyProtocol {
+		case "":
+			if len(ls.MQTTPlain.TrustedProxies) != 0 {
+				return fieldErr("listeners.mqtt_plain.trusted_proxies",
+					"只在 proxy_protocol 为 v2 时生效",
+					"删除 trusted_proxies，或显式设置 proxy_protocol: v2")
+			}
+		case "v2":
+			if len(ls.MQTTPlain.TrustedProxies) == 0 {
+				return fieldErr("listeners.mqtt_plain.trusted_proxies", "不得为空",
+					"列出允许连接此端点的 TLS 终结器 CIDR，例如 127.0.0.1/32")
+			}
+			for i, raw := range ls.MQTTPlain.TrustedProxies {
+				if _, err := netip.ParsePrefix(raw); err != nil {
+					return fieldErr(fmt.Sprintf("listeners.mqtt_plain.trusted_proxies[%d]", i),
+						fmt.Sprintf("取值 %q 不是合法 CIDR", raw),
+						"须包含前缀长度，例如 10.0.0.0/24 或 ::1/128")
+				}
+			}
+			if d := ls.MQTTPlain.ProxyHeaderTimeout.D(); d <= 0 {
+				return fieldErr("listeners.mqtt_plain.proxy_header_timeout", "须为正数",
+					"建议 3s；它限制慢代理头占用连接资源的时间")
+			}
+		default:
+			return fieldErr("listeners.mqtt_plain.proxy_protocol",
+				fmt.Sprintf("取值 %q 无效", ls.MQTTPlain.ProxyProtocol),
+				"留空表示普通明文 MQTT，或取 v2 启用受信代理身份入口")
 		}
 	}
 	return c.validateAdmin()
@@ -378,6 +452,7 @@ func (c *Config) validateBroker() error {
 		name string
 		v    int
 	}{
+		{"tls_handshake_concurrency", b.TLSHandshakeConcurrency},
 		{"writer_workers", b.WriterWorkers},
 		{"outbound_buffer", b.OutboundBuffer},
 		{"read_buffer", b.ReadBuffer},
@@ -392,6 +467,11 @@ func (c *Config) validateBroker() error {
 			fmt.Sprintf("为 %d，超出上限 %d", b.WriterWorkers, maxWriterWorkers),
 			"写出池的协程数远超 CPU 核数不会提高吞吐，只是多占栈内存；"+
 				"留空按核数自适应")
+	}
+	if b.TLSHandshakeConcurrency > maxTLSHandshakeConcurrency {
+		return fieldErr("broker.tls_handshake_concurrency",
+			fmt.Sprintf("为 %d，超出上限 %d", b.TLSHandshakeConcurrency, maxTLSHandshakeConcurrency),
+			"过多并发全握手会同时制造大量密码学对象和 GC 压力；留空按核数自适应")
 	}
 	if b.ReadBuffer > 0 && b.ReadBuffer < minReadBuffer {
 		return fieldErr("broker.read_buffer",
@@ -408,15 +488,22 @@ func (c *Config) validateBroker() error {
 			fmt.Sprintf("为 %s，小于下限 %s", d, minWriteTimeout),
 			"过短的刷写超时会把正常客户端判成慢客户端并断开；留空取默认值")
 	}
+	if d := b.TCPKeepAlive.D(); d != 0 && d < minTCPKeepAlive {
+		return fieldErr("broker.tcp_keepalive",
+			fmt.Sprintf("为 %s，小于容量安全下限 %s", d, minTCPKeepAlive),
+			"过短的内核保活会按连接数放大探测包和定时器；留空取默认值")
+	}
 	return nil
 }
 
 // 接入层参数的边界。它们不是配额，只是「填了会让节点自毁」的下限与上限。
 const (
-	maxWriterWorkers = 4096
-	minReadBuffer    = 64
-	minWriteBatch    = 512
-	minWriteTimeout  = 100 * time.Millisecond
+	maxWriterWorkers           = 4096
+	maxTLSHandshakeConcurrency = 4096
+	minReadBuffer              = 64
+	minWriteBatch              = 512
+	minWriteTimeout            = 100 * time.Millisecond
+	minTCPKeepAlive            = 30 * time.Second
 )
 
 // validateQuota 校验配额覆盖。
@@ -514,7 +601,8 @@ func (c *Config) validateAuth() error {
 	switch c.Auth.Mode {
 	case AuthCert:
 		if !c.PKI.Enabled && c.Listeners.MQTTTLS.ClientCAFile == "" &&
-			c.Listeners.MQTTALPN.ClientCAFile == "" {
+			c.Listeners.MQTTALPN.ClientCAFile == "" &&
+			c.Listeners.MQTTPlain.ProxyProtocol != "v2" {
 			return fieldErr("auth.mode",
 				"为 cert 但既未启用 pki 也未配置 client_ca_file",
 				"证书认证需要一个信任来源")

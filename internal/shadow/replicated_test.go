@@ -339,6 +339,31 @@ func TestReplicatedShadowIgnoresUnawaitedResults(t *testing.T) {
 	}
 }
 
+func TestReplicatedShadowTransactionalDeliveryWaitsForCommit(t *testing.T) {
+	rs, err := NewReplicatedStore(NewMemStore(), &fakeLog{}, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := EncodeCommand(Command{Kind: CmdUpdate, Thing: "lamp-1", NowSec: 1700})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.pending["id-1"] = nil
+	post, err := rs.ApplyCommittedTx("id-1", raw, func(cmd Command) (*Result, error) {
+		return rs.local.Apply(context.Background(), cmd)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.pending["id-1"] != nil {
+		t.Fatal("事务提交前已经交付 pending 结果")
+	}
+	post()
+	if rs.pending["id-1"] == nil || rs.pending["id-1"].res == nil {
+		t.Fatal("事务提交后没有交付 pending 结果")
+	}
+}
+
 // TestReplicatedShadowRefusesBrokenEntry 解不开的条目要让 apply 失败。
 func TestReplicatedShadowRefusesBrokenEntry(t *testing.T) {
 	rs, err := NewReplicatedStore(NewMemStore(), &fakeLog{}, "a")

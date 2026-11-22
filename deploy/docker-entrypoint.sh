@@ -21,6 +21,43 @@
 # 不设它：那几份清单里 init 是一个看得见的步骤，更该保持看得见。
 set -e
 
+# Go 不会自动把容器 memory limit 当成 runtime soft memory limit。没有
+# GOMEMLIMIT 时，大连接堆在 cgroup OOM 之前仍可能保留过多 span/栈/缓存页；
+# OOM killer 不给进程留下降载或写日志的机会。用户显式设置的值（包括 off）
+# 始终优先；否则取 cgroup 与物理内存较小者的 75%，给内核 socket、mmap、
+# bbolt/LogDB page cache 和非 Go 内存留四分之一。
+meminfo_path=${OPENIOTD_MEMINFO_PATH:-/proc/meminfo}
+cgroup_v2_path=${OPENIOTD_CGROUP_V2_PATH:-/sys/fs/cgroup/memory.max}
+cgroup_v1_path=${OPENIOTD_CGROUP_V1_PATH:-/sys/fs/cgroup/memory/memory.limit_in_bytes}
+if [ -z "${GOMEMLIMIT:-}" ] && [ -r "$meminfo_path" ]; then
+  host_kib=0
+  while read -r key value _; do
+    if [ "$key" = "MemTotal:" ]; then host_kib=$value; break; fi
+  done < "$meminfo_path"
+  host_bytes=$((host_kib * 1024))
+  effective_bytes=$host_bytes
+  cgroup_bytes=""
+  if [ -r "$cgroup_v2_path" ]; then
+    IFS= read -r cgroup_bytes < "$cgroup_v2_path" || cgroup_bytes=""
+  elif [ -r "$cgroup_v1_path" ]; then
+    IFS= read -r cgroup_bytes < "$cgroup_v1_path" || cgroup_bytes=""
+  fi
+  case "$cgroup_bytes" in
+    ''|max|*[!0-9]*) ;;
+    *)
+      if [ "$cgroup_bytes" -gt 0 ] && [ "$cgroup_bytes" -lt "$effective_bytes" ]; then
+        effective_bytes=$cgroup_bytes
+      fi
+      ;;
+  esac
+  if [ "$effective_bytes" -ge 67108864 ]; then
+    go_memory_limit=$((effective_bytes / 4 * 3))
+    GOMEMLIMIT="${go_memory_limit}B"
+    export GOMEMLIMIT
+    echo "openiotd: GOMEMLIMIT 未设置，按可用内存的 75% 自动设为 $GOMEMLIMIT" >&2
+  fi
+fi
+
 # 只认 "1" 与 "true"。
 #
 # 不用「非空即为真」那种写法：`OPENIOTD_AUTO_INIT=0` 与

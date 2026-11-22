@@ -680,22 +680,21 @@ func (s *sim) dumpSubEvents() {
 func (s *sim) checkInvariants(step int) {
 	b := s.r.b
 
-	// TST-050：同一 clientId 至多一个活会话。byClient 是 map，键唯一性
-	// 由它保证；真正要查的是索引与计数器没有分家。
-	b.mu.RLock()
-	indexed := len(b.byClient)
-	for id, c := range b.byClient {
-		if c.clientID != id {
-			s.t.Errorf("第 %d 步：索引键 %q 指向 clientID %q", step, id, c.clientID)
+	// TST-050：同一 clientId 至多一个活会话。client 分片内的 map
+	// 保证键唯一性；真正要查的是索引与计数器没有分家。
+	index := b.clientIndexSnapshot()
+	indexed := len(index)
+	for id, c := range index {
+		if c.clientID() != id {
+			s.t.Errorf("第 %d 步：索引键 %q 指向 clientID %q", step, id, c.clientID())
 		}
 	}
-	b.mu.RUnlock()
 
 	// 三个计数之间是包含关系，不是相等关系——这一点第一版写错了，
 	// 五个种子全红，而红的是断言不是实现：
 	//   Conns()  数的是已接受的套接字，CONNECT 之前就加一；
 	//   配额计数 在 handleConnect 的配额闸门处加一，鉴权之前；
-	//   byClient 只收录走完 CONNECT 的连接。
+	//   client 索引只收录走完 CONNECT 的连接。
 	// 于是握手中与清理中的连接会让前两者短暂地大于后者，那是正常的。
 	// 真正不该发生的是反过来：登记了却没被计数，说明有一条路径绕开了
 	// 计数或释放，而那正是"跑一天之后连不上"的成因。

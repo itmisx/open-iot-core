@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openiotd
+  namespace: open-iot-core
+spec:
+  replicas: 5
+  template:
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: openiotd
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              memory: 40Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        resources:
+          requests:
+            storage: 100Gi

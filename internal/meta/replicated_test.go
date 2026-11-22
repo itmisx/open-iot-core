@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"encoding/binary"
 	"errors"
 	"sync"
 	"testing"
@@ -255,6 +256,37 @@ func TestCommittedCommandsMatchAcrossStores(t *testing.T) {
 	}
 }
 
+func TestSetThingsReplicatesAsOneEntry(t *testing.T) {
+	_, nodes := newCluster(t, "a", "b", "c")
+	rev, err := nodes["b"].store.Apply(ctx(), Command{
+		Kind:   CmdSetThings,
+		Things: []ThingCmd{{Name: "batch-a"}, {Name: "batch-b"}},
+		Records: []RecordOp{
+			{Key: []byte("tbatch-a"), Value: []byte("a")},
+			{Key: []byte("tbatch-b"), Value: []byte("b")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev != 1 {
+		t.Fatalf("revision = %d，批次应只占一条日志", rev)
+	}
+	for id, n := range nodes {
+		if n.store.View().Revision() != 1 {
+			t.Errorf("%s revision = %d", id, n.store.View().Revision())
+		}
+		for _, name := range []string{"batch-a", "batch-b"} {
+			if _, ok := n.store.View().Thing(name); !ok {
+				t.Errorf("%s 热视图缺少 %s", id, name)
+			}
+			if got := string(n.cold.vals["t"+name]); got != string(name[len("batch-"):]) {
+				t.Errorf("%s 冷层 %s = %q", id, name, got)
+			}
+		}
+	}
+}
+
 // TestNewReplicatedStoreValidatesOptions 缺依赖要在构造时报错。
 func TestNewReplicatedStoreValidatesOptions(t *testing.T) {
 	local := NewLocalStore(LocalOptions{})
@@ -269,5 +301,53 @@ func TestNewReplicatedStoreValidatesOptions(t *testing.T) {
 		if _, err := NewReplicatedStore(opt); err == nil {
 			t.Errorf("第 %d 组缺依赖的参数应被拒", i)
 		}
+	}
+}
+
+// TestApplyCommittedSingleEntryMatchesBatch 钉住单条入口与批量入口等价。
+//
+// ApplyCommitted 是 ApplyCommittedBatch 的单条包装。它存在是因为调用方有
+// 两种形状（dragonboat 推一批、启动期补一条），而两者必须产生同一个结果
+// ——否则同一条日志在不同调用方那里会落到不同的 revision 上。
+func TestApplyCommittedSingleEntryMatchesBatch(t *testing.T) {
+	vals := map[string][]byte{}
+	txCalls := 0
+	revKey := []byte("revision")
+	s := NewLocalStore(LocalOptions{
+		Cold:        &fakeCold{vals: vals},
+		RevisionKey: revKey,
+		InTransaction: func(fn func(Transaction) error) error {
+			txCalls++
+			return fn(&testMetaTx{vals: vals})
+		},
+	})
+	defer s.Close()
+
+	if err := s.ApplyCommitted(Command{
+		ID: "one", Kind: CmdNop,
+		Records: []RecordOp{{Key: []byte("k1"), Value: []byte("v1")}},
+	}, 7); err != nil {
+		t.Fatalf("单条 ApplyCommitted: %v", err)
+	}
+	if txCalls != 1 {
+		t.Fatalf("单条入口用了 %d 个事务，期望 1", txCalls)
+	}
+	if string(vals["k1"]) != "v1" {
+		t.Fatalf("冷层记录没写进去: %#v", vals)
+	}
+	if got := binary.BigEndian.Uint64(vals[string(revKey)]); got != 7 {
+		t.Fatalf("revision = %d，期望 7", got)
+	}
+
+	// revision 的判据是严格递增而不是恰好加一（LANG-014 修订：成员变更会
+	// 占掉日志序号）。跳号必须接受。
+	if err := s.ApplyCommitted(Command{
+		ID: "two", Kind: CmdNop,
+		Records: []RecordOp{{Key: []byte("k2"), Value: []byte("v2")}},
+	}, 11); err != nil {
+		t.Fatalf("跳号的 ApplyCommitted: %v", err)
+	}
+	if got := binary.BigEndian.Uint64(vals[string(revKey)]); got != 11 {
+		t.Fatalf("跳号后 revision = %d，期望 11", got)
 	}
 }

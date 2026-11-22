@@ -3,7 +3,7 @@
 # 生成三个 Secret，k8s 清单依赖它们：
 #
 #   openiotd-repl-tls      复制组的 TLS 材料，每个 Pod 一套（CN=Pod 名）
-#   openiotd-device-ca     设备 CA，三个 Pod 必须**共用**同一份
+#   openiotd-device-ca     设备 CA 与 session ticket key，三个 Pod 共用
 #   openiotd-admin-token   管理面令牌，三个 Pod 统一
 #
 # 此前还有第四个 openiotd-ca-passphrase（CA 私钥口令），随 AUTH-092
@@ -93,6 +93,10 @@ docker run --rm -v openiotd-seed:/var/lib/openiotd --entrypoint /bin/sh \
   | tar xf - -C "${OUT}"
 docker volume rm -f openiotd-seed >/dev/null
 
+echo "==> 生成集群共享的 TLS session ticket 密钥"
+openssl rand -hex 32 > "${OUT}/pki/session-ticket.keys"
+chmod 600 "${OUT}/pki/session-ticket.keys"
+
 echo "==> 创建 Secret"
 kubectl create namespace "${NS}" --dry-run=client -o yaml | kubectl apply -f -
 
@@ -113,6 +117,7 @@ kubectl -n "${NS}" create secret generic openiotd-device-ca \
   --from-file="${OUT}/pki/ca-chain.pem" \
   --from-file="${OUT}/pki/server.pem" \
   --from-file="${OUT}/pki/server.key" \
+  --from-file="${OUT}/pki/session-ticket.keys" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl -n "${NS}" create secret generic openiotd-admin-token \

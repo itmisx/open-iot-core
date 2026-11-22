@@ -28,6 +28,95 @@ func (r *Registry) PutThing(ctx context.Context, t Thing) error {
 	return r.writeThing(ctx, t, thingUpsert, 0, false)
 }
 
+// MaxPutThingsBatch 是一次批量开通允许的最大设备数。它与复制命令上限
+// 一致，使 API 层无法构造一条会长期阻塞 Raft apply 的超大日志。
+const MaxPutThingsBatch = meta.MaxThingsPerCommand
+
+// PutThings 原子地创建或更新一批设备。整批只提交一条元数据日志，冷层
+// 记录由状态机在一个 batch 中落盘；任一输入非法时整批不写入。
+func (r *Registry) PutThings(ctx context.Context, things []Thing) error {
+	if len(things) == 0 {
+		return errors.New("registry: 批量设备列表不得为空")
+	}
+	if len(things) > MaxPutThingsBatch {
+		return fmt.Errorf("registry: 批量设备数 %d 超出上限 %d",
+			len(things), MaxPutThingsBatch)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	seen := make(map[string]struct{}, len(things))
+	policyIDs := make(map[string]meta.PolicySetID)
+	records := make([]thingRecord, 0, len(things))
+	now := r.now()
+	for i := range things {
+		t := things[i]
+		if err := ValidateThingName(t.Name); err != nil {
+			return fmt.Errorf("registry: 第 %d 台设备: %w", i+1, err)
+		}
+		if _, ok := seen[t.Name]; ok {
+			return fmt.Errorf("registry: 批量设备名 %q 重复", t.Name)
+		}
+		seen[t.Name] = struct{}{}
+		if err := validateAttributes(t.Attributes); err != nil {
+			return fmt.Errorf("registry: 设备 %q: %w", t.Name, err)
+		}
+		if t.PolicyName != "" {
+			if _, ok := policyIDs[t.PolicyName]; !ok {
+				id, _, exists := r.policyEntryLocked(t.PolicyName)
+				if !exists {
+					return fmt.Errorf("registry: 策略 %q 不存在；请先创建它", t.PolicyName)
+				}
+				policyIDs[t.PolicyName] = id
+			}
+		}
+
+		created, version := now, int64(1)
+		old, err := r.getThingRecordLocked(t.Name)
+		switch {
+		case err == nil:
+			created = old.Created
+			version = old.Version
+			if version < 1 {
+				version = 1
+			}
+			version++
+		case errors.Is(err, ErrNotFound):
+		default:
+			return fmt.Errorf("registry: 读取设备 %q: %w", t.Name, err)
+		}
+		records = append(records, thingRecord{
+			V: thingRecordVersion, Name: t.Name, Attributes: t.Attributes,
+			PolicyName: t.PolicyName, Created: created, Updated: now, Version: version,
+		})
+	}
+
+	cmd := meta.Command{Kind: meta.CmdSetThings}
+	cmd.Things = make([]meta.ThingCmd, 0, len(records))
+	cmd.Records = make([]meta.RecordOp, 0, len(records))
+	slots := r.meta.View().AttrSlots()
+	for i := range records {
+		rec := &records[i]
+		ps := meta.NoPolicySet
+		if rec.PolicyName != "" {
+			ps = policyIDs[rec.PolicyName]
+		}
+		cmd.Things = append(cmd.Things, meta.ThingCmd{
+			Name: rec.Name, PolicySet: ps, Attrs: projectAttrs(slots, rec.Attributes),
+		})
+		op, err := setOp(store.Key(store.PrefixThing, rec.Name), rec)
+		if err != nil {
+			return err
+		}
+		cmd.Records = append(cmd.Records, op)
+	}
+	if _, err := r.meta.Apply(ctx, cmd); err != nil {
+		return fmt.Errorf("registry: 批量写入设备失败: %w", err)
+	}
+	return nil
+}
+
 // CreateThing 只在设备不存在时创建。已存在返回 ErrAlreadyExists。
 func (r *Registry) CreateThing(ctx context.Context, t Thing) error {
 	return r.writeThing(ctx, t, thingCreate, 0, false)

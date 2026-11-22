@@ -28,6 +28,8 @@ data:
         key_file: /etc/openiotd/repl/tls.key
         ca_file: /etc/openiotd/repl/ca.crt
         pump_interval: 200ms
+        shadow_shards: 8
+        shadow_replication_factor: 3
         # 初始成员用 headless Service 给出的稳定 DNS 名。
         # 这是 StatefulSet 而不是 Deployment 的原因之一：Pod 名字和
         # DNS 名必须稳定，否则重建一个 Pod 就等于换了一个节点身份。
@@ -50,6 +52,7 @@ data:
         enabled: true
         addr: 0.0.0.0:8883
         require_client_cert: true
+        session_ticket_keys_file: /var/lib/openiotd/pki/session-ticket.keys
       admin:
         enabled: true
         addr: 0.0.0.0:9090

@@ -145,6 +145,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | PDB `maxUnavailable: 1` | 一次 `kubectl drain` 可能带走两个 Pod，那就失去多数派了 |
 | readiness `/readyz`、liveness `/healthz` | 拿 `/healthz` 做 readiness 会把监听还没起来的 Pod 放进 Service |
 
+主容器虽然要用 shell 按 Pod 序号设置 bootstrap/join，最终仍显式执行镜像的
+`docker-entrypoint.sh`。Kubernetes 的`command`会覆盖镜像ENTRYPOINT；若直接
+`exec openiotd`，入口脚本基于cgroup设置`GOMEMLIMIT`的保护会被绕过，大连接节点
+会直接撞到OOM killer。对应接线有Go门禁，不能改回直接启动二进制。
+
 ## 扩容
 
 **不要只改 `replicas`。** 顺序见 [`../README.md`](../README.md) 的「加减节点」，
@@ -183,9 +188,10 @@ kubectl -n open-iot-core set image statefulset/openiotd \
   改策略）；设备侧 8883 是 mTLS，要对外请用 LoadBalancer 或 NodePort，
   并确认服务端证书的 SAN 里有那个域名（也就是 `prepare.sh` 的
   `EXTRA_HOSTS`，不是 ConfigMap 里的 `server_hosts`）。
-- **没有 resources requests/limits。** 三个 Pod 不设请求意味着调度器按零
-  需求安排它们，一台机器上的邻居可以把节点挤到 OOM，而被杀掉的那个带走
-  一张多数派的票。按设备数与消息量压一遍再填。
+- **基础三节点示例没有 resources requests/limits。** 它用于功能试跑，不能直接
+  承载百万连接。五节点容量部署使用[`../k8s-million/`](../k8s-million/) overlay：
+  每Pod请求8 CPU/32GiB、限制40GiB、100GiB卷，并提供只暴露8883且
+  `externalTrafficPolicy: Local`的LoadBalancer。最终仍须按目标机器密度轮校准。
 - **镜像写死成 `latest`。** 配 `imagePullPolicy: IfNotPresent` 既不会自动
   更新，又让「这三个 Pod 跑的是哪一版」取决于各节点碰巧缓存了什么。
   生产钉版本，见上面的「升级」。

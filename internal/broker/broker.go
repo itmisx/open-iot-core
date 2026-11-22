@@ -49,6 +49,58 @@ type ConnInfo struct {
 	RedirectTo string
 }
 
+// liveConnInfo 是 CONNECT 之后仍需随长连接保留的传输事实。
+//
+// ConnInfo 里的证书 DN、序列号、指纹和 AccessKeyID 只供认证阶段使用；把
+// 整个 ConnInfo 永久嵌进 conn，会让百万空闲连接各自常驻两份大 DN 结构。
+// 认证字段放进 connAuthInfo，认证结束即解除引用；这里只留事件、管理面和
+// WebSocket 生命周期仍会读取的字段。
+type liveConnInfo struct {
+	IP         [16]byte
+	Port       uint16
+	TLSVersion uint16
+	ALPN       connALPN
+	flags      uint8
+}
+
+const (
+	connRemoteValid uint8 = 1 << iota
+	connRemoteV4
+)
+
+type connALPN uint8
+
+const (
+	connALPNNone connALPN = iota
+	connALPNMQTTCert
+	connALPNMQTTCustom
+	connALPNHTTPCert
+	connALPNOther
+)
+
+// connExtras 只由非标准 ALPN 或带连接寿命的 WebSocket 使用。普通 8883
+// mTLS 长连接不应为这些稀有字段永久预付三个机器字。
+type connExtras struct {
+	alpn        string
+	redirectTo  string
+	remoteZone  string
+	maxLifetime time.Duration
+	// lifetimeStop 只存在于配置了连接寿命的 WebSocket。放在已有的稀有
+	// sidecar，避免普通 mTLS 长连接为一个永远为 nil 的函数永久预付空间。
+	lifetimeStop func() bool
+}
+
+type connAuthInfo struct {
+	HasCert     bool
+	CertFP      meta.CertFingerprint
+	CertSubject authz.DN
+	CertIssuer  authz.DN
+	CertSerial  string
+	AccessKeyID string
+}
+
+var connAuthInfoPool = sync.Pool{New: func() any { return new(connAuthInfo) }}
+
 // PrincipalKind 是认证主体的种类。
 type PrincipalKind uint8
 
@@ -61,15 +113,31 @@ const (
 
 // Principal 是认证成功后解析出的主体。
 type Principal struct {
-	Kind   PrincipalKind
-	CertFP meta.CertFingerprint
-	HasFP  bool
 	// Thing 是绑定的设备名，为空表示未绑定。
 	Thing string
 	// Policies 是该主体生效的已编译策略集。
 	Policies []*authz.CompiledSet
 	// AuthzCtx 是策略求值上下文，连接建立时填充一次，之后每条消息复用。
+	AuthzCtx authz.Context
+	CertFP   meta.CertFingerprint
+	// 小字段集中放在末尾，避免 CertFP 后的对齐洞把每条 conn 推回 896 B
+	// allocator class。
+	Kind       PrincipalKind
+	HasFP      bool
+	AuthMethod events.AuthMethod
+}
+
+// livePrincipal 是认证完成后每条在线连接实际保留的主体投影。
+//
+// Principal.Thing 是 Authenticator 的公开返回字段，不能为了内部内存布局而
+// 删除；但它与 AuthzCtx.Thing 是同一个值。连接只保留后者，避免百万连接
+// 常驻两份字符串头，同时保持自定义 Authenticator 的兼容性。
+type livePrincipal struct {
+	Policies   []*authz.CompiledSet
 	AuthzCtx   authz.Context
+	CertFP     meta.CertFingerprint
+	Kind       PrincipalKind
+	HasFP      bool
 	AuthMethod events.AuthMethod
 }
 
@@ -94,6 +162,10 @@ type Options struct {
 	Sessions session.Store
 	// Owners 管理 clientId 所有权与围栏（契约 01）。
 	Owners cluster.SessionOwnership
+	// AuthoritativeEpoch 表示 Owners 发放的 epoch 在节点间全局有序。
+	// 为真时，会话写被围栏拒绝就必须拒绝 CONNECT；为假只记数，
+	// 用于兼容旧的每节点 LocalOwnership。
+	AuthoritativeEpoch bool
 	// Limiter 判定配额（契约 09）。
 	Limiter quota.Limiter
 	// Bus 是事件总线（契约 11）。
@@ -135,6 +207,14 @@ type Options struct {
 	KeepAliveGraceFactor float64
 	// WriteTimeout 是单次刷写的上限。停止读取的客户端不能占住写出工作协程。
 	WriteTimeout time.Duration
+	// TCPKeepAlive 是内核 TCP 保活周期。Go 的默认值是 15s，百万空闲连接
+	// 会因此产生约 6.7 万次/秒的探测；MQTT 已有应用层 keepalive，
+	// 所以默认放宽到 5m，只给 keepalive=0 的死连接兜底。
+	TCPKeepAlive time.Duration
+	// TLSHandshakeConcurrency 是每个 TLS listener 同时执行的握手上限。
+	// 达到上限后 Accept 路径停止把新套接字交给 TLS，让内核
+	// backlog 承担短时背压，避免重连风暴创建无界密码学工作集。
+	TLSHandshakeConcurrency int
 
 	// Mesh 把消息转发给远端节点（契约 07）。为 nil 时不转发——
 	// 单机下 Route 返回的远端集合恒为空，这条分支不会进入。
@@ -154,14 +234,13 @@ type Broker struct {
 	opt    Options
 	writer *writerPool
 
-	mu sync.RWMutex
-	// byClient 是 clientId 到连接的索引，用于抢占与运维踢出。
-	byClient map[string]*conn
-	// byCert 是证书指纹到连接的索引。
-	//
-	// 吊销后必须立即断开所有在用该证书的活连接——仅改状态不断连
-	// 视为未完成吊销（PRD PKI-030）。没有这个索引就只能全表扫描。
-	byCert map[meta.CertFingerprint]map[*conn]struct{}
+	clients [connIndexShardCount]clientIndexShard
+	things  [connIndexShardCount]thingIndexShard
+	certs   [connIndexShardCount]certIndexShard
+	// thingVersion 与各 thing 分片的 dirty map 是设备归属增量日志的合并视图。每次设备集合
+	// 真正发生 0↔1 转换才推进版本；同一设备在一轮广播前反复变化只保留
+	// 最终状态，避免重连风暴按事件数放大集群流量。
+	thingVersion atomic.Uint64
 
 	closed atomic.Bool
 
@@ -190,20 +269,187 @@ type Broker struct {
 	caps  map[string]*Capture
 }
 
+const connIndexShardCount = 256
+
+// thingDirtyRebuildThreshold 是单个分片 drain 后释放哈希桶的门槛。
+//
+// Go map 的 clear 只删键，不缩桶。百万设备同时上线时每个分片约产生四千
+// 条 dirty 记录；若一直 clear，风暴结束后仍永久保留第二套大哈希桶。小批次
+// 继续复用以避免稳态心跳反复分配，大批次则换一张空表让旧桶可被 GC。
+const thingDirtyRebuildThreshold = 1024
+
+// connIndexRebuildThreshold 控制在线索引在大批下线后的缩表。
+// Go map 删除键不会归还 backing buckets；每个分片至少累计这么多删除、且
+// 删除数超过当前存量时才重建，避免稳态少量上下线反复复制整张表。
+const connIndexRebuildThreshold = 1024
+
+type clientIndexShard struct {
+	mu      sync.RWMutex
+	items   map[string]*conn
+	deleted int
+}
+
+type thingIndexShard struct {
+	mu      sync.RWMutex
+	counts  map[string]uint32
+	dirty   map[string]bool
+	deleted int
+}
+
+type certIndexShard struct {
+	mu      sync.RWMutex
+	items   map[meta.CertFingerprint]certOwners
+	deleted int
+}
+
+// certOwners 为“一张证书通常只对应一条在线连接”的常态做内联存储。
+//
+// 旧结构为每个唯一指纹再分配一张 map；百万设备各用独立证书时就是百万张
+// 只有一个元素的小 map。只有同一证书确实并发连接时才升级为 many，降回一条
+// 时再折叠，吊销时仍能枚举全部连接。
+type certOwners struct {
+	one  *conn
+	many map[*conn]struct{}
+}
+
+func (o certOwners) len() int {
+	if o.many != nil {
+		return len(o.many)
+	}
+	if o.one != nil {
+		return 1
+	}
+	return 0
+}
+
+func (o certOwners) appendTo(dst []*conn) []*conn {
+	if o.many != nil {
+		for c := range o.many {
+			dst = append(dst, c)
+		}
+		return dst
+	}
+	if o.one != nil {
+		dst = append(dst, o.one)
+	}
+	return dst
+}
+
+func (b *Broker) initConnIndexes() {
+	for i := 0; i < connIndexShardCount; i++ {
+		b.clients[i].items = make(map[string]*conn)
+		b.things[i].counts = make(map[string]uint32)
+		b.things[i].dirty = make(map[string]bool)
+		b.certs[i].items = make(map[meta.CertFingerprint]certOwners)
+	}
+}
+
+func indexHash(s string) uint8 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return uint8(h)
+}
+
+func (b *Broker) clientShard(clientID string) *clientIndexShard {
+	return &b.clients[indexHash(clientID)]
+}
+
+func (b *Broker) thingShard(thing string) *thingIndexShard {
+	return &b.things[indexHash(thing)]
+}
+
+func (b *Broker) certShard(fp meta.CertFingerprint) *certIndexShard {
+	return &b.certs[fp[0]]
+}
+
+// lockThingNames 按固定分片序加锁，避免 clientId 接管时旧、新 thing 落在
+// 不同分片而形成锁顺序环。返回值只用于逆序解锁。
+func (b *Broker) lockThingNames(a, c string) (first, second *thingIndexShard) {
+	if a == "" && c == "" {
+		return nil, nil
+	}
+	ai, ci := indexHash(a), indexHash(c)
+	if a == "" {
+		ai = ci
+	}
+	if c == "" {
+		ci = ai
+	}
+	if ai == ci {
+		first = &b.things[ai]
+		first.mu.Lock()
+		return first, nil
+	}
+	if ai > ci {
+		ai, ci = ci, ai
+	}
+	first, second = &b.things[ai], &b.things[ci]
+	first.mu.Lock()
+	second.mu.Lock()
+	return first, second
+}
+
+func unlockThingNames(first, second *thingIndexShard) {
+	if second != nil {
+		second.mu.Unlock()
+	}
+	if first != nil {
+		first.mu.Unlock()
+	}
+}
+
+func (b *Broker) allConns() []*conn {
+	var out []*conn
+	for i := range b.clients {
+		shard := &b.clients[i]
+		shard.mu.RLock()
+		for _, c := range shard.items {
+			out = append(out, c)
+		}
+		shard.mu.RUnlock()
+	}
+	return out
+}
+
+func (b *Broker) clientIndexSnapshot() map[string]*conn {
+	out := make(map[string]*conn)
+	for i := range b.clients {
+		shard := &b.clients[i]
+		shard.mu.RLock()
+		for id, c := range shard.items {
+			out[id] = c
+		}
+		shard.mu.RUnlock()
+	}
+	return out
+}
+
 // 默认参数。
 const (
-	defaultOutboundBuffer = 64
+	// 写出池按连接批量排空；32 槽足以吸收一次调度间隙内的短突发。
+	// Runtime 只内联第一槽，第二条并发积压才延迟分配完整环形缓冲；需要
+	// 更深突发容忍度的部署仍可用 broker.outbound_buffer 提高。
+	defaultOutboundBuffer = 32
 	defaultMaxWriteBatch  = 64 * 1024
-	defaultReadBuffer     = 4 * 1024
+	// 绝大多数设备的 CONNECT/PING/ACK 都小于 192 字节；更大的报文由
+	// readPacket 按需倍增到 packet_size 上限。空闲长连接不应为偶发大包
+	// 永久预付 1 KiB。192 B 还使 conn 连同 Go malloc header 留在 512 B 档。
+	defaultReadBuffer     = 192
 	defaultKeepAliveGrace = 1.5
 	defaultWriteTimeout   = 5 * time.Second
+	defaultTCPKeepAlive   = 5 * time.Minute
 
 	// minWriterWorkers 是写出池的协程数下限。
 	//
 	// 不取 1 或 2：一次刷写最长占住一个工作协程 WriteTimeout 那么久
 	// （慢客户端或对端不读），池子太小时少数几个这样的客户端就能让全部
 	// 投递停摆。下限给到 8，使这种拖累需要同时出现八个才开始显形。
-	minWriterWorkers = 8
+	minWriterWorkers           = 8
+	minTLSHandshakeConcurrency = 256
+	maxTLSHandshakeConcurrency = 4096
 )
 
 // defaultWriterWorkers 是写出池的默认协程数。
@@ -220,6 +466,17 @@ func defaultWriterWorkers() int {
 	n := runtime.GOMAXPROCS(0) * 2
 	if n < minWriterWorkers {
 		return minWriterWorkers
+	}
+	return n
+}
+
+func defaultTLSHandshakeConcurrency() int {
+	n := runtime.GOMAXPROCS(0) * 64
+	if n < minTLSHandshakeConcurrency {
+		return minTLSHandshakeConcurrency
+	}
+	if n > maxTLSHandshakeConcurrency {
+		return maxTLSHandshakeConcurrency
 	}
 	return n
 }
@@ -259,6 +516,12 @@ func New(opt Options) (*Broker, error) {
 	if opt.ReadBufferSize <= 0 {
 		opt.ReadBufferSize = defaultReadBuffer
 	}
+	if opt.TCPKeepAlive <= 0 {
+		opt.TCPKeepAlive = defaultTCPKeepAlive
+	}
+	if opt.TLSHandshakeConcurrency <= 0 {
+		opt.TLSHandshakeConcurrency = defaultTLSHandshakeConcurrency()
+	}
 	if opt.KeepAliveGraceFactor <= 0 {
 		opt.KeepAliveGraceFactor = defaultKeepAliveGrace
 	}
@@ -279,16 +542,15 @@ func New(opt Options) (*Broker, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Broker{
-		opt:      opt,
-		writer:   newWriterPool(opt.WriterWorkers, opt.WriteTimeout),
-		byClient: make(map[string]*conn),
-		byCert:   make(map[meta.CertFingerprint]map[*conn]struct{}),
-		cancel:   cancel,
+		opt:    opt,
+		writer: newWriterPool(opt.WriterWorkers, opt.WriteTimeout),
+		cancel: cancel,
 
 		pendingWills: make(map[string]pendingWill),
 		taps:         make(map[string]*Tap),
 		caps:         make(map[string]*Capture),
 	}
+	b.initConnIndexes()
 	b.watchWG.Add(2)
 	go b.watchMeta(ctx)
 	go b.watchEvictions(ctx)
@@ -309,12 +571,7 @@ func (b *Broker) Close() error {
 	b.cancel()
 	b.watchWG.Wait()
 
-	b.mu.Lock()
-	conns := make([]*conn, 0, len(b.byClient))
-	for _, c := range b.byClient {
-		conns = append(conns, c)
-	}
-	b.mu.Unlock()
+	conns := b.allConns()
 	for _, c := range conns {
 		c.evict(reason.ServerShuttingDown, cluster.EvictAdministrative)
 	}
@@ -365,9 +622,7 @@ func (b *Broker) watchEvictions(ctx context.Context) {
 			if !ok {
 				return
 			}
-			b.mu.RLock()
-			c := b.byClient[ev.ClientID]
-			b.mu.RUnlock()
+			c := b.lookup(ev.ClientID)
 			// 只断开持有被驱逐 epoch 的那个连接：若索引里已是新连接，
 			// 说明抢占已完成，不能把新连接误断。
 			if c != nil && c.epoch == ev.PrevEpoch {
@@ -383,13 +638,11 @@ func (b *Broker) watchEvictions(ctx context.Context) {
 
 // kickByCert 断开全部在用某证书的连接。
 func (b *Broker) kickByCert(fp meta.CertFingerprint, why string) int {
-	b.mu.RLock()
-	set := b.byCert[fp]
-	victims := make([]*conn, 0, len(set))
-	for c := range set {
-		victims = append(victims, c)
-	}
-	b.mu.RUnlock()
+	shard := b.certShard(fp)
+	shard.mu.RLock()
+	owners := shard.items[fp]
+	victims := owners.appendTo(make([]*conn, 0, owners.len()))
+	shard.mu.RUnlock()
 
 	for _, c := range victims {
 		c.emitMetaKick(fp, why)
@@ -403,25 +656,18 @@ func (b *Broker) kickByCert(fp meta.CertFingerprint, why string) int {
 // 供集群的归属通告使用（CLU-075）：设备域主题不进全局订阅表，它们的
 // 路由靠这张表（ARCH-017 的性能杠杆）。
 //
-// 返回全量快照而不是增量：通告是幂等的，丢一次或乱序都不会让归属表
-// 永久偏离。设备数很大时这份切片会很大——到那一步要换成摘要
-// （ARCH-047 把编码留作可延后的实现细节）。
+// 这是管理面全量视图；集群稳态通告走 DrainThingChanges 的版本增量。
+// 新对端、进程重启或增量断档时由 ThingSnapshot 产生与版本原子对应的
+// 精确快照，不使用这个非原子遍历结果修复归属表。
 func (b *Broker) LocalThings() []string {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	out := make([]string, 0, len(b.byClient))
-	seen := make(map[string]bool, len(b.byClient))
-	for _, c := range b.byClient {
-		name := c.princ.Thing
-		if name == "" {
-			// 没绑设备的连接（控制台测试客户端、未绑定证书）
-			// 不参与设备域路由。
-			continue
+	var out []string
+	for i := range b.things {
+		shard := &b.things[i]
+		shard.mu.RLock()
+		for thing := range shard.counts {
+			out = append(out, thing)
 		}
-		if !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
+		shard.mu.RUnlock()
 	}
 	return out
 }
@@ -431,21 +677,132 @@ func (b *Broker) LocalThings() []string {
 // 参数是 []byte：它来自主题分类的结果，转成 string 会在路由路径上
 // 分配一次（LANG-007）。
 func (b *Broker) HoldsThing(thing []byte) bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	for _, c := range b.byClient {
-		if c.princ.Thing == string(thing) {
-			return true
+	name := string(thing)
+	shard := b.thingShard(name)
+	shard.mu.RLock()
+	ok := shard.counts[name] > 0
+	shard.mu.RUnlock()
+	return ok
+}
+
+// addThingLocked / removeThingLocked 维护设备索引。调用方必须持有对应分片写锁。
+func (b *Broker) addThingLocked(shard *thingIndexShard, thing string) {
+	if thing == "" {
+		return
+	}
+	if shard.counts[thing] == 0 {
+		b.recordThingLocked(shard, thing, true)
+	}
+	shard.counts[thing]++
+}
+
+func (b *Broker) removeThingLocked(shard *thingIndexShard, thing string) {
+	if thing == "" {
+		return
+	}
+	n := shard.counts[thing]
+	if n == 0 {
+		return
+	}
+	if n == 1 {
+		delete(shard.counts, thing)
+		shard.deleted++
+		b.recordThingLocked(shard, thing, false)
+		shard.compactIfNeeded()
+		return
+	}
+	shard.counts[thing] = n - 1
+}
+
+func (s *clientIndexShard) compactIfNeeded() {
+	if s.deleted < connIndexRebuildThreshold || s.deleted <= len(s.items) {
+		return
+	}
+	items := make(map[string]*conn, len(s.items))
+	for id, c := range s.items {
+		items[id] = c
+	}
+	s.items = items
+	s.deleted = 0
+}
+
+func (s *thingIndexShard) compactIfNeeded() {
+	if s.deleted < connIndexRebuildThreshold || s.deleted <= len(s.counts) {
+		return
+	}
+	counts := make(map[string]uint32, len(s.counts))
+	for thing, n := range s.counts {
+		counts[thing] = n
+	}
+	s.counts = counts
+	s.deleted = 0
+}
+
+func (s *certIndexShard) removedKey() {
+	s.deleted++
+	if s.deleted < connIndexRebuildThreshold || s.deleted <= len(s.items) {
+		return
+	}
+	items := make(map[meta.CertFingerprint]certOwners, len(s.items))
+	for fp, owners := range s.items {
+		items[fp] = owners
+	}
+	s.items = items
+	s.deleted = 0
+}
+
+func (b *Broker) recordThingLocked(shard *thingIndexShard, thing string, present bool) {
+	b.thingVersion.Add(1)
+	shard.dirty[thing] = present
+}
+
+// DrainThingChanges 取走自上次调用以来的设备归属变化。版本与变化在同一把
+// 锁下截取，因此调用方可以把上次版本到返回版本作为一个连续增量批次。
+func (b *Broker) DrainThingChanges() (uint64, []cluster.ThingChange) {
+	for i := range b.things {
+		b.things[i].mu.Lock()
+	}
+	version := b.thingVersion.Load()
+	var changes []cluster.ThingChange
+	for i := range b.things {
+		shard := &b.things[i]
+		for name, present := range shard.dirty {
+			changes = append(changes, cluster.ThingChange{Name: name, Present: present})
+		}
+		if len(shard.dirty) >= thingDirtyRebuildThreshold {
+			shard.dirty = make(map[string]bool)
+		} else {
+			clear(shard.dirty)
 		}
 	}
-	return false
+	for i := len(b.things) - 1; i >= 0; i-- {
+		b.things[i].mu.Unlock()
+	}
+	return version, changes
+}
+
+// ThingSnapshot 返回与版本原子对应的设备归属全量快照，只用于新节点和
+// 增量断档修复，不进入周期广播。
+func (b *Broker) ThingSnapshot() (uint64, []string) {
+	for i := range b.things {
+		b.things[i].mu.RLock()
+	}
+	version := b.thingVersion.Load()
+	var out []string
+	for i := range b.things {
+		for thing := range b.things[i].counts {
+			out = append(out, thing)
+		}
+	}
+	for i := len(b.things) - 1; i >= 0; i-- {
+		b.things[i].mu.RUnlock()
+	}
+	return version, out
 }
 
 // KickClient 按 clientId 断开连接，供运维与 Admin API 使用。
 func (b *Broker) KickClient(clientID string, rc reason.Code) bool {
-	b.mu.RLock()
-	c := b.byClient[clientID]
-	b.mu.RUnlock()
+	c := b.lookup(clientID)
 	if c == nil {
 		return false
 	}
@@ -457,20 +814,47 @@ func (b *Broker) KickClient(clientID string, rc reason.Code) bool {
 //
 // 接管发生在索引对投递可见之前。顺序反了的话，新连接刚记下的在途消息
 // 会被旧连接的快照盖掉，或者旧连接在快照之后又收进一条再也没人归还的额度。
-// 快照要等正在进行的投递放开运行时的锁，所以整段放在索引锁里。
+// 快照要等正在进行的投递放开运行时的锁，所以整段放在该
+// clientId 的分片锁里。固定顺序是 client → thing（分片号升序）→ cert。
 func (b *Broker) register(c *conn) (prev *conn, adopted bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	prev = b.byClient[c.clientID]
+	clientID := c.clientID()
+	clients := b.clientShard(clientID)
+	clients.mu.Lock()
+	defer clients.mu.Unlock()
+	prev = clients.items[clientID]
 	adopted = c.adoptLive(prev)
-	b.byClient[c.clientID] = c
+	oldThing := ""
+	if prev != nil && prev != c {
+		oldThing = prev.princ.AuthzCtx.Thing
+	}
+	thing := c.princ.AuthzCtx.Thing
+	firstThing, secondThing := b.lockThingNames(oldThing, thing)
+	defer unlockThingNames(firstThing, secondThing)
+	var certs *certIndexShard
 	if c.princ.HasFP {
-		set := b.byCert[c.princ.CertFP]
-		if set == nil {
-			set = make(map[*conn]struct{})
-			b.byCert[c.princ.CertFP] = set
+		certs = b.certShard(c.princ.CertFP)
+		certs.mu.Lock()
+		defer certs.mu.Unlock()
+	}
+	if oldThing != "" && oldThing != thing {
+		b.removeThingLocked(b.thingShard(oldThing), oldThing)
+	}
+	clients.items[clientID] = c
+	if prev == nil || (prev != c && oldThing != thing) {
+		b.addThingLocked(b.thingShard(thing), thing)
+	}
+	if c.princ.HasFP {
+		owners := certs.items[c.princ.CertFP]
+		switch {
+		case owners.many != nil:
+			owners.many[c] = struct{}{}
+		case owners.one == nil:
+			owners.one = c
+		case owners.one != c:
+			owners.many = map[*conn]struct{}{owners.one: {}, c: {}}
+			owners.one = nil
 		}
-		set[c] = struct{}{}
+		certs.items[c.princ.CertFP] = owners
 	}
 	return prev, adopted
 }
@@ -480,16 +864,53 @@ func (b *Broker) register(c *conn) (prev *conn, adopted bool) {
 // 只在索引中仍指向本连接时才删除：抢占发生后索引已指向新连接，
 // 旧连接的清理不能把新连接从索引里抹掉。
 func (b *Broker) unregister(c *conn) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if cur, ok := b.byClient[c.clientID]; ok && cur == c {
-		delete(b.byClient, c.clientID)
+	clientID := c.clientID()
+	clients := b.clientShard(clientID)
+	clients.mu.Lock()
+	defer clients.mu.Unlock()
+	cur, current := clients.items[clientID]
+	current = current && cur == c
+	var things *thingIndexShard
+	thing := c.princ.AuthzCtx.Thing
+	if current && thing != "" {
+		things = b.thingShard(thing)
+		things.mu.Lock()
+		defer things.mu.Unlock()
+	}
+	var certs *certIndexShard
+	if c.princ.HasFP {
+		certs = b.certShard(c.princ.CertFP)
+		certs.mu.Lock()
+		defer certs.mu.Unlock()
+	}
+	if current {
+		delete(clients.items, clientID)
+		clients.deleted++
+		clients.compactIfNeeded()
+		b.removeThingLocked(things, thing)
 	}
 	if c.princ.HasFP {
-		if set := b.byCert[c.princ.CertFP]; set != nil {
-			delete(set, c)
-			if len(set) == 0 {
-				delete(b.byCert, c.princ.CertFP)
+		owners, ok := certs.items[c.princ.CertFP]
+		if ok {
+			if owners.many == nil {
+				if owners.one == c {
+					delete(certs.items, c.princ.CertFP)
+					certs.removedKey()
+				}
+			} else {
+				delete(owners.many, c)
+				switch len(owners.many) {
+				case 0:
+					delete(certs.items, c.princ.CertFP)
+					certs.removedKey()
+				case 1:
+					for remaining := range owners.many {
+						owners = certOwners{one: remaining}
+					}
+					certs.items[c.princ.CertFP] = owners
+				default:
+					certs.items[c.princ.CertFP] = owners
+				}
 			}
 		}
 	}
@@ -497,9 +918,11 @@ func (b *Broker) unregister(c *conn) {
 
 // lookup 按 clientId 查连接。
 func (b *Broker) lookup(clientID string) *conn {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.byClient[clientID]
+	shard := b.clientShard(clientID)
+	shard.mu.RLock()
+	c := shard.items[clientID]
+	shard.mu.RUnlock()
+	return c
 }
 
 // Serve 在一个连接上提供服务，直到连接关闭或出错。
@@ -514,6 +937,31 @@ func (b *Broker) Serve(ctx context.Context, nc net.Conn, info ConnInfo) error {
 	b.conns.Add(1)
 	defer b.conns.Add(-1)
 	return c.serve(ctx)
+}
+
+// serveHandoff 供 Listener 把 CONNECT 后的稳态读循环交给新 goroutine。
+// launch 必须在返回前取得运行函数的所有权；Listener 用自己的 WaitGroup
+// 包装它，使 StopAccepting → Broker.Close → Listener.Close 的等待语义不变。
+func (b *Broker) serveHandoff(ctx context.Context, nc net.Conn, info ConnInfo,
+	launch func(run func()),
+) error {
+	if b.closed.Load() {
+		_ = nc.Close()
+		return ErrClosed
+	}
+	c := newConn(b, nc, info)
+	b.conns.Add(1)
+	if err := c.serveConnect(ctx); err != nil {
+		c.cleanup()
+		b.conns.Add(-1)
+		return err
+	}
+	launch(func() {
+		defer b.conns.Add(-1)
+		defer c.cleanup()
+		_ = c.serveEstablished(ctx)
+	})
+	return nil
 }
 
 // Stats 是 broker 的运行指标。
@@ -612,9 +1060,9 @@ func (b *Broker) ListConns(q ConnQuery) ([]ConnSnapshot, string) {
 
 	// 在锁内只收集 clientId，不构造快照：构造要读每个连接的多个字段，
 	// 在锁内做会把一次列举的耗时加到所有新连接的建立路径上。
-	b.mu.RLock()
-	ids := make([]string, 0, len(b.byClient))
-	for id := range b.byClient {
+	indexed := b.clientIndexSnapshot()
+	ids := make([]string, 0, len(indexed))
+	for id := range indexed {
 		if q.Thing == "" && !hasPrefix(id, q.ClientIDPrefix) {
 			continue
 		}
@@ -623,16 +1071,13 @@ func (b *Broker) ListConns(q ConnQuery) ([]ConnSnapshot, string) {
 		}
 		ids = append(ids, id)
 	}
-	b.mu.RUnlock()
 
 	sortStrings(ids)
 
 	out := make([]ConnSnapshot, 0, q.Limit)
 	next := ""
 	for _, id := range ids {
-		b.mu.RLock()
-		c := b.byClient[id]
-		b.mu.RUnlock()
+		c := b.lookup(id)
 		if c == nil {
 			continue // 列举期间断开了，跳过
 		}
@@ -651,9 +1096,7 @@ func (b *Broker) ListConns(q ConnQuery) ([]ConnSnapshot, string) {
 
 // GetConn 返回一条连接的详情。
 func (b *Broker) GetConn(clientID string) (ConnSnapshot, bool) {
-	b.mu.RLock()
-	c := b.byClient[clientID]
-	b.mu.RUnlock()
+	c := b.lookup(clientID)
 	if c == nil {
 		return ConnSnapshot{}, false
 	}
@@ -691,9 +1134,7 @@ type ConnDetail struct {
 // 订阅和在途都从会话运行时的快照读。那份快照自己加锁，
 // 管理面协程不去碰连接的读缓冲和编码缓冲。
 func (b *Broker) ConnDetail(clientID string) (ConnDetail, bool) {
-	b.mu.RLock()
-	c := b.byClient[clientID]
-	b.mu.RUnlock()
+	c := b.lookup(clientID)
 	if c == nil {
 		return ConnDetail{}, false
 	}
@@ -733,14 +1174,14 @@ func inflightState(st session.InflightState) string {
 // snapshot 构造连接的运维视图。
 func (c *conn) snapshot() ConnSnapshot {
 	s := ConnSnapshot{
-		ClientID:          c.clientID,
-		Thing:             c.princ.Thing,
+		ClientID:          c.clientID(),
+		Thing:             c.princ.AuthzCtx.Thing,
 		ProtoVer:          uint8(c.ver),
-		Remote:            c.info.Remote.String(),
+		Remote:            c.remote().String(),
 		ConnectedAtUnixMs: c.connectedAtMs,
-		KeepAliveMs:       c.keepAliveMs,
+		KeepAliveMs:       int64(c.keepAliveMs),
 		TLSVersion:        c.info.TLSVersion,
-		ALPN:              c.info.ALPN,
+		ALPN:              c.alpn(),
 		AuthMethod:        c.princ.AuthMethod.String(),
 		Epoch:             uint64(c.epoch),
 	}

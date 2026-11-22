@@ -82,6 +82,104 @@ func TestSwapKVRestoreKeepsOldDatabaseOnBadStream(t *testing.T) {
 	}
 }
 
+func filteredShardKey(key []byte) bool {
+	return len(key) > 0 && (key[0] == byte(PrefixSession) || key[0] == byte(PrefixShadow))
+}
+
+func TestFilteredSnapshotRestorePreservesShardKeyspaces(t *testing.T) {
+	src, err := OpenSwappable(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = src.Close() }()
+	_ = src.Set(Key(PrefixThing, "new-meta"), []byte("new"), true)
+	_ = src.Set(Key(PrefixSession, "source-session"), []byte("must-not-travel"), true)
+	_ = src.Set(Key(PrefixShadow, "source-shadow", ""), []byte("must-not-travel"), true)
+	var snap bytes.Buffer
+	if _, err := src.SnapshotFiltered(&snap, filteredShardKey); err != nil {
+		t.Fatal(err)
+	}
+
+	dst, err := OpenSwappable(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dst.Close() }()
+	_ = dst.Set(Key(PrefixThing, "old-meta"), []byte("old"), true)
+	_ = dst.Set(Key(PrefixSession, "local-session"), []byte("keep"), true)
+	_ = dst.Set(Key(PrefixShadow, "local-shadow", ""), []byte("keep"), true)
+	if err := dst.RestoreFiltered(bytes.NewReader(snap.Bytes()), filteredShardKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Get(Key(PrefixThing, "old-meta")); !errors.Is(err, ErrNotFound) {
+		t.Fatal("stale metadata survived filtered restore")
+	}
+	if got, err := dst.Get(Key(PrefixThing, "new-meta")); err != nil || string(got) != "new" {
+		t.Fatalf("new metadata = %q, %v", got, err)
+	}
+	for _, key := range [][]byte{Key(PrefixSession, "local-session"), Key(PrefixShadow, "local-shadow", "")} {
+		if got, err := dst.Get(key); err != nil || string(got) != "keep" {
+			t.Fatalf("local shard key %x = %q, %v", key, got, err)
+		}
+	}
+	for _, key := range [][]byte{Key(PrefixSession, "source-session"), Key(PrefixShadow, "source-shadow", "")} {
+		if _, err := dst.Get(key); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("source shard key %x leaked through metadata snapshot", key)
+		}
+	}
+}
+
+func TestFilteredRestoreAcceptsLegacyWholeBoltSnapshotWithoutOverwritingShards(t *testing.T) {
+	src, err := OpenSwappable(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = src.Close() }()
+	_ = src.Set(Key(PrefixThing, "meta"), []byte("new"), true)
+	_ = src.Set(Key(PrefixSession, "session"), []byte("foreign"), true)
+	var legacy bytes.Buffer
+	if _, err := src.Snapshot(&legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	dst, err := OpenSwappable(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dst.Close() }()
+	_ = dst.Set(Key(PrefixSession, "session"), []byte("local"), true)
+	if err := dst.RestoreFiltered(bytes.NewReader(legacy.Bytes()), filteredShardKey); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := dst.Get(Key(PrefixSession, "session")); err != nil || string(got) != "local" {
+		t.Fatalf("legacy restore overwrote local shard: %q, %v", got, err)
+	}
+	if got, err := dst.Get(Key(PrefixThing, "meta")); err != nil || string(got) != "new" {
+		t.Fatalf("legacy metadata not restored: %q, %v", got, err)
+	}
+}
+
+func TestFilteredRestoreRejectsShardKeyAndRollsBack(t *testing.T) {
+	dst, err := OpenSwappable(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dst.Close() }()
+	metaKey := Key(PrefixThing, "before")
+	_ = dst.Set(metaKey, []byte("keep-on-error"), true)
+	var bad bytes.Buffer
+	bad.Write(filteredSnapshotMagic)
+	if err := writeKV(&bad, Key(PrefixSession, "smuggled"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.RestoreFiltered(&bad, filteredShardKey); err == nil {
+		t.Fatal("logical metadata snapshot accepted a shard key")
+	}
+	if got, err := dst.Get(metaKey); err != nil || string(got) != "keep-on-error" {
+		t.Fatalf("failed restore did not roll back: %q, %v", got, err)
+	}
+}
+
 type failingReader struct {
 	after int
 	n     int

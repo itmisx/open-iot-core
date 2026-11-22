@@ -124,6 +124,101 @@ func (m *MemKV) Batch(ops []Op, _ bool) error {
 	return nil
 }
 
+// memTx 在内存实现上提供事务语义。
+//
+// 做法是"覆盖层 + 整批落地"：写先进 pending，读先查 pending 再回落到
+// 主表，fn 返回错误时直接丢掉 pending。不直接改主表是因为 InTx 的约定
+// 是出错回滚——而回滚一张 map 要么留快照要么留日志，覆盖层是两者里更
+// 便宜的那个（它的大小是这一批的写入数，而不是全库）。
+type memTx struct {
+	m       *MemKV
+	pending map[string][]byte // nil 值表示这个键在本事务内被删了
+}
+
+func (t *memTx) Get(key []byte) ([]byte, error) {
+	if v, ok := t.pending[string(key)]; ok {
+		if v == nil {
+			return nil, ErrNotFound
+		}
+		return append([]byte(nil), v...), nil
+	}
+	v, ok := t.m.data[string(key)]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return append([]byte(nil), v...), nil
+}
+
+func (t *memTx) Set(key, value []byte) error {
+	t.pending[string(key)] = append([]byte(nil), value...)
+	return nil
+}
+
+func (t *memTx) Delete(key []byte) error {
+	t.pending[string(key)] = nil
+	return nil
+}
+
+func (t *memTx) Scan(prefix []byte, fn func(key, value []byte) bool) error {
+	// 把主表与覆盖层合起来再排序：Scan 的约定是**升序**，而遍历两张
+	// map 的顺序是随机的。会话的入队序号就是靠升序扫出来的（取最后
+	// 一条的序号加一），顺序错了就是撞号。
+	merged := make(map[string][]byte, len(t.m.data)+len(t.pending))
+	for k, v := range t.m.data {
+		if bytes.HasPrefix([]byte(k), prefix) {
+			merged[k] = v
+		}
+	}
+	for k, v := range t.pending {
+		if !bytes.HasPrefix([]byte(k), prefix) {
+			continue
+		}
+		if v == nil {
+			delete(merged, k)
+			continue
+		}
+		merged[k] = v
+	}
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if !fn([]byte(k), merged[k]) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MemKV) InTx(_ bool, fn func(Tx) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	tx := &memTx{m: m, pending: map[string][]byte{}}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	for k, v := range tx.pending {
+		if v == nil {
+			delete(m.data, k)
+			continue
+		}
+		m.data[k] = v
+	}
+	return nil
+}
+
+// PruneMarked 与持久实现保持同样的原子语义，主要用于测试和无状态部署。
+func (m *MemKV) PruneMarked(prefix, marker []byte,
+	remove func(key []byte) (bool, error),
+) (int, bool, error) {
+	return pruneMarkedTx(m, prefix, marker, remove)
+}
+
 func (m *MemKV) Flush() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

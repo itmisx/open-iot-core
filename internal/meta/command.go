@@ -17,12 +17,25 @@ const (
 	// CmdSetAttrSlots 设定被策略引用的属性名清单。
 	// 热视图只物化这些属性，其余留在冷层（见 thingHot）。
 	CmdSetAttrSlots
+	// CmdSetThings 在一条日志里原子地写入一批设备。它只用于有界的控制面
+	// 批量开通，避免百万设备产生百万条 Raft 日志。
+	CmdSetThings
 )
 
 var cmdKindName = [...]string{
 	"Nop", "SetCert", "DeleteCert", "SetThing", "DeleteThing",
 	"SetPolicySet", "DeletePolicySet", "SetAttrSlots",
+	"SetThings",
 }
+
+// MaxThingsPerCommand 限制一条复制日志里的设备数，防止管理面用超大请求
+// 阻塞 Raft apply 与快照。512 台时日志仍是亚 MB 量级。
+const MaxThingsPerCommand = 512
+
+// MaxSetThingsCommandBytes 是批量设备命令的线上编码上限。条数上限挡不住
+// 设备属性很大的批次；把日志限制在 2 MiB 内，避免单条提案长期占用
+// Raft 复制与 apply 循环。
+const MaxSetThingsCommandBytes = 2 << 20
 
 func (k CmdKind) String() string {
 	if int(k) >= len(cmdKindName) {
@@ -106,6 +119,7 @@ type Command struct {
 
 	Cert      *CertCmd
 	Thing     *ThingCmd
+	Things    []ThingCmd
 	Policy    *PolicyCmd
 	AttrSlots []string
 
@@ -159,6 +173,32 @@ func (c *Command) Validate() error {
 	case CmdSetThing:
 		if c.Thing == nil || c.Thing.Name == "" {
 			return errors.New("meta: SetThing 缺少设备名")
+		}
+		return nil
+	case CmdSetThings:
+		if len(c.Things) == 0 {
+			return errors.New("meta: SetThings 缺少设备")
+		}
+		if len(c.Things) > MaxThingsPerCommand {
+			return errors.New("meta: SetThings 设备数超出上限")
+		}
+		seen := make(map[string]struct{}, len(c.Things))
+		for i := range c.Things {
+			name := c.Things[i].Name
+			if name == "" {
+				return errors.New("meta: SetThings 含空设备名")
+			}
+			if _, ok := seen[name]; ok {
+				return errors.New("meta: SetThings 含重复设备名")
+			}
+			seen[name] = struct{}{}
+		}
+		raw, err := EncodeCommand(*c)
+		if err != nil {
+			return err
+		}
+		if len(raw) > MaxSetThingsCommandBytes {
+			return errors.New("meta: SetThings 编码大小超出上限")
 		}
 		return nil
 	case CmdDeleteThing:
@@ -247,4 +287,13 @@ func (c *Change) RequiresDisconnect() bool {
 	default:
 		return false
 	}
+}
+
+// needsPersist 报告这条命令是否要往冷层或影子写东西。
+//
+// 单机写入只有这一类才进合批：不带记录也不带影子的命令只重建热视图，
+// 对它们开写事务既没有收益，又会在启动期重放冷层时撞上 bbolt 的 mmaplock
+// （见 LocalStore.Apply 的说明）。
+func (c Command) needsPersist() bool {
+	return len(c.Records) > 0 || len(c.Shadow) > 0
 }

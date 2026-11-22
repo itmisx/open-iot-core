@@ -47,7 +47,7 @@ func (c *conn) handleSubscribe(sp *packet.Subscribe) error {
 			continue
 		}
 		sub := router.Subscription{
-			ClientID:       c.clientID,
+			ClientID:       c.clientID(),
 			Filter:         filter,
 			QoS:            uint8(f.QoS),
 			NoLocal:        f.NoLocal,
@@ -102,13 +102,13 @@ func (c *conn) grantSubscription(ctx context.Context, filter string, f packet.Su
 	share, inner := splitShared(filter)
 	acquiredConn := false
 	if !c.rt.HasSubscription(inner, share) {
-		if !c.b.opt.Limiter.Acquire(quota.SubsPerConn, c.clientID, 1) {
-			c.emitQuota(quota.SubsPerConn, c.clientID)
+		if !c.b.opt.Limiter.Acquire(quota.SubsPerConn, c.clientID(), 1) {
+			c.emitQuota(quota.SubsPerConn, c.clientID())
 			return reason.QuotaExceeded
 		}
 		acquiredConn = true
 	}
-	if !c.b.opt.Router.Has(c.clientID, filter) {
+	if !c.b.opt.Router.Has(c.clientID(), filter) {
 		// Subscriptions 是计数型配额，须用 Acquire 而非 AllowGlobal。
 		//
 		// 这里曾经用错：AllowGlobal 只处理速率型，对计数型一律拒绝并计数。
@@ -116,7 +116,7 @@ func (c *conn) grantSubscription(ctx context.Context, filter string, f packet.Su
 		// 而不是悄悄把配额放宽 N 倍。
 		if !c.b.opt.Limiter.Acquire(quota.Subscriptions, "", 1) {
 			if acquiredConn {
-				c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID, 1)
+				c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID(), 1)
 			}
 			c.emitQuota(quota.Subscriptions, "")
 			return reason.QuotaExceeded
@@ -146,7 +146,7 @@ func (c *conn) recordSubscription(sub router.Subscription) {
 			c.b.opt.Limiter.Release(quota.Subscriptions, "", 1)
 		}
 		if !c.rt.HasSubscription(inner, share) {
-			c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID, 1)
+			c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID(), 1)
 		}
 		return
 	}
@@ -172,7 +172,7 @@ func (c *conn) sendRetained(sub router.Subscription) {
 		if !c.allowed(authz.ActReceive, m.Topic) {
 			continue
 		}
-		ref := router.SubRef{ClientID: c.clientID, QoS: sub.QoS, ID: sub.ID}
+		ref := router.SubRef{ClientID: c.clientID(), QoS: sub.QoS, ID: sub.ID}
 		c.deliverRetained(m, ref)
 	}
 }
@@ -182,7 +182,7 @@ func (c *conn) handleUnsubscribe(up *packet.Unsubscribe) error {
 	ack := &packet.Unsuback{PacketID: up.PacketID}
 	for _, f := range up.Filters {
 		filter := string(f)
-		removed := c.b.opt.Router.Unsubscribe(c.clientID, filter)
+		removed := c.b.opt.Router.Unsubscribe(c.clientID(), filter)
 		share, inner := splitShared(filter)
 		inSession, _ := c.rt.Unsubscribe(c.epoch, inner, share)
 		// 两份额度各跟各的权威，不能共用一个条件。
@@ -195,7 +195,7 @@ func (c *conn) handleUnsubscribe(up *packet.Unsubscribe) error {
 		// 这条是确定性模拟定位的：它每一步都在查"全局额度是否等于
 		// 路由表订阅数"，分叉的那一步就是这里。
 		if inSession {
-			c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID, 1)
+			c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID(), 1)
 		}
 		if removed {
 			c.b.opt.Limiter.Release(quota.Subscriptions, "", 1)
@@ -218,12 +218,12 @@ func (c *conn) handlePublish(pp *packet.Publish) error {
 		c.close(reason.PacketTooLarge, cluster.EvictAdministrative)
 		return reason.Errorf(reason.PacketTooLarge, "负载超出上限")
 	}
-	if !c.b.opt.Limiter.AllowLocal(quota.PublishRatePerConn, c.clientID, 1) {
-		c.emitQuota(quota.PublishRatePerConn, c.clientID)
+	if !c.b.opt.Limiter.AllowLocal(quota.PublishRatePerConn, c.clientID(), 1) {
+		c.emitQuota(quota.PublishRatePerConn, c.clientID())
 		return c.rejectPublish(pp, reason.QuotaExceeded)
 	}
-	if !c.b.opt.Limiter.AllowLocal(quota.ThroughputPerConn, c.clientID, len(pp.Payload)) {
-		c.emitQuota(quota.ThroughputPerConn, c.clientID)
+	if !c.b.opt.Limiter.AllowLocal(quota.ThroughputPerConn, c.clientID(), len(pp.Payload)) {
+		c.emitQuota(quota.ThroughputPerConn, c.clientID())
 		return c.rejectPublish(pp, reason.QuotaExceeded)
 	}
 	if !c.b.opt.Limiter.AllowGlobal(ctx, quota.InboundPublishRate, "", 1) {
@@ -308,7 +308,7 @@ func (c *conn) serveReserved(ctx context.Context, name string, payload []byte) {
 	}
 	msgs, ok := svc.HandleReserved(ctx, ReservedRequest{
 		Topic: name, Payload: payload,
-		ClientID: c.clientID, Thing: c.princ.Thing,
+		ClientID: c.clientID(), Thing: c.princ.AuthzCtx.Thing,
 	})
 	if !ok {
 		return
@@ -356,7 +356,7 @@ func (b *Broker) route(from *conn, msg *router.Message, pp *packet.Publish) int 
 		// from 为 nil 表示消息由平台自己发布（Shadow 的响应、
 		// 经 REST 触发的更新通知、遗嘱消息）。这类消息没有"发布者"，
 		// 因此 No Local 不适用——漏掉这个判断会在平台发布时解引用空指针。
-		if from != nil && ref.NoLocal && ref.ClientID == from.clientID {
+		if from != nil && ref.NoLocal && ref.ClientID == from.clientID() {
 			continue
 		}
 		if b.deliverTo(ref, msg) {

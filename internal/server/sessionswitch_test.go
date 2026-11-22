@@ -22,6 +22,18 @@ type recordingProposer struct {
 	index uint64
 }
 
+type remoteRecordingProposer struct {
+	*recordingProposer
+	reads int
+	err   error
+}
+
+func (p *remoteRecordingProposer) HasLocalReplica(string) bool { return false }
+func (p *remoteRecordingProposer) ReadSession(string) ([]byte, bool, error) {
+	p.reads++
+	return nil, false, p.err
+}
+
 func (p *recordingProposer) ShardOf(string) uint64 { return 16 }
 
 func (p *recordingProposer) ShardIDs() []uint64 { return []uint64{16} }
@@ -103,5 +115,23 @@ func TestSessionSwitchRoutesWritesThroughTheShardLog(t *testing.T) {
 	}
 	if err := sw.Delete(ctx, "dev-1", 9); !errors.Is(err, cluster.ErrStaleEpoch) {
 		t.Fatalf("非当前 epoch 的删除应回 ErrStaleEpoch，得到 %v", err)
+	}
+}
+
+func TestSessionSwitchRoutesNonReplicaLoadThroughClusterReader(t *testing.T) {
+	local := store.NewSessionStore(store.NewMemKV())
+	sw := newSessionSwitch(local)
+	wantErr := errors.New("remote session read reached")
+	prop := &remoteRecordingProposer{
+		recordingProposer: &recordingProposer{local: local},
+		err:               wantErr,
+	}
+	sw.use(store.NewReplicatedSessionStore(local, prop))
+
+	if _, _, err := sw.Load(context.Background(), "remote-dev"); !errors.Is(err, wantErr) {
+		t.Fatalf("Load 错误 = %v，期望远程 reader 的 %v", err, wantErr)
+	}
+	if prop.reads != 1 {
+		t.Fatalf("远程读取次数 = %d，期望 1", prop.reads)
 	}
 }

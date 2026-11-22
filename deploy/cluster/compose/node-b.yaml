@@ -18,6 +18,8 @@ cluster:
     key_file: /etc/openiotd/pki/node-b.key
     ca_file: /etc/openiotd/pki/ca.pem
     pump_interval: 200ms
+    shadow_shards: 8
+    shadow_replication_factor: 3
     # 初始成员。拨号用的名字就是 compose 的服务名；复制层不按主机名
     # 校验对端，身份按证书的 CommonName 认（CLU-069、CLU-102），
     # 所以 gen-certs.sh 不为拨号用的名字另签 SAN（CLU-103）。
@@ -40,6 +42,7 @@ listeners:
     enabled: true
     addr: 0.0.0.0:8883
     require_client_cert: true
+    session_ticket_keys_file: /etc/openiotd/pki/session-ticket.keys
   admin:
     enabled: true
     addr: 0.0.0.0:9090

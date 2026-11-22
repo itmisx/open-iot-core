@@ -4,16 +4,53 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/itmisx/open-iot-core/internal/config"
 	"github.com/itmisx/open-iot-core/internal/node"
 	"github.com/itmisx/open-iot-core/internal/pki"
 )
+
+// LoadSessionTicketKeys 读取集群共享的 TLS session ticket 密钥环。
+// 第一行是当前签发密钥，后续行仅用于解开轮换前的 ticket。
+func LoadSessionTicketKeys(path string) ([][32]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取 TLS session ticket 密钥 %s 失败: %w", path, err)
+	}
+	var out [][32]byte
+	seen := make(map[[32]byte]struct{})
+	for lineNo, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		raw, derr := hex.DecodeString(line)
+		if derr != nil || len(raw) != 32 {
+			return nil, fmt.Errorf("%s:%d: ticket 密钥必须是 64 位十六进制", path, lineNo+1)
+		}
+		var key [32]byte
+		copy(key[:], raw)
+		if _, exists := seen[key]; exists {
+			return nil, fmt.Errorf("%s:%d: ticket 密钥重复", path, lineNo+1)
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+		if len(out) > 8 {
+			return nil, fmt.Errorf("%s: ticket 密钥最多保留 8 把", path)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s: 没有可用的 TLS session ticket 密钥", path)
+	}
+	return out, nil
+}
 
 // PKI 文件名。
 const (

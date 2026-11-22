@@ -64,6 +64,33 @@ func TestShadowStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestShadowStoreApplyTxSeesEarlierBatchWrite(t *testing.T) {
+	kv := NewMemKV()
+	defer func() { _ = kv.Close() }()
+	s := NewShadowStore(kv)
+	err := kv.InTx(true, func(tx Tx) error {
+		first, err := s.ApplyTx(tx, upd("d1", "", patch(t, `{"reported":{"a":1}}`)))
+		if err != nil {
+			return err
+		}
+		second, err := s.ApplyTx(tx, upd("d1", "", patch(t, `{"reported":{"b":2}}`)))
+		if err != nil {
+			return err
+		}
+		if first.Version != 1 || second.Version != 2 {
+			t.Fatalf("批内版本 = %d,%d，期望 1,2", first.Version, second.Version)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, ok := s.Get("d1", "")
+	if !ok || doc.Version != 2 {
+		t.Fatalf("提交后的影子 = %+v, ok=%v", doc, ok)
+	}
+}
+
 // TestShadowPersistsAcrossRestart 是本轮的核心验收。
 //
 // 一个重启就忘掉设备影子的 broker 不能部署：设备会以为云端已知其状态，

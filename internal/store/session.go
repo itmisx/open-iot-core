@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/itmisx/open-iot-core/internal/cluster"
 	"github.com/itmisx/open-iot-core/internal/session"
@@ -29,29 +30,65 @@ type sessionRecord struct {
 type SessionStore struct {
 	kv KV
 
-	// 每 clientId 一把锁。
+	// epochTies 是「epoch 相等但归属节点不同」的写入次数（CLU-131）。
+	//
+	// 它是这条路径唯一的外部信号：epoch 由各节点的本地所有权表发放，
+	// term 恒为 1、序号各自递增，所以两个节点可以为同一个 clientId 发出
+	// **相同**的 epoch——而相等的 epoch 之间没有先后，围栏那条
+	// `st.Epoch < cur.Epoch` 判不出来。非零意味着真的撞上了，而不是
+	// 理论上会撞。
+	epochTies atomic.Uint64
+
+	// 同 clientId 的操作落到同一条带锁。
 	//
 	// 围栏判定是「读当前 epoch、比较、写入」三步，必须原子：
 	// 两个并发的 Save 若交错，旧 epoch 的那个可能在新 epoch 之后落地，
 	// 于是被接管的旧会话覆盖掉了新会话的状态。
-	mu    sync.Mutex
-	lanes map[string]*sync.Mutex
+	// 不能永久保存 map[clientId]*Mutex：百万持久会话会留下百万个 GC
+	// 对象。1024 条带足以覆盖本地并行 apply，常驻成本与设备数无关。
+	lanes [1024]sync.Mutex
 }
+
+// staleAtEqualEpoch 判断一条写入是否该在 epoch 相等时被拒（CLU-131）。
+//
+// 相等只可能来自两个节点各自发放的 epoch 撞号（同一个节点的序号严格
+// 递增，不会重复）。两者之间没有可比的先后，所以不能按 epoch 定序；
+// 但有一条判据是确定的：**已经断开的那一份不得覆盖还连着的那一份**。
+// 断开时的落盘一定带 DisconnectUnixMs，而 CONNECT 时落的那份是 0。
+//
+// 为什么不是"一律拒绝"或"一律接受"：撞号时哪一份更新无从得知，两种
+// 一刀切都有一半概率错；而"活的压过死的"这条与哪一份更新无关，它在
+// 两种情形下都是对的——设备此刻确实连在写 0 那一份的节点上。
+//
+// 为什么不加节点名做字典序平手判据（retained 那条路的做法，MQTT-123）：
+// retained 要的是**收敛**，谁赢不重要；会话要的是"别把活着的那份盖掉"，
+// 按节点名定序会让某个节点永久输——那个节点上的设备从此存不住会话。
+//
+// 计数但不报警：撞号本身是所有权实现的缺陷（LocalOwnership 的 term 恒为
+// 1），真正的修法是分片 ownership 服务，见 CLU-131。
+func (s *SessionStore) staleAtEqualEpoch(cur, in *session.State) bool {
+	if cur.Epoch != in.Epoch || cur.Owner == in.Owner {
+		return false
+	}
+	s.epochTies.Add(1)
+	return in.DisconnectUnixMs != 0 && cur.DisconnectUnixMs == 0
+}
+
+// EpochTies 返回「epoch 相等但归属节点不同」的写入次数（CLU-131）。
+func (s *SessionStore) EpochTies() uint64 { return s.epochTies.Load() }
 
 // NewSessionStore 创建持久化会话存储。
 func NewSessionStore(kv KV) *SessionStore {
-	return &SessionStore{kv: kv, lanes: make(map[string]*sync.Mutex)}
+	return &SessionStore{kv: kv}
 }
 
 func (s *SessionStore) lane(clientID string) *sync.Mutex {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m := s.lanes[clientID]
-	if m == nil {
-		m = &sync.Mutex{}
-		s.lanes[clientID] = m
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(clientID); i++ {
+		h ^= uint64(clientID[i])
+		h *= 1099511628211
 	}
-	return m
+	return &s.lanes[h&uint64(len(s.lanes)-1)]
 }
 
 func sessionKey(clientID string) []byte {
@@ -216,6 +253,9 @@ func (s *SessionStore) Save(_ context.Context, st *session.State) error {
 		if st.Epoch < cur.Epoch {
 			return cluster.ErrStaleEpoch
 		}
+		if s.staleAtEqualEpoch(cur, st) {
+			return cluster.ErrStaleEpoch
+		}
 	case errors.Is(err, ErrNotFound):
 	default:
 		return err
@@ -265,6 +305,52 @@ func (s *SessionStore) Save(_ context.Context, st *session.State) error {
 	// 这里是一次 Put，幂等；围栏判定（读当前 epoch 再比较）刻意留在事务
 	// 之外、由 lane 锁保护——把它挪进事务体，重试就会拿到不同的判定。
 	return s.kv.Set(key, enc, false)
+}
+
+// Replace atomically clears the old session (including its offline queue) and
+// stores the new state. Clean Start with a non-zero expiry needs this semantic;
+// doing Delete followed by Save would require two replicated proposals.
+func (s *SessionStore) Replace(_ context.Context, st *session.State) error {
+	if st == nil || st.ClientID == "" {
+		return errors.New("store: 会话缺少 clientId")
+	}
+	lane := s.lane(st.ClientID)
+	lane.Lock()
+	defer lane.Unlock()
+	cur, found, err := s.peek(s.kv, st.ClientID)
+	if err != nil {
+		return err
+	}
+	if found && st.Epoch < cur.Epoch {
+		return cluster.ErrStaleEpoch
+	}
+	if found && s.staleAtEqualEpoch(cur, st) {
+		return cluster.ErrStaleEpoch
+	}
+	ops, err := s.replaceStateOps(s.kv, st)
+	if err != nil {
+		return err
+	}
+	return s.kv.Batch(ops, false)
+}
+
+func (s *SessionStore) replaceStateOps(r kvReader, st *session.State) ([]Op, error) {
+	keys, err := s.queuedKeys(r, st.ClientID)
+	if err != nil {
+		return nil, err
+	}
+	bare := *st
+	bare.Queued = nil
+	enc, err := encodeSession(&bare)
+	if err != nil {
+		return nil, err
+	}
+	ops := make([]Op, 0, len(keys)+1)
+	for _, k := range keys {
+		ops = append(ops, Op{Kind: OpDelete, Key: k})
+	}
+	ops = append(ops, Op{Kind: OpSet, Key: sessionKey(st.ClientID), Value: enc})
+	return ops, nil
 }
 
 // Delete 删除会话状态。

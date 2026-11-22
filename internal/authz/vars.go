@@ -59,7 +59,30 @@ type varSpec struct {
 }
 
 // DN 是证书的可辨别名的可引用字段。
+//
+// CN、Country 与 Organization 是设备证书里最常见的三项，直接内联；
+// 其余字段放进按需扩展。旧布局无论证书是否填写字段，都会在每条长连接里
+// 常驻 8 个 string header（128 B），Subject + Issuer 就是 256 B。百万 mTLS
+// 连接为大量空字段支付这笔固定成本没有意义。DN 复制后共享只读扩展；本包
+// 不暴露扩展指针，也没有修改方法，因而不会引入跨连接可变状态。
 type DN struct {
+	CommonName   string
+	Country      string
+	Organization string
+	extra        *dnExtra
+}
+
+type dnExtra struct {
+	organizationalUnit string
+	state              string
+	locality           string
+	serialNumber       string
+	qualifier          string
+}
+
+// DNFields 是构造 DN 时的完整字段集。它只在 TLS 握手/管理面构造阶段使用，
+// 不随长连接常驻。
+type DNFields struct {
 	CommonName         string
 	Country            string
 	Organization       string
@@ -68,6 +91,22 @@ type DN struct {
 	Locality           string
 	SerialNumber       string
 	Qualifier          string
+}
+
+// NewDN 构造紧凑的只读 DN。只有至少一个少见字段非空时才分配扩展。
+func NewDN(v DNFields) DN {
+	d := DN{CommonName: v.CommonName, Country: v.Country, Organization: v.Organization}
+	if v.OrganizationalUnit != "" || v.State != "" || v.Locality != "" ||
+		v.SerialNumber != "" || v.Qualifier != "" {
+		d.extra = &dnExtra{
+			organizationalUnit: v.OrganizationalUnit,
+			state:              v.State,
+			locality:           v.Locality,
+			serialNumber:       v.SerialNumber,
+			qualifier:          v.Qualifier,
+		}
+	}
+	return d
 }
 
 func (d *DN) field(f dnField) string {
@@ -79,18 +118,27 @@ func (d *DN) field(f dnField) string {
 	case dnOrganization:
 		return d.Organization
 	case dnOrganizationalUnit:
-		return d.OrganizationalUnit
+		if d.extra != nil {
+			return d.extra.organizationalUnit
+		}
 	case dnState:
-		return d.State
+		if d.extra != nil {
+			return d.extra.state
+		}
 	case dnLocality:
-		return d.Locality
+		if d.extra != nil {
+			return d.extra.locality
+		}
 	case dnSerialNumber:
-		return d.SerialNumber
+		if d.extra != nil {
+			return d.extra.serialNumber
+		}
 	case dnQualifier:
-		return d.Qualifier
-	default:
-		return ""
+		if d.extra != nil {
+			return d.extra.qualifier
+		}
 	}
+	return ""
 }
 
 // CertContext 是连接所用证书的可引用字段。
@@ -98,6 +146,12 @@ type CertContext struct {
 	SerialNumber string
 	Subject      DN
 	Issuer       DN
+}
+
+// ThingAttributeSource 是策略求值读取设备属性所需的最小热视图接口。
+// Context 持有接口而非每连接闭包，避免百万连接各分配一个捕获对象。
+type ThingAttributeSource interface {
+	ThingAttr(thing, name string) (string, bool)
 }
 
 // Context 是一次授权判定的请求上下文。
@@ -111,9 +165,12 @@ type Context struct {
 	Thing string
 	// ThingAttached 表示连接所用证书确实绑定了该设备。
 	ThingAttached bool
-	// ThingAttr 查询设备属性。为 nil 时属性变量解析失败（从而拒绝）。
-	ThingAttr func(name string) (string, bool)
-	Cert      CertContext
+	// ThingAttrs 查询设备属性。为 nil 时属性变量解析失败（从而拒绝）。
+	ThingAttrs ThingAttributeSource
+	// Cert 按需存在。绝大多数设备策略只引用 Thing/ClientId；用指针避免
+	// 每条长期连接都为 128 B 的证书变量上下文预付空间。nil 与字段全空
+	// 语义相同：证书变量解析失败并导致该资源不匹配。
+	Cert *CertContext
 }
 
 // resolve 求值一个变量引用。
@@ -145,22 +202,28 @@ func (c *Context) resolve(v varSpec) (string, bool) {
 		return "false", true
 
 	case varThingAttr:
-		if !c.thingUsable() || c.ThingAttr == nil {
+		if !c.thingUsable() || c.ThingAttrs == nil {
 			return "", false
 		}
-		return c.ThingAttr(v.attr)
+		return c.ThingAttrs.ThingAttr(c.Thing, v.attr)
 
 	case varCertSerial:
-		if c.Cert.SerialNumber == "" {
+		if c.Cert == nil || c.Cert.SerialNumber == "" {
 			return "", false
 		}
 		return c.Cert.SerialNumber, true
 
 	case varSubject:
+		if c.Cert == nil {
+			return "", false
+		}
 		s := c.Cert.Subject.field(v.field)
 		return s, s != ""
 
 	case varIssuer:
+		if c.Cert == nil {
+			return "", false
+		}
 		s := c.Cert.Issuer.field(v.field)
 		return s, s != ""
 

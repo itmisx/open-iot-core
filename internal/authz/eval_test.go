@@ -19,7 +19,7 @@ func devCtx(clientID, thing string) *Context {
 		ClientID:      clientID,
 		Thing:         thing,
 		ThingAttached: true,
-		Cert: CertContext{
+		Cert: &CertContext{
 			SerialNumber: "0A1B2C",
 			Subject:      DN{CommonName: clientID + ".example", Organization: "Acme"},
 			Issuer:       DN{CommonName: "Acme Device CA", Country: "CN"},
@@ -278,12 +278,7 @@ func TestThingAttributesAndIsAttached(t *testing.T) {
 	   "Resource":"arn:aws:iot:*:*:topic/attached/${iot:Connection.Thing.IsAttached}"}
 	]}`)
 	ctx := devCtx("dev-1", "dev-1")
-	ctx.ThingAttr = func(n string) (string, bool) {
-		if n == "site" {
-			return "shanghai", true
-		}
-		return "", false
-	}
+	ctx.ThingAttrs = testThingAttrs{"dev-1/site": "shanghai"}
 
 	if d := Eval([]*CompiledSet{cs}, ctx, Request{ActPublish, "site/shanghai/data"}, nil); d != Allow {
 		t.Errorf("属性匹配应放行，得到 %s", d)
@@ -301,6 +296,13 @@ func TestThingAttributesAndIsAttached(t *testing.T) {
 	if d := Eval([]*CompiledSet{cs}, ctx, Request{ActReceive, "attached/true"}, nil); d != ImplicitDeny {
 		t.Errorf("IsAttached 为 false 不应匹配 true，得到 %s", d)
 	}
+}
+
+type testThingAttrs map[string]string
+
+func (a testThingAttrs) ThingAttr(thing, name string) (string, bool) {
+	v, ok := a[thing+"/"+name]
+	return v, ok
 }
 
 // TestRealWorldSDKPolicy 用 AWS 设备 SDK 示例里典型的策略形态做端到端验证。

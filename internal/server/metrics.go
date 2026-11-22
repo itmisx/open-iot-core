@@ -117,6 +117,99 @@ func (a *adminServer) collectConn(e *metrics.Encoder, node metrics.Label) {
 	e.Help(metricPrefix+"handshake_duration_ms", "TLS 握手耗时，仅成功的连接",
 		metrics.TypeHistogram)
 	e.Histogram(metricPrefix+"handshake_duration_ms", a.s.bus.Handshake(), node)
+	var tlsOK, tlsResumed, tlsFailed, tlsThrottled uint64
+	var tlsInFlight, tlsPeak, tlsCapacity int64
+	for _, l := range a.s.listeners {
+		st := l.TLSHandshakeStats()
+		tlsOK += st.Succeeded
+		tlsResumed += st.Resumed
+		tlsFailed += st.Failed
+		tlsThrottled += st.Throttled
+		tlsInFlight += st.InFlight
+		tlsPeak += st.Peak
+		tlsCapacity += int64(st.Capacity)
+	}
+	e.Help(metricPrefix+"tls_handshakes_total",
+		"TLS 握手数，不等 MQTT CONNECT；按全握手、恢复和失败分类", metrics.TypeCounter)
+	for _, m := range []struct {
+		result string
+		v      uint64
+	}{
+		{"full", tlsOK - tlsResumed}, {"resumed", tlsResumed},
+		{"failed", tlsFailed}, {"throttled", tlsThrottled},
+	} {
+		e.CounterUint(metricPrefix+"tls_handshakes_total", m.v, node,
+			metrics.Label{Name: "result", Value: m.result})
+	}
+	for _, m := range []struct {
+		name, help string
+		v          int64
+	}{
+		{"tls_handshakes_in_flight", "当前正在执行的 TLS 握手数", tlsInFlight},
+		{"tls_handshake_peak", "各 TLS listener 历史在途峰值之和", tlsPeak},
+		{"tls_handshake_capacity", "全部 TLS listener 的握手并发硬上限之和", tlsCapacity},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeGauge)
+		e.GaugeInt(metricPrefix+m.name, m.v, node)
+	}
+
+	// CONNECT 分段耗时（OBS-148）。
+	//
+	// 读法：auth 是本地热视图；RF=3 下 session_load 可由 Claim 带回，
+	// owner_claim 是可合批的 leader 内存 RPC，session_write 才是一轮共识。
+	// 建连慢时先看这四段谁占住了
+	// 端到端时间——此前只有一个端到端数字，于是 CLU-126 那 25 至 48 倍
+	// 无从归因。
+	e.Help(metricPrefix+"connect_stage_duration_ms",
+		"CONNECT 各段耗时，按阶段；仅走完全部四段的连接", metrics.TypeHistogram)
+	for st := events.ConnStage(0); st < events.NumConnStages; st++ {
+		e.Histogram(metricPrefix+"connect_stage_duration_ms", a.s.bus.ConnStage(st), node,
+			metrics.Label{Name: "stage", Value: st.String()})
+	}
+
+	// 一次建连发出几次逻辑会话写：本计数器除以
+	// connections_total{result="accepted"}。
+	//
+	// 不做成直方图：取值只有 0、1、2，而这个商是 CLU-126 第一条假设的
+	// 直接判据——非持久会话应当是 0，不是 0 就说明 persistSession 那层
+	// 判定有漏网的路径，而那条路径在功能上完全看不出来。
+	//
+	// 只统计 CONNECT 路径，不含断开时的那次落盘：分母是被接受的连接数，
+	// 混进断开侧的写入就不再是"一次建连写几次"了。物理
+	// Raft 提案数看 session_proposals_total；CLU-134 之后多个逻辑
+	// 写可以合成一条日志，两个计数器不应再相等。
+	e.Help(metricPrefix+"session_writes_total",
+		"CONNECT 路径上的累计逻辑会话写入次数；多次可合成一条 Raft 提案",
+		metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_writes_total", a.s.bus.SessionWrites(), node)
+
+	// epoch 撞号的次数（CLU-131）。
+	//
+	// 非零意味着两个节点真的为同一个 clientId 发出了相同的 epoch，而
+	// 不是理论上会。它是这条路径唯一的外部信号：撞号本身既不报错也不
+	// 丢数据（平手判据保住了还连着的那一份），但它说明所有权还在用
+	// 每节点各自递增的序号，该排 CLU-009 了。
+	e.Help(metricPrefix+"session_epoch_ties_total",
+		"epoch 相等但归属节点不同的会话写入次数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_epoch_ties_total",
+		a.s.sessionLocal.EpochTies(), node)
+
+	// 被围栏判为陈旧的会话写入（CLU-131）。
+	//
+	// 集群下非零是正常的，而且正是要暴露的那件事：epoch 由各节点的本地
+	// 所有权表发放，设备换节点重连时新节点的序号可能比旧节点小，于是一次
+	// 正常的重连被判成陈旧。**单节点下它应当恒为 0。**
+	e.Help(metricPrefix+"session_write_stale_total",
+		"被 epoch 围栏判为陈旧的会话写入次数；集群下非零属正常，单节点下不应出现",
+		metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_write_stale_total",
+		a.s.bus.SessionWriteStale(), node)
+
+	e.Help(metricPrefix+"session_write_failures_total",
+		"会话存储写入失败数，仅已接受的连接；被拒的见 connections_total{result=\"StoreFailed\"}",
+		metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_write_failures_total",
+		a.s.bus.SessionWriteFailures(), node)
 }
 
 // collectMessages 暴露消息指标（OBS-022）。
@@ -255,6 +348,191 @@ func (a *adminServer) collectCluster(e *metrics.Encoder, node metrics.Label) {
 
 	e.Help(metricPrefix+"cluster_shards", "分片数", metrics.TypeGauge)
 	e.GaugeInt(metricPrefix+"cluster_shards", int64(a.s.cfg.Cluster.ShardCount), node)
+
+	a.collectSessionShards(e, node)
+	a.collectShadowShards(e, node)
+}
+
+func (a *adminServer) collectShadowShards(e *metrics.Encoder, node metrics.Label) {
+	g := a.s.shadowShards.Load()
+	if g == nil {
+		return
+	}
+	st := g.Stats()
+	e.Help(metricPrefix+"shadow_shard_count", "影子分片数（真实 raft 日志条数）",
+		metrics.TypeGauge)
+	e.GaugeInt(metricPrefix+"shadow_shard_count", int64(g.ShardCount()), node)
+	e.Help(metricPrefix+"shadow_proposals_total",
+		"累计影子提案数，按发起时本节点是否为该分片 leader", metrics.TypeCounter)
+	for _, m := range []struct {
+		where string
+		v     uint64
+	}{{"local", st.ProposeLocal}, {"remote", st.ProposeRemote}, {"unknown", st.ProposeUnknown}} {
+		e.CounterUint(metricPrefix+"shadow_proposals_total", m.v, node,
+			metrics.Label{Name: "leader", Value: m.where})
+	}
+	e.Help(metricPrefix+"shadow_proposal_errors_total",
+		"影子提案失败数（没有 leader、失去多数派或超时）", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_proposal_errors_total", st.ProposeErrors, node)
+	e.Help(metricPrefix+"shadow_raft_proposals_total",
+		"实际提交给 Raft 的影子日志条数（二级合批后的物理提案数）", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_raft_proposals_total", st.RaftProposals, node)
+	e.Help(metricPrefix+"shadow_proposal_duration_ms",
+		"影子提案自发起到本地副本应用返回的耗时", metrics.TypeHistogram)
+	e.Histogram(metricPrefix+"shadow_proposal_duration_ms", st.Duration, node)
+	e.Help(metricPrefix+"shadow_remote_reads_total",
+		"由非副本节点发起的逻辑影子读数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_remote_reads_total", a.s.shadowRoute.remoteReads.Load(), node)
+	e.Help(metricPrefix+"shadow_remote_read_rpcs_total",
+		"影子远程读物理 RPC 数（含副本回退）", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_remote_read_rpcs_total", a.s.shadowRoute.remoteReadRPCs.Load(), node)
+	e.Help(metricPrefix+"shadow_remote_read_fallbacks_total",
+		"首选副本失败后尝试其他副本的次数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_remote_read_fallbacks_total", a.s.shadowRoute.remoteReadFallbacks.Load(), node)
+	e.Help(metricPrefix+"shadow_remote_read_errors_total",
+		"所有放置副本均读失败的逻辑请求数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_remote_read_errors_total", a.s.shadowRoute.remoteReadErrors.Load(), node)
+	e.Help(metricPrefix+"shadow_remote_writes_total",
+		"由非副本节点发出的影子写 RPC 数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_remote_writes_total", a.s.shadowRoute.remoteWrites.Load(), node)
+	e.Help(metricPrefix+"shadow_remote_write_errors_total",
+		"影子远程写失败数；写失败不会换副本重试", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"shadow_remote_write_errors_total", a.s.shadowRoute.remoteWriteErrors.Load(), node)
+}
+
+// collectSessionShards 暴露会话分区组的提案侧指标（OBS-148）。
+//
+// 单机下 s.shards 为 nil：那条路径不经复制组，没有提案可言。
+func (a *adminServer) collectSessionShards(e *metrics.Encoder, node metrics.Label) {
+	if a.s.shards == nil {
+		return
+	}
+	st := a.s.shards.Stats()
+
+	e.Help(metricPrefix+"session_shard_count", "会话分片数（真实 raft 日志条数）",
+		metrics.TypeGauge)
+	e.GaugeInt(metricPrefix+"session_shard_count", int64(a.s.shards.ShardCount()), node)
+
+	// 按 leader 位置分类的提案数。
+	//
+	// 读法：remote 占比是接入节点不是该分片 leader 的比例。
+	// CLU-136 之后这些提案会经 markOwn 长连接直达 leader，不再
+	// 先交给本地 follower 由 Dragonboat 内部转发。副本因子等于
+	// 节点数时，这个比例的期望仍是 (N-1)/N。
+	e.Help(metricPrefix+"session_proposals_total",
+		"累计会话提案数，按发起时本节点是否为该分片 leader", metrics.TypeCounter)
+	for _, m := range []struct {
+		where string
+		v     uint64
+	}{{"local", st.ProposeLocal}, {"remote", st.ProposeRemote}, {"unknown", st.ProposeUnknown}} {
+		e.CounterUint(metricPrefix+"session_proposals_total", m.v, node,
+			metrics.Label{Name: "leader", Value: m.where})
+	}
+
+	e.Help(metricPrefix+"session_proposal_errors_total",
+		"会话提案失败数（没有 leader、失去多数派或超时）", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_proposal_errors_total", st.ProposeErrors, node)
+	e.Help(metricPrefix+"session_raft_proposals_total",
+		"实际提交给 Raft 的会话日志条数（二级合批后的物理提案数）", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_raft_proposals_total", st.RaftProposals, node)
+	for _, m := range []struct {
+		name, help string
+		v          uint64
+	}{
+		{"session_leader_merge_access_batches_total", "leader 二次合批已消费的 Access 侧批次数", st.LeaderMergeAccessBatches},
+		{"session_leader_merge_logical_total", "leader 二次合批已装入 Raft 日志的逻辑会话命令数", st.LeaderMergeLogical},
+		{"session_leader_merge_physical_total", "leader 二次合批实际提交的物理 Raft 日志数", st.LeaderMergePhysical},
+		{"session_leader_merge_full_total", "leader 二次合批装满 64 条逻辑命令的日志数", st.LeaderMergeFull},
+		{"session_leader_merge_drained_total", "leader 二次合批未满且已耗尽当前队列快照的日志数", st.LeaderMergeDrained},
+		{"session_leader_merge_blocked_total", "leader 二次合批未满且被重复 ID、字节上限或维护命令截断的日志数", st.LeaderMergeBlocked},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeCounter)
+		e.CounterUint(metricPrefix+m.name, m.v, node)
+	}
+	for _, m := range []struct {
+		name, help string
+		v          int64
+	}{
+		{"session_leader_merge_queued", "当前在 shard leader 等待二次合并的 Access 批次数", st.LeaderMergeQueued},
+		{"session_leader_merge_in_flight", "当前由 shard leader 提交给 Raft 的二次合并日志数", st.LeaderMergeInFlight},
+		{"session_leader_merge_peak_queued", "进程启动以来 shard leader 二次合并排队峰值", st.LeaderMergePeakQueued},
+		{"session_leader_merge_peak_in_flight", "进程启动以来 shard leader 提交 Raft 的在途日志峰值", st.LeaderMergePeakInFlight},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeGauge)
+		e.GaugeInt(metricPrefix+m.name, m.v, node)
+	}
+
+	e.Help(metricPrefix+"session_remote_reads_total",
+		"非本地 session cell 的逻辑读取数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_remote_reads_total", st.SessionReadLogical, node)
+	e.Help(metricPrefix+"session_remote_read_batches_total",
+		"非本地 session cell 的批量 RPC 数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_remote_read_batches_total", st.SessionReadBatches, node)
+	e.Help(metricPrefix+"session_remote_read_claim_piggyback_total",
+		"由 ownership Claim 应答直接携带、因而未另发读取 RPC 的会话读取数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_remote_read_claim_piggyback_total", st.SessionReadClaimed, node)
+	e.Help(metricPrefix+"session_remote_read_errors_total",
+		"非本地 session cell 读取失败的逻辑请求数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_remote_read_errors_total", st.SessionReadErrors, node)
+
+	// Access 侧提案 pipeline 的队列压力。in_flight_batches 长时间顶到 8、
+	// queued 同时增长才说明共识已形成背压；只看 CONNECT p99 无法区分
+	// 是 TLS、ownership 还是 session 写在排队。
+	qst := a.s.sessions.proposalQueueStats()
+	e.Help(metricPrefix+"session_proposal_backpressured_total",
+		"入队时所在分片已用满在途提案上限的会话写数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"session_proposal_backpressured_total", qst.Backpressured, node)
+	for _, m := range []struct {
+		name, help string
+		v          int
+	}{
+		{"session_proposal_queued", "当前等待合批或 pipeline 背压的会话写数", qst.Queued},
+		{"session_proposal_in_flight", "当前已交给共识层、等待结果的逻辑会话写数", qst.InFlight},
+		{"session_proposal_in_flight_batches", "当前已交给共识层的 Access 侧物理批次数", qst.InFlightBatches},
+		{"session_proposal_peak_queued", "进程启动以来 Access 侧会话写排队峰值", qst.PeakQueued},
+		{"session_proposal_peak_in_flight_batches", "进程启动以来 Access 侧会话提案在途批次峰值", qst.PeakInFlightBatches},
+		{"session_proposal_cached_requests", "当前缓存的会话提案请求对象数", qst.CachedRequests},
+		{"session_proposal_cached_batches", "当前缓存的会话提案批工作区数", qst.CachedBatches},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeGauge)
+		e.GaugeInt(metricPrefix+m.name, int64(m.v), node)
+	}
+
+	// Ownership Claim 是每次集群 CONNECT 必经的一轮写语义 RPC。
+	// logical/rpc 的比值是合批系数；queued 和 in_flight_rpcs 同时顶高
+	// 说明对端或网络已饱和，不应再用增加 CONNECT 协程掩盖。
+	ost := a.s.owners.Stats()
+	e.Help(metricPrefix+"ownership_remote_claims_total",
+		"非 leader Access 节点发起的逻辑 Ownership Claim 数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"ownership_remote_claims_total", ost.RemoteClaims, node)
+	e.Help(metricPrefix+"ownership_claim_rpcs_total",
+		"Ownership Claim 物理 RPC 数（包含明确 NotLeader 后的副本回退）", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"ownership_claim_rpcs_total", ost.RemoteRPCs, node)
+	e.Help(metricPrefix+"ownership_claim_errors_total",
+		"Ownership Claim 最终失败的逻辑请求数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"ownership_claim_errors_total", ost.RemoteErrors, node)
+	e.Help(metricPrefix+"ownership_claim_backpressured_total",
+		"入队时所在分片已用满在途 RPC 上限的 Claim 数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"ownership_claim_backpressured_total", ost.Backpressured, node)
+	for _, m := range []struct {
+		name, help string
+		v          int
+	}{
+		{"ownership_claim_queued", "当前等待合批或背压的 Claim 数", ost.QueuedClaims},
+		{"ownership_claim_in_flight", "当前已发出、等待应答的逻辑 Claim 数", ost.InFlightClaims},
+		{"ownership_claim_in_flight_rpcs", "当前已发出的 Claim 物理 RPC 数", ost.InFlightRPCs},
+		{"ownership_claim_cached_requests", "当前缓存的 Claim 请求对象数", ost.CachedRequests},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeGauge)
+		e.GaugeInt(metricPrefix+m.name, int64(m.v), node)
+	}
+
+	// 与 connect_stage_duration_ms{stage="session_write"} 对照着看：
+	// 两者的差额是存储层在共识之外花的时间（编解码与本地写），
+	// 差额很小就说明时间都在共识那一轮里。
+	e.Help(metricPrefix+"session_proposal_duration_ms",
+		"会话提案自发起到应用返回的耗时", metrics.TypeHistogram)
+	e.Histogram(metricPrefix+"session_proposal_duration_ms", st.Duration, node)
 }
 
 // collectPKI 暴露 PKI 指标（OBS-027）。
@@ -329,6 +607,12 @@ func countExpiringSoon(certs []registry.Certificate, nowMs int64) int64 {
 // collectQuota 暴露配额指标（OBS-029）。
 func (a *adminServer) collectQuota(e *metrics.Encoder, node metrics.Label) {
 	stats := a.s.lim.Stats()
+	e.Help(metricPrefix+"quota_rate_buckets", "当前常驻的速率令牌桶数", metrics.TypeGauge)
+	e.GaugeInt(metricPrefix+"quota_rate_buckets", a.s.lim.RateBucketCount(), node)
+	e.Help(metricPrefix+"quota_rate_buckets_swept_total",
+		"恢复满额后被回收的速率令牌桶数", metrics.TypeCounter)
+	e.CounterUint(metricPrefix+"quota_rate_buckets_swept_total",
+		a.s.lim.RateBucketsSwept(), node)
 
 	e.Help(metricPrefix+"quota_allowed_total", "配额放行数", metrics.TypeCounter)
 	for _, s := range stats {
@@ -391,12 +675,25 @@ func collectRuntime(e *metrics.Encoder, node metrics.Label) {
 	}{
 		{"heap_alloc_bytes", "当前堆上活跃对象字节数", m.HeapAlloc},
 		{"heap_sys_bytes", "向系统申请的堆字节数", m.HeapSys},
+		{"heap_inuse_bytes", "堆中已映射并正在使用的 span 字节数", m.HeapInuse},
+		{"heap_released_bytes", "已归还操作系统的空闲堆字节数", m.HeapReleased},
 		{"heap_objects", "堆上对象数", m.HeapObjects},
+		{"stack_inuse_bytes", "goroutine 栈正在使用的字节数", m.StackInuse},
 		{"stack_sys_bytes", "goroutine 栈占用字节数", m.StackSys},
+		{"runtime_sys_bytes", "Go 运行时从操作系统取得的总字节数", m.Sys},
 		{"gc_cycles_total", "GC 轮次", uint64(m.NumGC)},
 	} {
 		e.Help(metricPrefix+g.name, g.help, metrics.TypeGauge)
 		e.CounterUint(metricPrefix+g.name, g.v, node)
+	}
+	memoryLimit := debug.SetMemoryLimit(-1)
+	e.Help(metricPrefix+"runtime_memory_limit_bytes",
+		"Go runtime 当前 soft memory limit；未限制时为 MaxInt64", metrics.TypeGauge)
+	e.GaugeInt(metricPrefix+"runtime_memory_limit_bytes", memoryLimit, node)
+	if rss, ok := processResidentBytes(); ok {
+		e.Help(metricPrefix+"process_resident_memory_bytes",
+			"进程当前驻留物理内存字节数（Linux /proc）", metrics.TypeGauge)
+		e.CounterUint(metricPrefix+"process_resident_memory_bytes", rss, node)
 	}
 
 	// GC 暂停分位（OBS-028）。

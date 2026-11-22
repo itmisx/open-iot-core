@@ -1,8 +1,16 @@
 # 构建产物
 /openiotd
 /openiotctl
+/mqttbench
 /dist/
 /bin/
+
+# 编译出来的测试二进制。
+#
+# `go test -c` 与被中断的 `go test` 会在包目录或仓库根目录留下 <pkg>.test，
+# 一个十几 MB。它们原先不在这张表里，于是 `git add -A` 顺手就能把它们带进
+# 历史——与下面 out/ 那条同一个理由，只是后果没那么严重。
+*.test
 
 # 教程示例的构建产物与跑出来的材料。
 #

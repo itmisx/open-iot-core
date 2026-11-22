@@ -1,6 +1,25 @@
 package cluster
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
+
+var remoteThingsBenchmarkSink *RemoteThings
+
+func BenchmarkRemoteThingsSnapshot100K(b *testing.B) {
+	things := make([]string, 100_000)
+	for i := range things {
+		things[i] = fmt.Sprintf("thing-%08d", i)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rt := NewRemoteThings("self")
+		rt.ApplySnapshot("peer", 1, 1, things)
+		remoteThingsBenchmarkSink = rt
+	}
+}
 
 // TestAdvertiseReplacesWholeSnapshot 通告是全量替换，不是增量。
 //
@@ -70,6 +89,37 @@ func TestLastAdvertiserWins(t *testing.T) {
 	}
 }
 
+func TestLastAdvertiserUpdatesNodeCounts(t *testing.T) {
+	rt := NewRemoteThings("a")
+	rt.ApplySnapshot("b", 1, 1, []string{"lamp-1"})
+	rt.ApplySnapshot("c", 1, 1, []string{"lamp-1"})
+	if rt.Nodes() != 1 {
+		t.Fatalf("接管后节点数 = %d，期望只有当前 owner", rt.Nodes())
+	}
+	// 旧 owner 的迟到删除不能删掉新 owner，也不能破坏节点计数。
+	if ok := rt.ApplyDelta("b", 1, 1, 2, []ThingChange{{Name: "lamp-1", Present: false}}); !ok {
+		t.Fatal("旧 owner 的连续增量被拒绝")
+	}
+	if got, ok := rt.Locate([]byte("lamp-1")); !ok || got != "c" {
+		t.Fatalf("旧 owner 删除破坏新归属: %q ok=%v", got, ok)
+	}
+	if rt.Nodes() != 1 {
+		t.Fatalf("旧 owner 删除后节点数 = %d，期望 1", rt.Nodes())
+	}
+}
+
+func TestSnapshotDeduplicatesNames(t *testing.T) {
+	rt := NewRemoteThings("a")
+	rt.ApplySnapshot("b", 1, 1, []string{"lamp-1", "lamp-1", ""})
+	if rt.Len() != 1 || rt.Nodes() != 1 {
+		t.Fatalf("重复名快照后设备数 = %d 节点数 = %d，期望 1 1", rt.Len(), rt.Nodes())
+	}
+	rt.ApplySnapshot("b", 1, 2, nil)
+	if rt.Len() != 0 || rt.Nodes() != 0 {
+		t.Fatalf("空快照后设备数 = %d 节点数 = %d，期望 0 0", rt.Len(), rt.Nodes())
+	}
+}
+
 // TestForgetDropsOnlyThatNode 成员离开时只清它自己的归属。
 func TestForgetDropsOnlyThatNode(t *testing.T) {
 	rt := NewRemoteThings("a")
@@ -97,5 +147,54 @@ func TestLocateMissIsNotAnError(t *testing.T) {
 	rt := NewRemoteThings("a")
 	if node, ok := rt.Locate([]byte("没这台")); ok || node != "" {
 		t.Errorf("= %q ok=%v，期望空且 false", node, ok)
+	}
+}
+
+func TestThingDeltaRequiresContinuousVersion(t *testing.T) {
+	rt := NewRemoteThings("a")
+	rt.ApplySnapshot("b", 7, 10, []string{"lamp-1"})
+	if ok := rt.ApplyDelta("b", 7, 10, 12, []ThingChange{
+		{Name: "lamp-1", Present: false},
+		{Name: "lamp-2", Present: true},
+	}); !ok {
+		t.Fatal("连续增量被拒绝")
+	}
+	if _, ok := rt.Locate([]byte("lamp-1")); ok {
+		t.Fatal("增量删除未生效")
+	}
+	if got, ok := rt.Locate([]byte("lamp-2")); !ok || got != "b" {
+		t.Fatalf("增量新增 = %q ok=%v", got, ok)
+	}
+	if rt.NeedsSync("b") {
+		t.Fatal("连续增量不应请求快照")
+	}
+
+	if ok := rt.ApplyDelta("b", 7, 9, 13, nil); ok {
+		t.Fatal("断档增量被错误接受")
+	}
+	if !rt.NeedsSync("b") {
+		t.Fatal("断档后没有请求快照")
+	}
+	// 断档不能破坏最后一份正确视图。
+	if got, ok := rt.Locate([]byte("lamp-2")); !ok || got != "b" {
+		t.Fatalf("断档破坏了旧视图: %q ok=%v", got, ok)
+	}
+}
+
+func TestThingEpochChangeRequiresSnapshot(t *testing.T) {
+	rt := NewRemoteThings("a")
+	rt.ApplySnapshot("b", 1, 5, []string{"old"})
+	if ok := rt.ApplyDelta("b", 2, 0, 1, []ThingChange{{Name: "new", Present: true}}); ok {
+		t.Fatal("进程 epoch 变化后仍接受增量")
+	}
+	if !rt.NeedsSync("b") {
+		t.Fatal("进程 epoch 变化后没有请求快照")
+	}
+	rt.ApplySnapshot("b", 2, 1, []string{"new"})
+	if rt.NeedsSync("b") {
+		t.Fatal("安装快照后仍请求同步")
+	}
+	if _, ok := rt.Locate([]byte("old")); ok {
+		t.Fatal("新进程快照没有清除旧归属")
 	}
 }

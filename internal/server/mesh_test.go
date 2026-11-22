@@ -112,6 +112,64 @@ func TestOnMeshFeedsRouterAndOwnership(t *testing.T) {
 	}
 }
 
+func TestOnMeshThingDeltaDetectsGapAndRequestsSnapshot(t *testing.T) {
+	r := newTestRig(t, func(cfg *config.Config) { clusterConfig(t, cfg, "n1") })
+	r.start()
+	s := r.s
+
+	s.onMesh("n2", cluster.MeshPayload{Things: []string{"legacy"}})
+	s.thingSyncMu.Lock()
+	legacy := s.thingLegacyPeers["n2"]
+	s.thingSyncMu.Unlock()
+	if !legacy {
+		t.Fatal("旧格式对端没有进入滚动升级兼容模式")
+	}
+
+	s.onMesh("n2", cluster.MeshPayload{
+		ThingEpoch: 7, ThingVersion: 1, ThingSnapshot: true,
+		Things: []string{"lamp-1"},
+	})
+	s.thingSyncMu.Lock()
+	legacy = s.thingLegacyPeers["n2"]
+	s.thingSyncMu.Unlock()
+	if legacy {
+		t.Fatal("对端升级到版本增量后仍停留在全量兼容模式")
+	}
+	s.onMesh("n2", cluster.MeshPayload{
+		ThingEpoch: 7, ThingFrom: 1, ThingVersion: 2,
+		ThingChanges: []cluster.ThingChange{
+			{Name: "lamp-1", Present: false},
+			{Name: "lamp-2", Present: true},
+		},
+	})
+	if _, ok := s.remoteThings.Locate([]byte("lamp-1")); ok {
+		t.Fatal("连续增量没有删除旧设备")
+	}
+	if node, ok := s.remoteThings.Locate([]byte("lamp-2")); !ok || node != "n2" {
+		t.Fatalf("连续增量没有加入新设备: node=%q ok=%v", node, ok)
+	}
+
+	// from=1 落后于本地水位 2，必须拒绝并请求快照，不能破坏旧视图。
+	s.onMesh("n2", cluster.MeshPayload{
+		ThingEpoch: 7, ThingFrom: 1, ThingVersion: 3,
+		ThingChanges: []cluster.ThingChange{{Name: "bad", Present: true}},
+	})
+	if !s.remoteThings.NeedsSync("n2") {
+		t.Fatal("版本断档后没有登记快照请求")
+	}
+	if _, ok := s.remoteThings.Locate([]byte("bad")); ok {
+		t.Fatal("版本断档的增量被应用了")
+	}
+
+	s.onMesh("n2", cluster.MeshPayload{ThingSync: true})
+	s.thingSyncMu.Lock()
+	requested := s.thingSyncRequests["n2"]
+	s.thingSyncMu.Unlock()
+	if !requested {
+		t.Fatal("对端的快照请求没有交给 gossip 循环")
+	}
+}
+
 // TestForgetDepartedNodesDropsGossip 不再是成员的节点要被忘掉（CLU-101）。
 //
 // 不忘的三个后果都不报错：往不在了的节点转发、它承载的设备的消息被转

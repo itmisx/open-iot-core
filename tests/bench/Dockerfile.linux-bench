@@ -1,0 +1,8 @@
+FROM alpine:3.21
+
+# connect-stage-ab.sh 只需要这些运行时工具；openiotd 与 mqttbench 由宿主机
+# 交叉编译后只读挂载，确保 A/B 两臂使用逐字节相同的产物。
+RUN apk add --no-cache bash curl openssl
+
+WORKDIR /src
+ENTRYPOINT ["/bin/bash"]

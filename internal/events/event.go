@@ -78,10 +78,17 @@ const (
 	ConnClosed
 	ConnViewStale
 	ConnProtocolError
+	// ConnStoreFailed 是持久会话无法落盘而被拒的连接（CLU-130）。
+	//
+	// 与 ConnThrottled 分开：限流是本节点刻意的削峰，而这一项意味着
+	// 复制层此刻写不进去（分片没选出 leader、失去多数派或超时），
+	// 运维要据此看共识层而不是看配额。
+	ConnStoreFailed
 )
 
 var connResultName = [...]string{
 	"Accepted", "AuthFailed", "Throttled", "Evicted", "Closed", "ViewStale", "ProtocolError",
+	"StoreFailed",
 }
 
 // NumConnResults 是 ConnResult 的取值个数。
@@ -212,6 +219,40 @@ type ConnFields struct {
 	HandshakeMS float64
 	// Duration 是连接存续毫秒数，仅断开事件有意义。
 	DurationMS int64
+
+	// 以下四项是 CONNECT 路径的分段耗时，仅接受事件有意义（OBS-148）。
+	//
+	// 为什么要分段：建连速率的瓶颈定位靠的是"哪一段在花时间"，而只有
+	// 一个端到端数字时，任何归因都是猜的——CLU-125 修完 apply 侧之后
+	// 端到端只涨 18%，剩下的 25 至 48 倍无从下手正是因为没有这四个数
+	// （CLU-126）。四段按代价排序：认证与鉴权只读热视图，会话读取是本地
+	// 磁盘，所有权抢占是一次内存互斥，而会话写入在集群下是一次共识往返。
+	//
+	// 单位毫秒，与 HandshakeMS 一致。
+	AuthMS         float64
+	SessionLoadMS  float64
+	OwnerClaimMS   float64
+	SessionWriteMS float64
+	// SessionWriteFailed 表示其中有一次写入失败。
+	//
+	// 接受的连接也可能带着它：顶掉一条旧持久记录的那次 Delete 失败
+	// 并不阻止本次连接（见 handleConnect），但它必须可见——否则
+	// "复制层写不进去"这件事在成功的建连里完全没有信号。
+	SessionWriteFailed bool
+	// SessionWriteStale 表示其中有一次被 epoch 围栏判为陈旧。
+	//
+	// 与 SessionWriteFailed 分开：集群下一次完全正常的跨节点重连也会被
+	// 判为陈旧（epoch 由各节点的本地所有权表发放，序号各自递增，
+	// CLU-131），所以它不是故障信号，而是「epoch 跨节点不可比」这件事
+	// 的直接证据。
+	SessionWriteStale bool
+	// SessionWrites 是本次 CONNECT 发出的会话存储写入次数。
+	//
+	// 它是 `session_writes_per_connect` 的分子：集群下每次写入是一条
+	// 复制日志，而"一次建连提几条日志"是 CLU-126 第一条要排除的假设。
+	// 非持久会话应当是 0——若不是 0，connect.go 里那层 persistSession
+	// 判定就有漏网的路径，而那条路径在功能上完全看不出来。
+	SessionWrites uint8
 }
 
 // SubFields 是订阅事件的字段。

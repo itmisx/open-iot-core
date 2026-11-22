@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -191,6 +192,17 @@ func (r *testRig) trustPool() *x509.CertPool {
 		r.t.Fatal("CA 链中没有可用证书")
 	}
 	return pool
+}
+
+func TestTLSCurvePreferences(t *testing.T) {
+	if got := tlsCurvePreferences(true); got != nil {
+		t.Fatalf("启用后量子混合组时应使用 Go 默认，得到 %v", got)
+	}
+	got := tlsCurvePreferences(false)
+	want := []tls.CurveID{tls.X25519, tls.CurveP256}
+	if !slices.Equal(got, want) {
+		t.Fatalf("容量优先曲线 = %v，期望 %v", got, want)
+	}
 }
 
 // dial 以设备证书建立真实 mTLS 连接。

@@ -23,6 +23,17 @@ import (
 // 这个适配器能成立，靠的是 CLU-109 那一步：applied index 已经随冷层
 // 一起落盘了。没有它，Open 只能报 0，而 dragonboat **不会重放早于该序号
 // 的日志**（那些已被快照压掉），后果是丢数据而不是慢。
+// ShardEntry 是一批已提交日志中的一条。
+//
+// Result 由 ApplyBatch 回填并逐条交回提案方：epoch 围栏的判定是按条
+// 返回的（CLU-116），整批一个值会把"我这条被旧 epoch 拦了"变成"这批
+// 里有人被拦了"，而提案方要的是前者。
+type ShardEntry struct {
+	Index  uint64
+	Data   []byte
+	Result uint64
+}
+
 type metaMachine struct {
 	// apply 应用一条已提交日志，index 即 raft 日志序号。
 	// 它必须在返回前把状态与 index 一起落盘（见 Update 的说明）。
@@ -33,6 +44,12 @@ type metaMachine struct {
 	// 提交之前判等于在两个节点各判一次，而它们看到的当前 epoch 可能
 	// 不同——那正是契约 01 要拦的那种覆盖。
 	apply func(index uint64, data []byte) (uint64, error)
+	// applyBatch 整批应用，非空时取代 apply（CLU-125）。
+	//
+	// 两条路径并存而不是统一掉：元数据组的一条命令可能带很多条冷层
+	// 记录，而它的写入是人工操作的结果（每秒几十到上百），没有合批的
+	// 需要；会话分片在 CONNECT 路径上，有。
+	applyBatch func(ents []ShardEntry) error
 	// appliedIndex 回报已经持久化到哪一条，供 Open 使用。
 	appliedIndex func() uint64
 	snapshotTo   func(io.Writer) error
@@ -69,6 +86,23 @@ func (m *metaMachine) Open(stopc <-chan struct{}) (uint64, error) {
 // 本节点应用不了就意味着状态机分叉。dragonboat 会据此停掉本节点，
 // 这与原先 cluster.ErrApplyFailed 的行为一致——不跳过、不继续。
 func (m *metaMachine) Update(ents []sm.Entry) ([]sm.Entry, error) {
+	// 整批那一条路径（CLU-125）：会话分片走它，元数据组仍走逐条。
+	//
+	// 两者的差别只在 fsync 次数，不在语义——applyBatch 也要在返回前把
+	// 状态与 index 一起落盘，只是"一起"的范围变成整批。
+	if m.applyBatch != nil {
+		batch := make([]ShardEntry, len(ents))
+		for i := range ents {
+			batch[i] = ShardEntry{Index: ents[i].Index, Data: ents[i].Cmd}
+		}
+		if err := m.applyBatch(batch); err != nil {
+			return nil, err
+		}
+		for i := range ents {
+			ents[i].Result = sm.Result{Value: batch[i].Result}
+		}
+		return ents, nil
+	}
 	for i := range ents {
 		v, err := m.apply(ents[i].Index, ents[i].Cmd)
 		if err != nil {

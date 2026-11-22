@@ -436,6 +436,9 @@ func TestCleanStartDiscardsSession(t *testing.T) {
 	if ack := second.connect("dev-1", true); ack.SessionPresent {
 		t.Error("clean start 不应报告会话已存在")
 	}
+	if got := r.sess.Len(); got != 0 {
+		t.Fatalf("clean session 不应写入会话存储，当前记录数 = %d", got)
+	}
 	pub := r.dial(ConnInfo{})
 	pub.connect("pub", true)
 	pub.publish("a/b", "x", packet.QoS0, false)

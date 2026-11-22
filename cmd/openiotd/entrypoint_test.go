@@ -34,6 +34,24 @@ func entrypointPath(t *testing.T) string {
 	return p
 }
 
+// TestKubernetesMainContainerPreservesEntrypoint 防止 StatefulSet 用 command
+// 绕开镜像入口。入口不只处理可选 init，还负责按 cgroup 设置 GOMEMLIMIT；
+// 百万连接节点绕开它会在 Go runtime 来得及回收前被 OOM killer 直接杀掉。
+func TestKubernetesMainContainerPreservesEntrypoint(t *testing.T) {
+	p, err := filepath.Abs(filepath.Join("..", "..", "deploy", "cluster", "k8s", "30-statefulset.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "exec /usr/local/bin/docker-entrypoint.sh serve --config /etc/openiotd/openiotd.yaml"
+	if !strings.Contains(string(raw), want) {
+		t.Fatalf("StatefulSet 主容器没有经过镜像入口：缺少 %q", want)
+	}
+}
+
 // stubBinDir 造一个只含 openiotd 桩的目录，用来顶替 PATH 上的真二进制。
 //
 // 桩把每次调用的参数追加到一个文件里，于是「调了几次、每次什么参数、
@@ -187,4 +205,48 @@ func TestEntrypointInitFailureStopsServe(t *testing.T) {
 	if len(calls) != 1 || calls[0] != "init --if-needed" {
 		t.Fatalf("init 失败后不应再调 serve，实际调用序列 %q", calls)
 	}
+}
+
+func TestEntrypointMemoryLimit(t *testing.T) {
+	inputs := t.TempDir()
+	meminfo := filepath.Join(inputs, "meminfo")
+	cgroup := filepath.Join(inputs, "memory.max")
+	if err := os.WriteFile(meminfo, []byte("MemTotal:       1048576 kB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cgroup, []byte("536870912\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(t *testing.T, supplied, expectation string) {
+		t.Helper()
+		dir := t.TempDir()
+		stub := `#!/bin/sh
+case "$EXPECT_GOMEMLIMIT" in
+  nonempty) [ -n "${GOMEMLIMIT:-}" ] || exit 9 ;;
+  *) [ "${GOMEMLIMIT:-}" = "$EXPECT_GOMEMLIMIT" ] || exit 10 ;;
+esac
+exit 0
+`
+		if err := os.WriteFile(filepath.Join(dir, "openiotd"), []byte(stub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("/bin/sh", entrypointPath(t), "config", "print")
+		cmd.Env = []string{
+			"PATH=" + dir,
+			"EXPECT_GOMEMLIMIT=" + expectation,
+			"OPENIOTD_MEMINFO_PATH=" + meminfo,
+			"OPENIOTD_CGROUP_V2_PATH=" + cgroup,
+			"OPENIOTD_CGROUP_V1_PATH=" + filepath.Join(inputs, "missing-v1"),
+		}
+		if supplied != "" {
+			cmd.Env = append(cmd.Env, "GOMEMLIMIT="+supplied)
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("入口脚本未传递预期内存限制: %v（%s）", err, out)
+		}
+	}
+	// cgroup 512 MiB 小于物理 1 GiB，75% 正好是 384 MiB。
+	t.Run("未设置时自动计算", func(t *testing.T) { run(t, "", "402653184B") })
+	t.Run("显式值优先", func(t *testing.T) { run(t, "512MiB", "512MiB") })
+	t.Run("显式 off 优先", func(t *testing.T) { run(t, "off", "off") })
 }

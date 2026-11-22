@@ -12,6 +12,17 @@ import (
 	"github.com/itmisx/open-iot-core/internal/session"
 )
 
+type discardWriterConn struct{}
+
+func (discardWriterConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (discardWriterConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (discardWriterConn) Close() error                     { return nil }
+func (discardWriterConn) LocalAddr() net.Addr              { return nil }
+func (discardWriterConn) RemoteAddr() net.Addr             { return nil }
+func (discardWriterConn) SetDeadline(time.Time) error      { return nil }
+func (discardWriterConn) SetReadDeadline(time.Time) error  { return nil }
+func (discardWriterConn) SetWriteDeadline(time.Time) error { return nil }
+
 // newWriterTestBroker 造一个只够跑写出池的 broker。
 //
 // 写出池只碰连接的出站队列与套接字，不需要路由、元数据与事件总线：
@@ -116,6 +127,95 @@ func TestWriterPoolQueueFIFO(t *testing.T) {
 	}
 	if got := p.stats().Pending; got != 0 {
 		t.Fatalf("取空之后队列长度为 %d", got)
+	}
+}
+
+// TestWriterSingleFrameDoesNotRetainMergeBuffer 钉住单帧快路。每条连接的
+// 首个 CONNACK 都走这里；若它分配合并 sidecar，百万空闲连接会永久保留百万块
+// 只装过几字节的 backing array。
+func TestWriterSingleFrameDoesNotRetainMergeBuffer(t *testing.T) {
+	p := idleWriterPool()
+	b := &Broker{}
+	b.opt.ReadBufferSize = defaultReadBuffer
+	b.opt.MaxWriteBatch = defaultMaxWriteBatch
+	b.writer = p
+	srv, cli := net.Pipe()
+	defer srv.Close()
+	defer cli.Close()
+	c := newConn(b, srv, ConnInfo{})
+	c.rt = session.NewRuntime(&session.State{ClientID: "single"}, nil, defaultOutboundBuffer)
+	if err := c.rt.Enqueue(0, session.Outbound{Bytes: []byte{0x20, 0x02, 0x00, 0x00}}); err != nil {
+		t.Fatal(err)
+	}
+	c.queued.Store(true)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4)
+		_, _ = io.ReadFull(cli, buf)
+	}()
+	p.flush(c)
+	<-done
+	if v := p.mergeBuffers.Get(); v != nil {
+		t.Fatal("单帧刷写不应借用合并缓冲")
+	}
+}
+
+func TestWriterMultiFrameMergedInOrder(t *testing.T) {
+	p := idleWriterPool()
+	b := &Broker{}
+	b.opt.ReadBufferSize = defaultReadBuffer
+	b.opt.MaxWriteBatch = defaultMaxWriteBatch
+	b.writer = p
+	srv, cli := net.Pipe()
+	defer srv.Close()
+	defer cli.Close()
+	c := newConn(b, srv, ConnInfo{})
+	c.rt = session.NewRuntime(&session.State{ClientID: "multi"}, nil, defaultOutboundBuffer)
+	for _, frame := range [][]byte{{1, 2}, {3, 4}} {
+		if err := c.rt.Enqueue(0, session.Outbound{Bytes: frame}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.queued.Store(true)
+	got := make(chan [4]byte, 1)
+	go func() {
+		var buf [4]byte
+		_, _ = io.ReadFull(cli, buf[:])
+		got <- buf
+	}()
+	p.flush(c)
+	if out := <-got; out != [4]byte{1, 2, 3, 4} {
+		t.Fatalf("合并写出 = %v", out)
+	}
+}
+
+func TestFailWriteUsesClosedStateFlag(t *testing.T) {
+	c := &conn{nc: discardWriterConn{}}
+	c.failWrite(io.ErrClosedPipe)
+	if got := c.closedRC.Load(); got&connWriteFailedMask == 0 || got&^connWriteFailedMask != 0 {
+		t.Fatalf("write failure state = %#x", got)
+	}
+}
+
+func BenchmarkWriterSingleFrame(b *testing.B) {
+	brk := &Broker{}
+	brk.opt.ReadBufferSize = defaultReadBuffer
+	brk.opt.MaxWriteBatch = defaultMaxWriteBatch
+	p := idleWriterPool()
+	brk.writer = p
+	c := newConn(brk, discardWriterConn{}, ConnInfo{})
+	c.releaseConnectStages()
+	c.rt = session.NewRuntime(&session.State{ClientID: "single"}, nil, defaultOutboundBuffer)
+	frame := []byte{0x20, 0x02, 0x00, 0x00}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := c.rt.Enqueue(0, session.Outbound{Bytes: frame}); err != nil {
+			b.Fatal(err)
+		}
+		c.queued.Store(true)
+		p.flush(c)
 	}
 }
 

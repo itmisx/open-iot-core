@@ -80,25 +80,28 @@ func TestQuotaOverridesUnknownIsDeterministic(t *testing.T) {
 // 在这里重复造一遍它们，而那正是会随装配变化而腐坏的那种断言。
 func TestBrokerOptionsMapping(t *testing.T) {
 	c := config.BrokerConfig{
-		WriterWorkers:  32,
-		OutboundBuffer: 256,
-		ReadBuffer:     8192,
-		MaxWriteBatch:  131072,
-		WriteTimeout:   config.Duration(2 * time.Second),
+		TLSHandshakeConcurrency: 512,
+		WriterWorkers:           32,
+		OutboundBuffer:          256,
+		ReadBuffer:              8192,
+		MaxWriteBatch:           131072,
+		WriteTimeout:            config.Duration(2 * time.Second),
+		TCPKeepAlive:            config.Duration(10 * time.Minute),
 	}
 	var opt broker.Options
 	brokerOptions(&c, &opt)
-	if opt.WriterWorkers != 32 || opt.OutboundBuffer != 256 ||
+	if opt.TLSHandshakeConcurrency != 512 || opt.WriterWorkers != 32 || opt.OutboundBuffer != 256 ||
 		opt.ReadBufferSize != 8192 || opt.MaxWriteBatch != 131072 ||
-		opt.WriteTimeout != 2*time.Second {
+		opt.WriteTimeout != 2*time.Second || opt.TCPKeepAlive != 10*time.Minute {
 		t.Fatalf("映射结果是 %+v", opt)
 	}
 	// 零值必须保持为零：默认值由 broker 包补齐，这里补一遍就是第二个真相。
 	var zero config.BrokerConfig
 	opt = broker.Options{}
 	brokerOptions(&zero, &opt)
-	if opt.WriterWorkers != 0 || opt.OutboundBuffer != 0 ||
-		opt.ReadBufferSize != 0 || opt.MaxWriteBatch != 0 || opt.WriteTimeout != 0 {
+	if opt.TLSHandshakeConcurrency != 0 || opt.WriterWorkers != 0 || opt.OutboundBuffer != 0 ||
+		opt.ReadBufferSize != 0 || opt.MaxWriteBatch != 0 || opt.WriteTimeout != 0 ||
+		opt.TCPKeepAlive != 0 {
 		t.Fatalf("零值不该被填上默认值，得到 %+v", opt)
 	}
 }

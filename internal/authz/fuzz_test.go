@@ -3,7 +3,30 @@ package authz
 import (
 	"strings"
 	"testing"
+	"unsafe"
 )
+
+var dnLayoutSink DN
+
+func TestDNCompactCommonFields(t *testing.T) {
+	if got := unsafe.Sizeof(DN{}); got != 56 {
+		t.Fatalf("DN 固定布局 = %d B，期望 56 B", got)
+	}
+	commonAllocs := testing.AllocsPerRun(1000, func() {
+		dnLayoutSink = NewDN(DNFields{
+			CommonName: "device-1", Country: "CN", Organization: "Acme",
+		})
+	})
+	if commonAllocs != 0 {
+		t.Fatalf("常见 DN 字段每次构造分配 %.1f 次，期望 0", commonAllocs)
+	}
+	rareAllocs := testing.AllocsPerRun(1000, func() {
+		dnLayoutSink = NewDN(DNFields{CommonName: "device-1", Locality: "Singapore"})
+	})
+	if rareAllocs != 1 {
+		t.Fatalf("含稀有字段的 DN 每次构造分配 %.1f 次，期望 1", rareAllocs)
+	}
+}
 
 // TestAllDNFieldsAreReferenceable 验证每个声明支持的 DN 字段都真的可用：
 // 能被解析、能被求值、能参与匹配。
@@ -11,7 +34,7 @@ import (
 // 清单与实现不一致是很隐蔽的缺陷——策略里写了一个"支持"的字段，
 // 求值时却恒为空，结果是该语句永远不匹配，表现为设备莫名被拒。
 func TestAllDNFieldsAreReferenceable(t *testing.T) {
-	full := DN{
+	full := NewDN(DNFields{
 		CommonName:         "cn-value",
 		Country:            "CN",
 		Organization:       "org-value",
@@ -20,7 +43,7 @@ func TestAllDNFieldsAreReferenceable(t *testing.T) {
 		Locality:           "locality-value",
 		SerialNumber:       "dn-serial",
 		Qualifier:          "qualifier-value",
-	}
+	})
 	for i := dnField(0); i < numDNFields; i++ {
 		name := dnFieldNames[i]
 		want := full.field(i)
@@ -32,7 +55,7 @@ func TestAllDNFieldsAreReferenceable(t *testing.T) {
 				res := "arn:aws:iot:*:*:topic/x/${iot:Certificate." + which + "." + name + "}"
 				cs := mustCompile(t, "p", `{"Statement":[{"Effect":"Allow",
 				  "Action":"iot:Publish","Resource":"`+res+`"}]}`)
-				ctx := &Context{ClientID: "c"}
+				ctx := &Context{ClientID: "c", Cert: &CertContext{}}
 				if which == "Subject" {
 					ctx.Cert.Subject = full
 				} else {
@@ -42,7 +65,7 @@ func TestAllDNFieldsAreReferenceable(t *testing.T) {
 					t.Errorf("字段 %s.%s 求值为 %q 时应放行，得到 %s", which, name, want, d)
 				}
 				// 另一侧未填充，应求值失败而拒绝
-				other := &Context{ClientID: "c"}
+				other := &Context{ClientID: "c", Cert: &CertContext{}}
 				if which == "Subject" {
 					other.Cert.Issuer = full
 				} else {
@@ -221,8 +244,8 @@ func FuzzEvalNeverPanics(f *testing.F) {
 		}
 		ctx := &Context{
 			ClientID: "dev", Thing: "dev", ThingAttached: true,
-			ThingAttr: func(string) (string, bool) { return "v", true },
-			Cert: CertContext{
+			ThingAttrs: testThingAttrs{"dev/attr": "v"},
+			Cert: &CertContext{
 				SerialNumber: "SN",
 				Subject:      DN{CommonName: "cn"},
 				Issuer:       DN{CommonName: "ca"},

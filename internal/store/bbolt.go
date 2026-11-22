@@ -192,6 +192,95 @@ func (k *boltKV) write(sync bool, fn func(*bolt.Bucket) error) error {
 	return nil
 }
 
+// boltTx 把 bbolt 的桶包成 Tx。
+//
+// 只持桶而不持 *bolt.Tx：Tx 接口不需要提交与回滚（见它的说明），
+// 而少暴露一个引擎类型就少一处把引擎泄到业务代码里的机会（ARCH-065）。
+type boltTx struct{ b *bolt.Bucket }
+
+func (t boltTx) Get(key []byte) ([]byte, error) {
+	v := t.b.Get(key)
+	if v == nil {
+		return nil, ErrNotFound
+	}
+	// 复制：bbolt 返回的是 mmap 视图，事务一关就不再有效，而 KV.Get
+	// 的约定是"调用方可以随意持有与修改"。
+	return append([]byte(nil), v...), nil
+}
+
+func (t boltTx) Set(key, value []byte) error { return t.b.Put(key, value) }
+
+func (t boltTx) Delete(key []byte) error { return t.b.Delete(key) }
+
+func (t boltTx) Scan(prefix []byte, fn func(key, value []byte) bool) error {
+	c := t.b.Cursor()
+	for key, val := c.Seek(prefix); key != nil &&
+		bytes.HasPrefix(key, prefix); key, val = c.Next() {
+		if !fn(key, val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (k *boltKV) InTx(sync bool, fn func(Tx) error) error {
+	return k.write(sync, func(b *bolt.Bucket) error { return fn(boltTx{b: b}) })
+}
+
+// replaceFiltered 在一个 bbolt 写事务里流式删除非保留键并装入新记录。
+// Cursor.Delete 避免先把百万 metadata 键复制进内存。
+func (k *boltKV) replaceFiltered(preserve func([]byte) bool,
+	load func(set func([]byte, []byte) error) error,
+) error {
+	return k.write(true, func(b *bolt.Bucket) error {
+		c := b.Cursor()
+		for key, _ := c.First(); key != nil; key, _ = c.Next() {
+			if preserve != nil && preserve(key) {
+				continue
+			}
+			if err := c.Delete(); err != nil {
+				return err
+			}
+		}
+		return load(b.Put)
+	})
+}
+
+// PruneMarked 用 bbolt cursor 就地删除，不把百万个键先复制到堆上。
+func (k *boltKV) PruneMarked(prefix, marker []byte,
+	remove func(key []byte) (bool, error),
+) (deleted int, already bool, err error) {
+	err = k.write(true, func(b *bolt.Bucket) error {
+		if b.Get(marker) != nil {
+			already = true
+			return nil
+		}
+		c := b.Cursor()
+		for key, _ := c.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, _ = c.Next() {
+			shouldRemove := false
+			if remove != nil {
+				var removeErr error
+				shouldRemove, removeErr = remove(key)
+				if removeErr != nil {
+					return removeErr
+				}
+			}
+			if !shouldRemove {
+				continue
+			}
+			if err := c.Delete(); err != nil {
+				return err
+			}
+			deleted++
+		}
+		return b.Put(marker, []byte{1})
+	})
+	if err != nil {
+		deleted = 0
+	}
+	return deleted, already, err
+}
+
 func (k *boltKV) Scan(prefix []byte, fn func(key, value []byte) bool) error {
 	k.mu.RLock()
 	defer k.mu.RUnlock()

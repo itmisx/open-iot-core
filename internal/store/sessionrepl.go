@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"sync"
+	"time"
 
 	"github.com/itmisx/open-iot-core/internal/cluster"
 	"github.com/itmisx/open-iot-core/internal/session"
@@ -41,7 +44,228 @@ const (
 	sessionOpEnqueue uint8 = 3
 	sessionOpTake    uint8 = 4
 	sessionOpExpire  uint8 = 5
+	sessionOpReplace uint8 = 6
+	// sessionOpBatch 把同一分片的多条独立命令装进一条 Raft
+	// 日志。它是持久会话 CONNECT 路径的合并提案（CLU-134）。
+	sessionOpBatch uint8 = 7
 )
+
+// MergeSessionProposals 把多个 Access 节点已经形成的会话 batch 在 shard
+// leader 上再次展平。状态机返回的是 stale 位图，所以总逻辑命令数仍限制
+// 为 64；widths 让 cluster 层把合并后的位图切回每个原始请求。
+//
+// 同一 clientId 可以在同一条日志里出现多次：事务按数组顺序应用，后一个
+// epoch 会围栏前一个，stale 位也仍按原位置返回。禁止重复反而会让旧连接的
+// 断开 Save 与新 CONNECT 的 Save 拆成两次 fsync，正是重连风暴里最常见的
+// 相邻写；这里严格保留 leader 队列前缀顺序，不做重排或丢弃。
+func MergeSessionProposals(items [][]byte) ([]byte, []uint8, int, error) {
+	if len(items) == 0 {
+		return nil, nil, 0, errors.New("store: 没有可合并的会话提案")
+	}
+	flat := make([]json.RawMessage, 0, sessionProposalBatchMax)
+	widths := make([]uint8, 0, len(items))
+	bytesUsed := 0
+	consumed := 0
+	for _, raw := range items {
+		var partBuf [sessionProposalBatchMax]json.RawMessage
+		cmd, err := decodeSessionMergeView(raw, true, partBuf[:0])
+		if err != nil {
+			if consumed == 0 {
+				return nil, nil, 1, err
+			}
+			break
+		}
+		// Expire 是一次分片全库扫描，状态机刻意禁止它作为 batch 子命令；
+		// 单独提交也避免一次事务里重复扫描同一分片。
+		if cmd.op == sessionOpExpire {
+			if consumed == 0 {
+				return append([]byte(nil), raw...), []uint8{1}, 1, nil
+			}
+			break
+		}
+		parts := []json.RawMessage{json.RawMessage(raw)}
+		if cmd.op == sessionOpBatch {
+			parts = cmd.batch
+		}
+		valid := true
+		for _, part := range parts {
+			sub, derr := decodeSessionMergeView(part, false, nil)
+			if derr != nil || sub.op == sessionOpBatch || sub.op == sessionOpExpire {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			if consumed == 0 {
+				return append([]byte(nil), raw...), []uint8{uint8(len(parts))}, 1, nil
+			}
+			break
+		}
+		if len(parts) == 0 || len(flat)+len(parts) > sessionProposalBatchMax ||
+			(consumed > 0 && bytesUsed+len(raw) > sessionProposalBatchMaxBytes) {
+			break
+		}
+		flat = append(flat, parts...)
+		widths = append(widths, uint8(len(parts)))
+		bytesUsed += len(raw)
+		consumed++
+	}
+	if consumed == 0 {
+		return append([]byte(nil), items[0]...), []uint8{1}, 1, nil
+	}
+	if consumed == 1 {
+		return append([]byte(nil), items[0]...), widths, 1, nil
+	}
+	// 每个 Access envelope 已在 decodeSessionMergeView(validate=true) 里做过
+	// 完整 JSON 校验，split 出来的子切片天然也是合法 JSON；这里不能再让
+	// json.Valid 把一条最多 1 MiB 的日志重复扫描一遍。
+	return encodeSessionRawBatchUnchecked(flat), widths, consumed, nil
+}
+
+// sessionMergeHeader 是 leader 二次合批唯一需要解码的部分。
+// 不能在这里解整个 session.State：它可含订阅、在途表和离线队列，
+// 64 条合批若全量反序列化，会把 leader 变成 CONNECT 的 CPU/GC 瓶颈。
+type sessionMergeHeader struct {
+	V        int               `json:"v"`
+	Op       uint8             `json:"op"`
+	ClientID string            `json:"c"`
+	Batch    []json.RawMessage `json:"b"`
+}
+
+type sessionMergeView struct {
+	op       uint8
+	clientID []byte
+	batch    []json.RawMessage
+}
+
+func decodeSessionMergeView(raw []byte, validate bool,
+	batchScratch []json.RawMessage,
+) (sessionMergeView, error) {
+	if validate && !json.Valid(raw) {
+		return sessionMergeView{}, errors.New("store: 会话命令损坏")
+	}
+	if op, client, batchAt, ok := canonicalSessionHeader(raw); ok {
+		view := sessionMergeView{op: op, clientID: client}
+		if op == sessionOpBatch {
+			parts, err := splitCanonicalSessionBatch(raw, batchAt, batchScratch)
+			if err != nil {
+				return sessionMergeView{}, err
+			}
+			view.batch = parts
+		}
+		return view, nil
+	}
+	return decodeSessionMergeViewFallback(raw)
+}
+
+func decodeSessionMergeViewFallback(raw []byte) (sessionMergeView, error) {
+	var h sessionMergeHeader
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return sessionMergeView{}, fmt.Errorf("store: 会话命令损坏: %w", err)
+	}
+	if h.V != sessionCmdVersion {
+		return sessionMergeView{}, fmt.Errorf("store: 会话命令版本 %d 不支持", h.V)
+	}
+	return sessionMergeView{op: h.Op, clientID: []byte(h.ClientID), batch: h.Batch}, nil
+}
+
+// canonicalSessionHeader 只读 encoding/json 对 sessionCmd 产生的固定前缀。
+// clientId 含 JSON 转义时回落通用解码，不为了快路径放宽线格式。
+func canonicalSessionHeader(raw []byte) (op uint8, client []byte, batchAt int, ok bool) {
+	const vPrefix = `{"v":`
+	if !bytes.HasPrefix(raw, []byte(vPrefix)) {
+		return 0, nil, 0, false
+	}
+	i := len(vPrefix)
+	version, next, valid := parseCanonicalUint(raw, i)
+	if !valid || version != sessionCmdVersion || !bytes.HasPrefix(raw[next:], []byte(`,"op":`)) {
+		return 0, nil, 0, false
+	}
+	i = next + len(`,"op":`)
+	op64, next, valid := parseCanonicalUint(raw, i)
+	if !valid || op64 > 255 || !bytes.HasPrefix(raw[next:], []byte(`,"c":"`)) {
+		return 0, nil, 0, false
+	}
+	i = next + len(`,"c":"`)
+	start := i
+	for i < len(raw) {
+		switch raw[i] {
+		case '\\':
+			return 0, nil, 0, false
+		case '"':
+			return uint8(op64), raw[start:i], i + 1, true
+		default:
+			i++
+		}
+	}
+	return 0, nil, 0, false
+}
+
+func parseCanonicalUint(raw []byte, start int) (uint64, int, bool) {
+	if start >= len(raw) || raw[start] < '0' || raw[start] > '9' {
+		return 0, start, false
+	}
+	var n uint64
+	i := start
+	for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+		n = n*10 + uint64(raw[i]-'0')
+		i++
+	}
+	return n, i, true
+}
+
+func splitCanonicalSessionBatch(raw []byte, afterClient int,
+	parts []json.RawMessage,
+) ([]json.RawMessage, error) {
+	const batchPrefix = `,"b":[`
+	if afterClient > len(raw) || !bytes.HasPrefix(raw[afterClient:], []byte(batchPrefix)) {
+		return nil, errors.New("store: 会话批命令缺少 b")
+	}
+	i := afterClient + len(batchPrefix)
+	if i >= len(raw) {
+		return nil, errors.New("store: 会话批命令截断")
+	}
+	if raw[i] == ']' {
+		return parts, nil
+	}
+	start, depth := i, 0
+	inString, escaped := false, false
+	for ; i < len(raw); i++ {
+		b := raw[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if b == '\\' {
+				escaped = true
+			} else if b == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch b {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+		case '}':
+			depth--
+		case ']':
+			if depth == 0 {
+				parts = append(parts, json.RawMessage(raw[start:i]))
+				return parts, nil
+			}
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, json.RawMessage(raw[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	return nil, errors.New("store: 会话批命令截断")
+}
 
 // 状态机的返回值，由 Propose 交回提案方。
 const (
@@ -74,7 +298,35 @@ type sessionCmd struct {
 	// 的时刻判定过期，同一条日志在不同节点上产生不同结果——那是分叉，
 	// 而表现是"某个节点上会话莫名消失"。
 	NowMs int64 `json:"n,omitempty"`
+	// Batch 仅在 Op=sessionOpBatch 时有值。用 RawMessage 避免把已经
+	// 编码好的子命令再做一次 base64；子命令仍各自带版本号。
+	Batch []json.RawMessage `json:"b,omitempty"`
 }
+
+const (
+	sessionProposalBatchMax = 64
+	// Access 侧用较小块交给 leader，leader 仍会将多块展平到
+	// 64 条。避免 40+30 这类不可拆的 Access 批让前一条 Raft
+	// 日志只装 40 条，又不降低最终的共识合批上限。
+	sessionAccessProposalBatchMax = 16
+	// 条数上限之外再限编码前大小，避免 64 个拥有大量订阅的
+	// 会话合成一条超过 dragonboat 提案上限的命令。单条超过时仍
+	// 单独提案，让下层给出权威的大小错误。
+	sessionProposalBatchMaxBytes = 1 << 20
+	sessionProposalBatchDelay    = time.Millisecond
+	// 每个 session shard 允许少量提案同时交给 Dragonboat。此前 Access
+	// 合批器必须等一轮 SyncPropose 完整返回才会派下一批，8 个 shard 因而
+	// 最多只有 8 个物理提案在途，重连风暴即使已经合批仍会在用户态排队。
+	// 有界 pipeline 让共识库合并 WAL/传输，同时避免失去多数派时无界堆积。
+	sessionProposalConcurrentMax = 8
+	// pipeline 已有提案在途时，小尾批稍等一会儿，避免把持续到达的请求
+	// 打散成大量单项日志；满批不受这个等待影响。
+	sessionProposalConcurrentMin = 8
+	sessionProposalMaxWait       = 2 * time.Millisecond
+	// 重连风暴后不永久留住峰值数量的 request/channel。
+	sessionProposalRequestCacheMax = 4096
+	sessionProposalSliceCacheMax   = 4096
+)
 
 func encodeSessionCmd(c *sessionCmd) ([]byte, error) {
 	c.V = sessionCmdVersion
@@ -83,6 +335,67 @@ func encodeSessionCmd(c *sessionCmd) ([]byte, error) {
 		return nil, fmt.Errorf("store: 编码会话命令失败: %w", err)
 	}
 	return b, nil
+}
+
+func startSessionBatch(encodedBytes int) []byte {
+	// 保持与 encoding/json 的 sessionCmd 字段顺序一致，便于抓包和旧节点排查。
+	out := make([]byte, 0, encodedBytes+32)
+	out = append(out, `{"v":`...)
+	out = strconv.AppendInt(out, sessionCmdVersion, 10)
+	out = append(out, `,"op":`...)
+	out = strconv.AppendUint(out, uint64(sessionOpBatch), 10)
+	out = append(out, `,"c":"","b":[`...)
+	return out
+}
+
+func encodeSessionRawBatch(parts []json.RawMessage) ([]byte, error) {
+	total := 0
+	for _, raw := range parts {
+		if !json.Valid(raw) {
+			return nil, errors.New("store: 会话批命令含无效 JSON")
+		}
+		total += len(raw)
+	}
+	return encodeSessionRawBatchUncheckedSize(parts, total), nil
+}
+
+func encodeSessionRawBatchUnchecked(parts []json.RawMessage) []byte {
+	total := 0
+	for _, raw := range parts {
+		total += len(raw)
+	}
+	return encodeSessionRawBatchUncheckedSize(parts, total)
+}
+
+func encodeSessionRawBatchUncheckedSize(parts []json.RawMessage, total int) []byte {
+	out := startSessionBatch(total + len(parts))
+	for i, raw := range parts {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, raw...)
+	}
+	out = append(out, ']', '}')
+	return out
+}
+
+func encodeSessionRequestBatch(batch []*sessionProposalRequest) ([]byte, error) {
+	total := 0
+	for _, req := range batch {
+		if !json.Valid(req.data) {
+			return nil, errors.New("store: 会话提案含无效 JSON")
+		}
+		total += len(req.data)
+	}
+	out := startSessionBatch(total + len(batch))
+	for i, req := range batch {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, req.data...)
+	}
+	out = append(out, ']', '}')
+	return out, nil
 }
 
 func decodeSessionCmd(raw []byte) (*sessionCmd, error) {
@@ -119,6 +432,18 @@ func appliedIndexOp(shard, index uint64) Op {
 	return Op{Kind: OpSet, Key: SessionAppliedKey(shard), Value: b[:]}
 }
 
+// kvReader 是 ops 构造函数需要的读能力。
+//
+// 它的存在是为了让同一段逻辑既能从 KV 读（单条 apply、补发前的预读），
+// 也能从一个**写事务**里读（按批 apply，CLU-125）。两者的区别正是这一
+// 条改动的全部：事务里的读看得见同一批里前面几条命令的写入，而批内
+// 后一条必须看得见前一条——入队序号是在 apply 时由当前状态推出的
+// （CLU-115），看不见就撞号，而撞号的表现是一条消息静默覆盖另一条。
+type kvReader interface {
+	Get(key []byte) ([]byte, error)
+	Scan(prefix []byte, fn func(key, value []byte) bool) error
+}
+
 // ApplySessionCmd 应用一条已提交的会话命令。
 //
 // 状态与 applied index 进**同一个 Batch**（CLU-109）：分两次写会留出一个
@@ -137,11 +462,24 @@ func (s *SessionStore) ApplySessionCmd(shard, index uint64, data []byte,
 		// 本节点跳过就是状态机分叉。返回错误让 dragonboat 停掉本节点。
 		return 0, err
 	}
+	if cmd.Op == sessionOpBatch {
+		var result uint64
+		err := s.kv.InTx(false, func(tx Tx) error {
+			v, aerr := s.applyBatchCmd(tx, cmd, owns)
+			if aerr != nil {
+				return aerr
+			}
+			result = v
+			op := appliedIndexOp(shard, index)
+			return tx.Set(op.Key, op.Value)
+		})
+		return result, err
+	}
 	lane := s.lane(cmd.ClientID)
 	lane.Lock()
 	defer lane.Unlock()
 
-	ops, res, err := s.sessionCmdOps(cmd, owns)
+	ops, res, err := s.sessionCmdOps(s.kv, cmd, owns)
 	if err != nil {
 		return 0, err
 	}
@@ -152,35 +490,193 @@ func (s *SessionStore) ApplySessionCmd(shard, index uint64, data []byte,
 	return res, nil
 }
 
+// SessionEntry 是一批已提交会话命令中的一条。
+//
+// Result 由 ApplySessionBatch 回填：epoch 围栏的判定要逐条交回提案方
+// （CLU-116），所以它不能是整批一个值。
+type SessionEntry struct {
+	Index  uint64
+	Data   []byte
+	Result uint64
+}
+
+// ApplySessionBatch 在**一个**写事务里应用一批已提交的会话命令（CLU-125）。
+//
+// 它与逐条调用 ApplySessionCmd 的区别只有一个：fsync 的次数。逐条时
+// 每条命令一次事务提交，而可合并的并发度等于分片数（每个分片只有一个
+// apply 协程，循环里是串行的）——实测单副本 8 分片 187 条/秒，而同一条
+// 路径上把状态机换成不落盘的内存实现是 13772 条/秒，余量全在这里。
+// 这正是 MQTT-119 当年在**本地**会话存储上做过的那件事（逐条 191 次/秒
+// 对合并 27268 次/秒），复制路径把它丢了一次。
+//
+// 三件事不能丢，它们都只在多节点加并发时才显形：
+//
+//   - **批内后一条要看得见前一条的效果。** 所以读写都走同一个 Tx，而不是
+//     先把全批的 ops 算完再一起写：入队序号是在 apply 时由当前状态推出的
+//     （CLU-115），先算完的话同一批里两条 enqueue 会算出同一个序号，表现
+//     是一条消息静默覆盖另一条。
+//   - **每条命令的返回值要逐条保留**（CLU-116）。
+//   - **applied index 要和数据进同一个事务**（CLU-109）。这里写的是这一批
+//     **最后一条**的 index：中间任何一条的 index 都会让"报的位置"小于
+//     "盘上的状态"，于是重启后那几条被重放，而 dragonboat 不保证重放
+//     已被快照压掉的日志。
+//
+// 整批原子也让错误处理变简单：任何一条出错就整批回滚，由调用方把错误
+// 交给 dragonboat 停掉本节点——它和逐条版一样，不跳过、不继续。
+func (s *SessionStore) ApplySessionBatch(shard uint64, ents []SessionEntry,
+	owns func(string) bool,
+) error {
+	if len(ents) == 0 {
+		return nil
+	}
+	cmds := make([]*sessionCmd, len(ents))
+	for i := range ents {
+		cmd, err := decodeSessionCmd(ents[i].Data)
+		if err != nil {
+			// 解不开的命令是致命的（与逐条版同一条理由）：它已被多数派
+			// 提交，别的节点会应用它，本节点跳过就是状态机分叉。
+			return err
+		}
+		cmds[i] = cmd
+	}
+	// sync 传 false：允许与别的分片的事务合并，这正是要的效果。持久性
+	// 不受影响——bbolt 的 Batch 仍然在返回前提交并 fsync（见 boltKV.write）。
+	return s.kv.InTx(false, func(tx Tx) error {
+		// 结果每次都从头填：sync=false 的事务体可能被重跑（bbolt 的
+		// Batch 语义），累积就会串味。
+		for i := range ents {
+			ents[i].Result = 0
+		}
+		for i := range ents {
+			res, err := s.applyOneLocked(tx, cmds[i], owns)
+			if err != nil {
+				return err
+			}
+			ents[i].Result = res
+		}
+		op := appliedIndexOp(shard, ents[len(ents)-1].Index)
+		return tx.Set(op.Key, op.Value)
+	})
+}
+
+// applyOneLocked 在给定事务里应用一条命令，返回状态机的判定值。
+//
+// lane 锁一条一取、取完即放，不是整批持着：lane 的作用是挡住同一个
+// clientId 上的并发读改写，而一次只持一把就不会死锁（整批持着要先对
+// clientId 排序，而那只是为了一个这里不需要的性质）。
+func (s *SessionStore) applyOneLocked(tx Tx, cmd *sessionCmd,
+	owns func(string) bool,
+) (uint64, error) {
+	if cmd.Op == sessionOpBatch {
+		return s.applyBatchCmd(tx, cmd, owns)
+	}
+	lane := s.lane(cmd.ClientID)
+	lane.Lock()
+	defer lane.Unlock()
+	ops, res, err := s.sessionCmdOps(tx, cmd, owns)
+	if err != nil {
+		return 0, err
+	}
+	for i := range ops {
+		switch ops[i].Kind {
+		case OpSet:
+			if err := tx.Set(ops[i].Key, ops[i].Value); err != nil {
+				return 0, err
+			}
+		case OpDelete:
+			if err := tx.Delete(ops[i].Key); err != nil {
+				return 0, err
+			}
+		default:
+			return 0, fmt.Errorf("store: 未知的操作类型 %d", ops[i].Kind)
+		}
+	}
+	return res, nil
+}
+
+// applyBatchCmd 在同一个状态机事务里顺序应用子命令。
+// 返回值的第 i 位表示第 i 条被 epoch 围栏拒绝。
+func (s *SessionStore) applyBatchCmd(tx Tx, cmd *sessionCmd,
+	owns func(string) bool,
+) (uint64, error) {
+	if len(cmd.Batch) == 0 || len(cmd.Batch) > sessionProposalBatchMax {
+		return 0, fmt.Errorf("store: 会话批命令条数 %d 超出范围", len(cmd.Batch))
+	}
+	var result uint64
+	for i := range cmd.Batch {
+		sub, err := decodeSessionCmd(cmd.Batch[i])
+		if err != nil {
+			return 0, err
+		}
+		if sub.Op == sessionOpBatch || sub.Op == sessionOpExpire {
+			return 0, fmt.Errorf("store: 会话批命令不允许子操作 %d", sub.Op)
+		}
+		v, err := s.applyOneLocked(tx, sub, owns)
+		if err != nil {
+			return 0, err
+		}
+		if v == sessionResStale {
+			result |= uint64(1) << uint(i)
+		}
+	}
+	return result, nil
+}
+
 // sessionCmdOps 把一条命令翻成一组写入，不自己落盘。
 //
 // 拆出来是为了让 applied index 能和它们进同一个 Batch。所有分支都只
 // **读**当前状态再算出写入——于是同一条命令在任何节点上算出的是同一组
 // 写入，这正是复制日志要求的确定性。
-func (s *SessionStore) sessionCmdOps(cmd *sessionCmd, owns func(string) bool,
+func (s *SessionStore) sessionCmdOps(r kvReader, cmd *sessionCmd,
+	owns func(string) bool,
 ) ([]Op, uint64, error) {
 	switch cmd.Op {
 	case sessionOpSave:
-		return s.saveOps(cmd)
+		return s.saveOps(r, cmd)
 	case sessionOpDelete:
-		return s.deleteOps(cmd)
+		return s.deleteOps(r, cmd)
 	case sessionOpEnqueue:
-		return s.enqueueOps(cmd)
+		return s.enqueueOps(r, cmd)
 	case sessionOpTake:
-		return s.takeOps(cmd)
+		return s.takeOps(r, cmd)
 	case sessionOpExpire:
-		return s.expireOps(cmd, owns)
+		return s.expireOps(r, cmd, owns)
+	case sessionOpReplace:
+		return s.replaceOps(r, cmd)
+	case sessionOpBatch:
+		return nil, 0, errors.New("store: 批命令必须在事务中应用")
 	default:
 		return nil, 0, fmt.Errorf("store: 未知的会话操作码 %d", cmd.Op)
 	}
 }
 
-func (s *SessionStore) saveOps(cmd *sessionCmd) ([]Op, uint64, error) {
+func (s *SessionStore) replaceOps(r kvReader, cmd *sessionCmd) ([]Op, uint64, error) {
+	if cmd.State == nil || cmd.State.ClientID == "" {
+		return nil, 0, errors.New("store: replace 命令缺少会话状态")
+	}
+	cur, found, err := s.peek(r, cmd.State.ClientID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if found && cmd.State.Epoch < cur.Epoch {
+		return nil, sessionResStale, nil
+	}
+	if found && s.staleAtEqualEpoch(cur, cmd.State) {
+		return nil, sessionResStale, nil
+	}
+	ops, err := s.replaceStateOps(r, cmd.State)
+	if err != nil {
+		return nil, 0, err
+	}
+	return ops, sessionResOK, nil
+}
+
+func (s *SessionStore) saveOps(r kvReader, cmd *sessionCmd) ([]Op, uint64, error) {
 	st := cmd.State
 	if st == nil || st.ClientID == "" {
 		return nil, 0, errors.New("store: save 命令缺少会话状态")
 	}
-	cur, found, err := s.peek(st.ClientID)
+	cur, found, err := s.peek(r, st.ClientID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -192,6 +688,12 @@ func (s *SessionStore) saveOps(cmd *sessionCmd) ([]Op, uint64, error) {
 	if found && st.Epoch < cur.Epoch {
 		return nil, sessionResStale, nil
 	}
+	// epoch 相等的那一种同样在这里判（CLU-131）。判定只看命令与当前
+	// 状态，所以每个节点算出的结果相同——确定性不受影响，各节点各自
+	// 累加自己的计数器。
+	if found && s.staleAtEqualEpoch(cur, st) {
+		return nil, sessionResStale, nil
+	}
 	bare := *st
 	bare.Queued = nil
 	enc, eerr := encodeSession(&bare)
@@ -201,7 +703,7 @@ func (s *SessionStore) saveOps(cmd *sessionCmd) ([]Op, uint64, error) {
 	ops := []Op{{Kind: OpSet, Key: sessionKey(st.ClientID), Value: enc}}
 	// 队列只在传进来的那一份非 nil 时对账（与单机的 Save 同一条约定）。
 	if st.Queued != nil {
-		clear, cerr := s.queuedKeys(st.ClientID)
+		clear, cerr := s.queuedKeys(r, st.ClientID)
 		if cerr != nil {
 			return nil, 0, cerr
 		}
@@ -223,8 +725,8 @@ func (s *SessionStore) saveOps(cmd *sessionCmd) ([]Op, uint64, error) {
 	return ops, sessionResOK, nil
 }
 
-func (s *SessionStore) deleteOps(cmd *sessionCmd) ([]Op, uint64, error) {
-	cur, found, err := s.peek(cmd.ClientID)
+func (s *SessionStore) deleteOps(r kvReader, cmd *sessionCmd) ([]Op, uint64, error) {
+	cur, found, err := s.peek(r, cmd.ClientID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -236,7 +738,7 @@ func (s *SessionStore) deleteOps(cmd *sessionCmd) ([]Op, uint64, error) {
 		// 连接有权删（与单机的 Delete 同一条）。
 		return nil, sessionResStale, nil
 	}
-	keys, kerr := s.queuedKeys(cmd.ClientID)
+	keys, kerr := s.queuedKeys(r, cmd.ClientID)
 	if kerr != nil {
 		return nil, 0, kerr
 	}
@@ -247,7 +749,7 @@ func (s *SessionStore) deleteOps(cmd *sessionCmd) ([]Op, uint64, error) {
 	return append(ops, Op{Kind: OpDelete, Key: sessionKey(cmd.ClientID)}), sessionResOK, nil
 }
 
-func (s *SessionStore) enqueueOps(cmd *sessionCmd) ([]Op, uint64, error) {
+func (s *SessionStore) enqueueOps(r kvReader, cmd *sessionCmd) ([]Op, uint64, error) {
 	if cmd.Msg == nil {
 		return nil, 0, errors.New("store: enqueue 命令缺少消息")
 	}
@@ -256,7 +758,7 @@ func (s *SessionStore) enqueueOps(cmd *sessionCmd) ([]Op, uint64, error) {
 	// 这一步是确定性的来源：各节点按同一个日志序应用，于是算出同一个
 	// 序号。换成提案方分配，两个节点并发入队就会撞号——而撞号的表现是
 	// 一条消息静默覆盖另一条（键相同），不是报错。
-	last, err := s.lastQueuedSeq(cmd.ClientID)
+	last, err := s.lastQueuedSeq(r, cmd.ClientID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -269,10 +771,10 @@ func (s *SessionStore) enqueueOps(cmd *sessionCmd) ([]Op, uint64, error) {
 	}}, sessionResOK, nil
 }
 
-func (s *SessionStore) takeOps(cmd *sessionCmd) ([]Op, uint64, error) {
+func (s *SessionStore) takeOps(r kvReader, cmd *sessionCmd) ([]Op, uint64, error) {
 	prefix := queuedPrefix(cmd.ClientID)
 	var ops []Op
-	err := s.kv.Scan(prefix, func(key, _ []byte) bool {
+	err := r.Scan(prefix, func(key, _ []byte) bool {
 		if len(key) != len(prefix)+8 {
 			return true
 		}
@@ -295,14 +797,15 @@ func (s *SessionStore) takeOps(cmd *sessionCmd) ([]Op, uint64, error) {
 // 本分片的日志里，否则快照会把它们复活：另一个分片的快照含着这些键，
 // 而它那条日志从没删过它们。所以同一轮清理在每个分片上各提一条命令，
 // 各自只删自己那一批（CLU-114）。
-func (s *SessionStore) expireOps(cmd *sessionCmd, owns func(string) bool,
+func (s *SessionStore) expireOps(r kvReader, cmd *sessionCmd,
+	owns func(string) bool,
 ) ([]Op, uint64, error) {
 	if owns == nil {
 		return nil, 0, errors.New("store: expire 命令缺少分片归属判定")
 	}
 	var ops []Op
 	var ids []string
-	err := s.kv.Scan([]byte{byte(PrefixSession)}, func(key, value []byte) bool {
+	err := r.Scan([]byte{byte(PrefixSession)}, func(key, value []byte) bool {
 		st, derr := decodeSession(value)
 		if derr != nil {
 			if parts, ok := SplitKey(key, PrefixSession, 1); ok && owns(parts[0]) {
@@ -320,7 +823,7 @@ func (s *SessionStore) expireOps(cmd *sessionCmd, owns func(string) bool,
 	}
 	for _, id := range ids {
 		ops = append(ops, Op{Kind: OpDelete, Key: sessionKey(id)})
-		keys, kerr := s.queuedKeys(id)
+		keys, kerr := s.queuedKeys(r, id)
 		if kerr != nil {
 			return nil, 0, kerr
 		}
@@ -332,8 +835,8 @@ func (s *SessionStore) expireOps(cmd *sessionCmd, owns func(string) bool,
 }
 
 // peek 读出会话当前状态（不含队列），供围栏判定使用。
-func (s *SessionStore) peek(clientID string) (*session.State, bool, error) {
-	raw, err := s.kv.Get(sessionKey(clientID))
+func (s *SessionStore) peek(r kvReader, clientID string) (*session.State, bool, error) {
+	raw, err := r.Get(sessionKey(clientID))
 	if errors.Is(err, ErrNotFound) {
 		return nil, false, nil
 	}
@@ -349,19 +852,19 @@ func (s *SessionStore) peek(clientID string) (*session.State, bool, error) {
 	return st, true, nil
 }
 
-func (s *SessionStore) queuedKeys(clientID string) ([][]byte, error) {
+func (s *SessionStore) queuedKeys(r kvReader, clientID string) ([][]byte, error) {
 	var keys [][]byte
-	err := s.kv.Scan(queuedPrefix(clientID), func(key, _ []byte) bool {
+	err := r.Scan(queuedPrefix(clientID), func(key, _ []byte) bool {
 		keys = append(keys, append([]byte(nil), key...))
 		return true
 	})
 	return keys, err
 }
 
-func (s *SessionStore) lastQueuedSeq(clientID string) (uint64, error) {
+func (s *SessionStore) lastQueuedSeq(r kvReader, clientID string) (uint64, error) {
 	var last uint64
 	prefix := queuedPrefix(clientID)
-	err := s.kv.Scan(prefix, func(key, _ []byte) bool {
+	err := r.Scan(prefix, func(key, _ []byte) bool {
 		if len(key) == len(prefix)+8 {
 			last = binary.BigEndian.Uint64(key[len(prefix):])
 		}
@@ -385,7 +888,7 @@ func (s *SessionStore) PeekQueued(clientID string) ([]session.QueuedMsg, uint64,
 	if len(msgs) == 0 {
 		return nil, 0, nil
 	}
-	last, lerr := s.lastQueuedSeq(clientID)
+	last, lerr := s.lastQueuedSeq(s.kv, clientID)
 	if lerr != nil {
 		return nil, 0, lerr
 	}
@@ -407,15 +910,21 @@ func (s *SessionStore) SnapshotSessionShard(shard uint64, owns func(string) bool
 	if _, err := w.Write(head[:]); err != nil {
 		return err
 	}
+	var recordHeader [8]byte
+	var writeErr error
 	for _, prefix := range []Prefix{PrefixSession, PrefixQueued} {
 		err := s.kv.Scan([]byte{byte(prefix)}, func(key, value []byte) bool {
 			if !owns(clientOfKey(key, prefix)) {
 				return true
 			}
-			return writeKV(w, key, value) == nil
+			writeErr = writeKVHeader(w, key, value, &recordHeader)
+			return writeErr == nil
 		})
 		if err != nil {
 			return err
+		}
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 	return nil
@@ -485,6 +994,12 @@ func clientOfKey(key []byte, prefix Prefix) string {
 
 func writeKV(w io.Writer, key, value []byte) error {
 	var hdr [8]byte
+	return writeKVHeader(w, key, value, &hdr)
+}
+
+// writeKVHeader 允许大扫描复用头缓冲，避免每条记录因 io.Writer 接口逃逸
+// 分配一个 8 字节对象。调用方串行使用 hdr。
+func writeKVHeader(w io.Writer, key, value []byte, hdr *[8]byte) error {
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(key)))
 	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(value)))
 	if _, err := w.Write(hdr[:]); err != nil {
@@ -540,6 +1055,83 @@ type SessionProposer interface {
 	ShardIDs() []uint64
 }
 
+// remoteSessionReader 是 RF<节点数时由 cluster.ShardGroup 提供的读路径。
+// 单元测试里的轻量 proposer 不必实现它；当前 RF=all 时 HasLocalReplica
+// 恒为真，因此生产路径也不会多一次 RPC。
+type remoteSessionReader interface {
+	HasLocalReplica(clientID string) bool
+	ReadSession(clientID string) ([]byte, bool, error)
+}
+
+type claimedSessionReader interface {
+	TakeClaimedSession(clientID string, epoch cluster.Epoch) (
+		data []byte, found, cached bool, err error,
+	)
+}
+
+// sessionReplicaSnapshot 是 session cell 的只读快照。cluster 只把它当成
+// 不透明字节转发；编码放在 store，避免传输层依赖 session 包。
+//
+// QueueUpTo 必须和 Queue 来自同一次本地读取。TakeQueued 随后提交的是
+// “删到该序号”，而不是清空队列，因此快照之后新入队的消息不会被误删。
+type sessionReplicaSnapshot struct {
+	State     *session.State      `json:"s,omitempty"`
+	Queue     []session.QueuedMsg `json:"q,omitempty"`
+	QueueUpTo uint64              `json:"u,omitempty"`
+}
+
+// ReadReplicaSnapshot 编码一份可供非副本节点读取的完整 session-cell
+// 快照。found 表示会话或队列至少有一项；队列可以在会话记录暂时不存在时
+// 独立存在，所以不能只用 Load 的 found。
+func (s *SessionStore) ReadReplicaSnapshot(clientID string) ([]byte, bool, error) {
+	// 一把 client lane 锁内读取状态、队列与水位：既避免 Load 和
+	// PeekQueued 各扫描一次队列，也保证三者来自同一个本地视图。
+	lane := s.lane(clientID)
+	lane.Lock()
+	defer lane.Unlock()
+	var st *session.State
+	stateFound := false
+	rawState, err := s.kv.Get(sessionKey(clientID))
+	if err == nil {
+		st, err = decodeSession(rawState)
+		stateFound = err == nil
+	} else if errors.Is(err, ErrNotFound) {
+		err = nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store: 读取远程会话快照 %s 失败: %w", clientID, err)
+	}
+	msgs, err := s.loadQueued(clientID)
+	if err != nil {
+		return nil, false, err
+	}
+	var upTo uint64
+	if len(msgs) > 0 {
+		upTo, err = s.lastQueuedSeq(s.kv, clientID)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if !stateFound && len(msgs) == 0 {
+		return nil, false, nil
+	}
+	raw, err := json.Marshal(sessionReplicaSnapshot{
+		State: st, Queue: msgs, QueueUpTo: upTo,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("store: 编码远程会话快照 %s 失败: %w", clientID, err)
+	}
+	return raw, true, nil
+}
+
+func decodeReplicaSnapshot(clientID string, raw []byte) (sessionReplicaSnapshot, error) {
+	var snap sessionReplicaSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return sessionReplicaSnapshot{}, fmt.Errorf("store: 远程会话快照损坏 %s: %w", clientID, err)
+	}
+	return snap, nil
+}
+
 // ReplicatedSessionStore 是会话的集群实现：写入走复制日志，读取走本地。
 //
 // 读不经过共识是刻意的（契约 05）：CONNECT 时要读会话，而那条路径上
@@ -550,12 +1142,85 @@ type SessionProposer interface {
 type ReplicatedSessionStore struct {
 	local *SessionStore
 	prop  SessionProposer
+
+	batchMu               sync.Mutex
+	batch                 map[uint64]*sessionProposalLane
+	reqFree               []*sessionProposalRequest
+	proposalBackpressured uint64
+	proposalQueued        int
+	proposalActive        int
+	proposalPeakQueued    int
+	proposalPeakActive    int
+}
+
+// SessionProposalQueueStats 是 Access 侧会话提案 pipeline 的有界快照。
+// 它与 ShardGroup 的 Raft 指标分开：这里回答请求是否仍堵在用户态队列，
+// 后者回答真正进入共识的日志数与耗时。
+type SessionProposalQueueStats struct {
+	Backpressured       uint64
+	Queued              int
+	InFlight            int
+	InFlightBatches     int
+	PeakQueued          int
+	PeakInFlightBatches int
+	CachedRequests      int
+	CachedBatches       int
+}
+
+func (r *ReplicatedSessionStore) ProposalQueueStats() SessionProposalQueueStats {
+	r.batchMu.Lock()
+	st := SessionProposalQueueStats{
+		Backpressured:       r.proposalBackpressured,
+		Queued:              r.proposalQueued,
+		InFlightBatches:     r.proposalActive,
+		PeakQueued:          r.proposalPeakQueued,
+		PeakInFlightBatches: r.proposalPeakActive,
+		CachedRequests:      len(r.reqFree),
+	}
+	for _, lane := range r.batch {
+		st.InFlight += len(lane.inFlight)
+		st.CachedBatches += len(lane.batchFree)
+	}
+	r.batchMu.Unlock()
+	return st
+}
+
+type sessionProposalResult struct {
+	stale bool
+	err   error
+}
+
+type sessionProposalRequest struct {
+	clientID string
+	data     []byte
+	queued   time.Time
+	done     chan sessionProposalResult
+}
+
+type sessionProposalLane struct {
+	running  bool
+	active   int
+	pending  []*sessionProposalRequest
+	inFlight map[string]struct{}
+	// scratch 与 pending 交换，筛选一批时不再每轮分配 remain。
+	scratch []*sessionProposalRequest
+	// seen 每条 lane 复用；每批清空，不延长 clientId 字符串生命。
+	seen map[string]struct{}
+	// batchFree 的上限等于并行提案上限，避免一次重连风暴永久保留
+	// 大量临时指针数组。
+	batchFree []*sessionProposalBatch
+}
+
+type sessionProposalBatch struct {
+	requests []*sessionProposalRequest
 }
 
 // NewReplicatedSessionStore 包装一个本地会话存储。
 func NewReplicatedSessionStore(local *SessionStore, prop SessionProposer,
 ) *ReplicatedSessionStore {
-	return &ReplicatedSessionStore{local: local, prop: prop}
+	return &ReplicatedSessionStore{
+		local: local, prop: prop, batch: make(map[uint64]*sessionProposalLane),
+	}
 }
 
 var _ session.Store = (*ReplicatedSessionStore)(nil)
@@ -566,7 +1231,45 @@ func (r *ReplicatedSessionStore) Local() *SessionStore { return r.local }
 // Load 从本地读。
 func (r *ReplicatedSessionStore) Load(ctx context.Context, clientID string,
 ) (*session.State, bool, error) {
+	if reader, ok := r.prop.(remoteSessionReader); ok && !reader.HasLocalReplica(clientID) {
+		raw, found, err := reader.ReadSession(clientID)
+		return decodeLoadedReplica(clientID, raw, found, err)
+	}
 	return r.local.Load(ctx, clientID)
+}
+
+// LoadClaimed 优先消费 ownership Claim RPC 顺带返回的一次性快照。
+// 没有预读结果时退回 Load，故它是纯性能优化，不改变故障与重试语义。
+func (r *ReplicatedSessionStore) LoadClaimed(ctx context.Context, clientID string,
+	epoch cluster.Epoch,
+) (*session.State, bool, error) {
+	reader, remote := r.prop.(remoteSessionReader)
+	if !remote || reader.HasLocalReplica(clientID) {
+		return r.local.Load(ctx, clientID)
+	}
+	if claimed, ok := r.prop.(claimedSessionReader); ok {
+		raw, found, cached, err := claimed.TakeClaimedSession(clientID, epoch)
+		if cached {
+			return decodeLoadedReplica(clientID, raw, found, err)
+		}
+	}
+	return r.Load(ctx, clientID)
+}
+
+func decodeLoadedReplica(clientID string, raw []byte, found bool, err error) (
+	*session.State, bool, error,
+) {
+	if err != nil || !found {
+		return nil, found, err
+	}
+	snap, err := decodeReplicaSnapshot(clientID, raw)
+	if err != nil {
+		return nil, false, err
+	}
+	if snap.State != nil {
+		snap.State.Queued = snap.Queue
+	}
+	return snap.State, snap.State != nil, nil
 }
 
 // Save 把会话状态提进复制日志。
@@ -576,6 +1279,20 @@ func (r *ReplicatedSessionStore) Save(_ context.Context, st *session.State) erro
 	}
 	data, err := encodeSessionCmd(&sessionCmd{
 		Op: sessionOpSave, ClientID: st.ClientID, State: st,
+	})
+	if err != nil {
+		return err
+	}
+	return r.propose(st.ClientID, data)
+}
+
+// Replace atomically replaces a persistent session in one shard proposal.
+func (r *ReplicatedSessionStore) Replace(_ context.Context, st *session.State) error {
+	if st == nil || st.ClientID == "" {
+		return errors.New("store: 会话缺少 clientId")
+	}
+	data, err := encodeSessionCmd(&sessionCmd{
+		Op: sessionOpReplace, ClientID: st.ClientID, State: st,
 	})
 	if err != nil {
 		return err
@@ -646,7 +1363,23 @@ func (r *ReplicatedSessionStore) AppendQueued(clientID string, m session.QueuedM
 // 下次重连再补发。反过来（先返回再提案）会在提案失败时把消息投出去
 // 却没删，下次重连重投一遍。
 func (r *ReplicatedSessionStore) TakeQueued(clientID string) ([]session.QueuedMsg, error) {
-	msgs, upTo, err := r.local.PeekQueued(clientID)
+	var msgs []session.QueuedMsg
+	var upTo uint64
+	var err error
+	if reader, ok := r.prop.(remoteSessionReader); ok && !reader.HasLocalReplica(clientID) {
+		var raw []byte
+		var found bool
+		raw, found, err = reader.ReadSession(clientID)
+		if err == nil && found {
+			var snap sessionReplicaSnapshot
+			snap, err = decodeReplicaSnapshot(clientID, raw)
+			if err == nil {
+				msgs, upTo = snap.Queue, snap.QueueUpTo
+			}
+		}
+	} else {
+		msgs, upTo, err = r.local.PeekQueued(clientID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -666,14 +1399,193 @@ func (r *ReplicatedSessionStore) TakeQueued(clientID string) ([]session.QueuedMs
 }
 
 func (r *ReplicatedSessionStore) propose(clientID string, data []byte) error {
-	res, err := r.prop.Propose(clientID, data)
-	if err != nil {
-		return err
+	shard := r.prop.ShardOf(clientID)
+	r.batchMu.Lock()
+	var req *sessionProposalRequest
+	if n := len(r.reqFree); n > 0 {
+		req = r.reqFree[n-1]
+		r.reqFree = r.reqFree[:n-1]
+	} else {
+		req = &sessionProposalRequest{done: make(chan sessionProposalResult, 1)}
 	}
-	if res == sessionResStale {
+	// propose 是同步等待：收到 done 之前调用方不会改写 data，
+	// 所以无需再把已编码命令复制一遍。
+	req.clientID, req.data, req.queued = clientID, data, time.Now()
+	lane := r.batch[shard]
+	if lane == nil {
+		lane = &sessionProposalLane{inFlight: make(map[string]struct{})}
+		r.batch[shard] = lane
+	}
+	lane.pending = append(lane.pending, req)
+	r.proposalQueued++
+	if r.proposalQueued > r.proposalPeakQueued {
+		r.proposalPeakQueued = r.proposalQueued
+	}
+	if lane.active >= sessionProposalConcurrentMax {
+		r.proposalBackpressured++
+	}
+	if !lane.running {
+		lane.running = true
+		go r.runProposalLane(shard, lane)
+	}
+	r.batchMu.Unlock()
+	result := <-req.done
+	req.clientID, req.data, req.queued = "", nil, time.Time{}
+	r.batchMu.Lock()
+	if len(r.reqFree) < sessionProposalRequestCacheMax {
+		r.reqFree = append(r.reqFree, req)
+	}
+	r.batchMu.Unlock()
+	if result.err != nil {
+		return result.err
+	}
+	if result.stale {
 		return cluster.ErrStaleEpoch
 	}
 	return nil
+}
+
+// runProposalLane 将同一分片短时间内到达的写入合成一次
+// SyncPropose，并把少量互不相关的批次并行交给 Dragonboat。每批一个
+// clientId 最多一条，且同 clientId 在前一批完成前不会进入下一批；否则
+// pipeline 的完成乱序会破坏同设备的 Save/Take/Enqueue 顺序。
+func (r *ReplicatedSessionStore) runProposalLane(shard uint64, lane *sessionProposalLane) {
+	for {
+		time.Sleep(sessionProposalBatchDelay)
+		r.batchMu.Lock()
+		if len(lane.pending) == 0 {
+			if lane.active == 0 {
+				lane.running = false
+				if cap(lane.pending) > sessionProposalSliceCacheMax {
+					lane.pending = nil
+				}
+				if cap(lane.scratch) > sessionProposalSliceCacheMax {
+					lane.scratch = nil
+				}
+				r.batchMu.Unlock()
+				return
+			}
+			r.batchMu.Unlock()
+			continue
+		}
+		batch, dispatch := selectSessionProposalBatch(lane, time.Now())
+		if dispatch {
+			r.proposalQueued -= len(batch.requests)
+			r.proposalActive++
+			if r.proposalActive > r.proposalPeakActive {
+				r.proposalPeakActive = r.proposalActive
+			}
+		}
+		r.batchMu.Unlock()
+		if dispatch {
+			go r.finishProposalBatch(shard, lane, batch)
+		}
+	}
+}
+
+// selectSessionProposalBatch 在 batchMu 下选出一批可并行的请求。
+// now 可注入，既让尾批等待边界可测，也避免测试依赖调度时序。
+func selectSessionProposalBatch(lane *sessionProposalLane, now time.Time) (
+	*sessionProposalBatch, bool,
+) {
+	if len(lane.pending) == 0 || lane.active >= sessionProposalConcurrentMax {
+		return nil, false
+	}
+	batch := lane.takeBatch()
+	// remain 必须用与 pending 不同的底层数组；就地 append 会覆盖 range
+	// 尚未读到的请求。scratch 在两个独立数组间交换。
+	pending := lane.pending
+	remain := lane.scratch[:0]
+	seen := lane.seen
+	if seen == nil {
+		seen = make(map[string]struct{}, sessionAccessProposalBatchMax)
+		lane.seen = seen
+	}
+	batchBytes := 0
+	for _, req := range pending {
+		_, duplicate := seen[req.clientID]
+		_, blocked := lane.inFlight[req.clientID]
+		fitsBytes := len(batch.requests) == 0 ||
+			batchBytes+len(req.data) <= sessionProposalBatchMaxBytes
+		if len(batch.requests) < sessionAccessProposalBatchMax && !duplicate && !blocked && fitsBytes {
+			seen[req.clientID] = struct{}{}
+			batch.requests = append(batch.requests, req)
+			batchBytes += len(req.data)
+		} else {
+			remain = append(remain, req)
+		}
+	}
+	if len(batch.requests) == 0 || (lane.active > 0 &&
+		len(batch.requests) < sessionProposalConcurrentMin &&
+		now.Sub(batch.requests[0].queued) < sessionProposalMaxWait) {
+		clear(remain)
+		clear(seen)
+		lane.putBatch(batch)
+		return nil, false
+	}
+	lane.pending = remain
+	for id := range seen {
+		lane.inFlight[id] = struct{}{}
+	}
+	clear(pending)
+	lane.scratch = pending[:0]
+	clear(seen)
+	lane.active++
+	return batch, true
+}
+
+func (lane *sessionProposalLane) takeBatch() *sessionProposalBatch {
+	if n := len(lane.batchFree); n > 0 {
+		batch := lane.batchFree[n-1]
+		lane.batchFree = lane.batchFree[:n-1]
+		return batch
+	}
+	return &sessionProposalBatch{
+		requests: make([]*sessionProposalRequest, 0, sessionProposalBatchMax),
+	}
+}
+
+func (lane *sessionProposalLane) putBatch(batch *sessionProposalBatch) {
+	clear(batch.requests)
+	batch.requests = batch.requests[:0]
+	if len(lane.batchFree) < sessionProposalConcurrentMax {
+		lane.batchFree = append(lane.batchFree, batch)
+	}
+}
+
+func (r *ReplicatedSessionStore) finishProposalBatch(shard uint64,
+	lane *sessionProposalLane, batch *sessionProposalBatch,
+) {
+	result, err := r.proposeBatch(shard, batch.requests)
+	r.batchMu.Lock()
+	for _, req := range batch.requests {
+		delete(lane.inFlight, req.clientID)
+	}
+	lane.active--
+	r.proposalActive--
+	r.batchMu.Unlock()
+	for i, req := range batch.requests {
+		req.done <- sessionProposalResult{
+			stale: result&(uint64(1)<<uint(i)) != 0,
+			err:   err,
+		}
+	}
+	r.batchMu.Lock()
+	lane.putBatch(batch)
+	r.batchMu.Unlock()
+}
+
+func (r *ReplicatedSessionStore) proposeBatch(shard uint64,
+	batch []*sessionProposalRequest,
+) (uint64, error) {
+	if len(batch) == 1 {
+		return r.prop.ProposeShard(shard, batch[0].data)
+	}
+	data, err := encodeSessionRequestBatch(batch)
+	if err != nil {
+		return 0, err
+	}
+	return r.prop.ProposeShard(shard, data)
 }
 
 // Count 返回本地已持久化的会话数。

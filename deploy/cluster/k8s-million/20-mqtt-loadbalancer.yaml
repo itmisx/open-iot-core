@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: openiotd-mqtt
+  namespace: open-iot-core
+  annotations:
+    # 云厂商若支持直连Pod/IP target，应在这里加入其provider专用annotation，
+    # 进一步绕开node SNAT/conntrack；本通用清单不能猜具体云厂商。
+    openiotd.io/capacity-note: "prefer provider IP target mode"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: openiotd
+  ports:
+    - name: mqtt-tls
+      port: 8883
+      targetPort: 8883

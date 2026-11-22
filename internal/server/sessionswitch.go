@@ -46,14 +46,29 @@ func (s *sessionSwitch) target() session.Store {
 
 func (s *sessionSwitch) Load(ctx context.Context, clientID string,
 ) (*session.State, bool, error) {
-	// 读一律走本地，集群下也是（契约 05：连接路径不发 RPC）。
-	// 这里不经 target 是刻意的——复制实现的 Load 也只是转发到本地，
-	// 多一跳只会让"读是本地读"这件事看起来像个实现细节。
+	// RF=all 时复制实现仍会直接读本地；RF<节点数时，非副本 Access 节点
+	// 必须经它的合批只读路径去 session cell。强制读 local 会把远端已有
+	// 持久会话误判成不存在，并让 CLU-147 的远程读合批成为死代码。
+	return s.target().Load(ctx, clientID)
+}
+
+// LoadClaimed 让 broker 把刚取得的 epoch 交给复制会话层，以命中 Claim
+// 应答携带的一次性快照。单机或尚未切换时与普通 Load 完全相同。
+func (s *sessionSwitch) LoadClaimed(ctx context.Context, clientID string,
+	epoch cluster.Epoch,
+) (*session.State, bool, error) {
+	if r := s.repl.Load(); r != nil {
+		return r.LoadClaimed(ctx, clientID, epoch)
+	}
 	return s.local.Load(ctx, clientID)
 }
 
 func (s *sessionSwitch) Save(ctx context.Context, st *session.State) error {
 	return s.target().Save(ctx, st)
+}
+
+func (s *sessionSwitch) Replace(ctx context.Context, st *session.State) error {
+	return s.target().Replace(ctx, st)
 }
 
 func (s *sessionSwitch) Delete(ctx context.Context, clientID string,
@@ -72,6 +87,13 @@ func (s *sessionSwitch) AppendQueued(clientID string, m session.QueuedMsg) error
 
 func (s *sessionSwitch) TakeQueued(clientID string) ([]session.QueuedMsg, error) {
 	return s.target().TakeQueued(clientID)
+}
+
+func (s *sessionSwitch) proposalQueueStats() store.SessionProposalQueueStats {
+	if r := s.repl.Load(); r != nil {
+		return r.ProposalQueueStats()
+	}
+	return store.SessionProposalQueueStats{}
 }
 
 // Count 报告本地已持久化的会话数。

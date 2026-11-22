@@ -133,24 +133,50 @@ func (s *ReplicatedStore) Apply(ctx context.Context, cmd Command) (*Result, erro
 // 日志前缀，所有节点都会算出同样的冲突，它是确定性的状态机结果，
 // 要交回发起方而不是让 apply 失败——apply 失败会让日志与状态不一致。
 func (s *ReplicatedStore) ApplyCommitted(id string, raw []byte) error {
-	cmd, err := DecodeCommand(raw)
+	post, err := s.ApplyCommittedTx(id, raw, func(cmd Command) (*Result, error) {
+		return s.local.Apply(context.Background(), cmd)
+	})
 	if err != nil {
 		return err
 	}
-	res, applyErr := s.local.Apply(context.Background(), cmd)
+	post()
+	return nil
+}
 
+// ApplyCommittedTx 计算一条已提交影子命令，但把 pending 结果的交付延后到
+// 返回的回调。元数据批事务只有提交成功后才执行该回调，避免事务回滚时
+// 发起方已经收到成功结果。
+func (s *ReplicatedStore) ApplyCommittedTx(id string, raw []byte,
+	apply func(Command) (*Result, error),
+) (func(), error) {
+	cmd, err := DecodeCommand(raw)
+	if err != nil {
+		return nil, err
+	}
+	res, applyErr := apply(cmd)
+
+	// 冲突与校验失败交回发起方，不算 apply 失败。
+	var e *Error
+	if applyErr != nil && !errors.As(applyErr, &e) {
+		return nil, applyErr
+	}
+	return func() {
+		s.deliver(id, res, applyErr)
+	}, nil
+}
+
+func (s *ReplicatedStore) deliver(id string, res *Result, applyErr error) {
 	s.mu.Lock()
 	if _, waiting := s.pending[id]; waiting {
 		s.pending[id] = &outcome{res: res, err: applyErr}
 	}
 	s.mu.Unlock()
+}
 
-	// 冲突与校验失败交回发起方，不算 apply 失败
-	var e *Error
-	if applyErr != nil && !errors.As(applyErr, &e) {
-		return applyErr
-	}
-	return nil
+// DeliverCommitted 供独立分片状态机在整批事务提交后交付结果。
+// 元数据日志路径继续使用 ApplyCommittedTx；两条路径共享同一 pending 表。
+func (s *ReplicatedStore) DeliverCommitted(id string, res *Result, applyErr error) {
+	s.deliver(id, res, applyErr)
 }
 
 // Close 关本地存储。

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,27 +26,32 @@ import (
 type conn struct {
 	b    *Broker
 	nc   net.Conn
-	info ConnInfo
+	info liveConnInfo
+	ver  packet.Version
+	// persistSession 为假表示协商出来的会话过期间隔是 0。
+	// 这种会话只存在于连接运行时，不得产生任何复制写入。
+	// 与 ver 一起填入 compact transport 后的两个对齐字节。
+	persistSession bool
+	// aux 合并 CONNECT 分段与短命认证输入。它只归读 goroutine 所有；
+	// 稀有但会被踢线/管理 goroutine 读取的传输扩展放在原子 retry sidecar，
+	// 避免释放 CONNECT sidecar 时与外部断连竞态。
+	aux *connAux
 
-	ver      packet.Version
-	clientID string
-	princ    Principal
-	epoch    cluster.Epoch
-	rt       *session.Runtime
-
-	// 读缓冲与编码缓冲由读 goroutine 独占。
-	rbuf []byte
+	princ livePrincipal
+	epoch cluster.Epoch
+	rt    *session.Runtime
+	// 读缓冲由读 goroutine 独占。
+	// 默认 192 B 直接内联在连接对象里，避免百万连接再多一百万个
+	// heap object 和 allocator span 开销。大报文仍在 readPacket 里按需扩容。
+	rsmall [defaultReadBuffer]byte
+	rbuf   []byte
 	// roff 是已消费到的位置，rlen 是已读入的位置。
 	//
 	// 分成两个游标而不是读完就把缓冲压实，是因为 packet.Decode 是
 	// 零拷贝的：解出的报文直接引用 rbuf。压实会把后续报文的字节搬到
 	// 前一个报文的字段上，而那时调用方还没用它。见 readPacket。
-	roff int
-	rlen int
-	ebuf []byte
-	// wbuf 由写出池独占。
-	wbuf          []byte
-	maxWriteBatch int
+	roff uint32
+	rlen uint32
 
 	// queued 是写出池的入队标记，保证同一连接不被重复入队。
 	queued atomic.Bool
@@ -58,43 +64,214 @@ type conn struct {
 	// 不得有任何地方读写它。
 	wnext *conn
 
+	// retry 仅在连接真的发出 QoS 1/2 消息后分配；百万条只保活或只发
+	// QoS 0 的连接不应各自常驻一把 mutex 和一张 nil map。
+	retry atomic.Pointer[connRetryState]
+
 	connectedAtMs int64
-	keepAliveMs   int64
-
-	// nextPacketID 是出站报文标识符分配器。
-	nextPacketID atomic.Uint32
-
-	// retryStop 是每条在途消息的重试定时器。回调在定时器协程上，
-	// 与 close 的取消互斥。
-	retryMu   sync.Mutex
-	retryStop map[uint16]func() bool
-	// lifetimeStop 取消 WebSocket 连接时长上限的定时器。
-	lifetimeStop func() bool
+	keepAliveMs   uint32
 
 	closeOnce sync.Once
 	closedRC  atomic.Uint32
 	// evictWhy 是外部协程请求断开时登记的原因，存的是 why+1，
 	// 因为 EvictTakenOver 的值就是 0，零值分不出"没登记"。
 	evictWhy atomic.Uint32
-	// writeFailed 记录写出错误，使读循环能及时退出。
-	writeFailed atomic.Bool
+}
+
+type connAux struct {
+	stages connectStages
+	// auth 只活到 Authenticator 返回；成功连接不永久保留认证输入副本。
+	auth *connAuthInfo
+}
+
+var connAuxPool = sync.Pool{New: func() any { return new(connAux) }}
+
+type connRetryState struct {
+	mu           sync.Mutex
+	stops        map[uint16]func() bool
+	nextPacketID atomic.Uint32
+	// extra 与 QoS 重试同属按需、并发可见状态。复用 conn 上已有的原子
+	// sidecar 指针，使普通空闲连接不因罕见 ALPN/WSS 字段涨回 512 B 档。
+	extra *connExtras
+}
+
+const connWriteFailedMask uint32 = 1 << 31
+
+func (c *conn) retryState() *connRetryState {
+	if st := c.retry.Load(); st != nil {
+		return st
+	}
+	st := new(connRetryState)
+	if c.retry.CompareAndSwap(nil, st) {
+		return st
+	}
+	return c.retry.Load()
 }
 
 func newConn(b *Broker, nc net.Conn, info ConnInfo) *conn {
-	return &conn{
-		b:             b,
-		nc:            nc,
-		info:          info,
-		rbuf:          make([]byte, b.opt.ReadBufferSize),
-		ebuf:          make([]byte, 0, 512),
-		wbuf:          make([]byte, 0, 4096),
-		maxWriteBatch: b.opt.MaxWriteBatch,
+	alpn, customALPN := compactALPN(info.ALPN)
+	live, remoteZone := compactLiveConnInfo(info.Remote, info.TLSVersion, alpn)
+	c := &conn{
+		b:    b,
+		nc:   nc,
+		aux:  connAuxPool.Get().(*connAux),
+		info: live,
 	}
+	c.aux.stages.handshakeMS = info.HandshakeMS
+	if customALPN != "" || info.MaxLifetime != 0 || info.RedirectTo != "" || remoteZone != "" {
+		c.retryState().extra = &connExtras{alpn: customALPN, maxLifetime: info.MaxLifetime,
+			redirectTo: info.RedirectTo, remoteZone: remoteZone}
+	}
+	if b.opt.ReadBufferSize <= len(c.rsmall) {
+		c.rbuf = c.rsmall[:b.opt.ReadBufferSize]
+	} else {
+		c.rbuf = make([]byte, b.opt.ReadBufferSize)
+	}
+	if info.HasCert || info.AccessKeyID != "" || info.CertSerial != "" ||
+		info.CertSubject != (authz.DN{}) || info.CertIssuer != (authz.DN{}) {
+		c.aux.auth = connAuthInfoPool.Get().(*connAuthInfo)
+		*c.aux.auth = connAuthInfo{
+			HasCert: info.HasCert, CertFP: info.CertFP,
+			CertSubject: info.CertSubject, CertIssuer: info.CertIssuer,
+			CertSerial: info.CertSerial, AccessKeyID: info.AccessKeyID,
+		}
+	}
+	return c
+}
+
+func compactLiveConnInfo(remote netip.AddrPort, tlsVersion uint16, alpn connALPN) (liveConnInfo, string) {
+	info := liveConnInfo{TLSVersion: tlsVersion, ALPN: alpn}
+	if !remote.IsValid() {
+		return info, ""
+	}
+	addr := remote.Addr()
+	info.IP = addr.As16()
+	info.Port = remote.Port()
+	info.flags = connRemoteValid
+	if addr.Is4() {
+		info.flags |= connRemoteV4
+	}
+	return info, addr.Zone()
+}
+
+func (c *conn) remote() netip.AddrPort {
+	if c.info.flags&connRemoteValid == 0 {
+		return netip.AddrPort{}
+	}
+	addr := netip.AddrFrom16(c.info.IP)
+	if c.info.flags&connRemoteV4 != 0 {
+		addr = addr.Unmap()
+	}
+	if st := c.retry.Load(); st != nil && st.extra != nil && st.extra.remoteZone != "" {
+		addr = addr.WithZone(st.extra.remoteZone)
+	}
+	return netip.AddrPortFrom(addr, c.info.Port)
+}
+
+func compactALPN(v string) (connALPN, string) {
+	switch v {
+	case "":
+		return connALPNNone, ""
+	case ALPNMQTTCert:
+		return connALPNMQTTCert, ""
+	case ALPNMQTTCustom:
+		return connALPNMQTTCustom, ""
+	case ALPNHTTPCert:
+		return connALPNHTTPCert, ""
+	default:
+		return connALPNOther, v
+	}
+}
+
+func (c *conn) alpn() string {
+	switch c.info.ALPN {
+	case connALPNMQTTCert:
+		return ALPNMQTTCert
+	case connALPNMQTTCustom:
+		return ALPNMQTTCustom
+	case connALPNHTTPCert:
+		return ALPNHTTPCert
+	case connALPNOther:
+		if st := c.retry.Load(); st != nil && st.extra != nil {
+			return st.extra.alpn
+		}
+	}
+	return ""
+}
+
+func (c *conn) maxLifetime() time.Duration {
+	st := c.retry.Load()
+	if st == nil || st.extra == nil {
+		return 0
+	}
+	return st.extra.maxLifetime
+}
+
+func (c *conn) redirectTo() string {
+	st := c.retry.Load()
+	if st == nil || st.extra == nil {
+		return ""
+	}
+	return st.extra.redirectTo
+}
+
+func (c *conn) clientID() string { return c.princ.AuthzCtx.ClientID }
+
+func (c *conn) releaseConnectStages() {
+	if c.aux == nil {
+		return
+	}
+	c.releaseAuthInfo()
+	c.aux.stages = connectStages{}
+	aux := c.aux
+	c.aux = nil
+	*aux = connAux{}
+	connAuxPool.Put(aux)
+}
+
+func (c *conn) releaseAuthInfo() {
+	if c.aux == nil || c.aux.auth == nil {
+		return
+	}
+	auth := c.aux.auth
+	c.aux.auth = nil
+	// pool 不得延长证书 DN、序列号或 access key 标识的生命周期。
+	*auth = connAuthInfo{}
+	connAuthInfoPool.Put(auth)
+}
+
+func (c *conn) authenticationInfo() ConnInfo {
+	handshakeMS := float64(0)
+	if c.aux != nil {
+		handshakeMS = c.aux.stages.handshakeMS
+	}
+	info := ConnInfo{
+		Remote: c.remote(), TLSVersion: c.info.TLSVersion, ALPN: c.alpn(),
+		HandshakeMS: handshakeMS, MaxLifetime: c.maxLifetime(),
+		RedirectTo: c.redirectTo(),
+	}
+	if c.aux != nil && c.aux.auth != nil {
+		auth := c.aux.auth
+		info.HasCert, info.CertFP = auth.HasCert, auth.CertFP
+		info.CertSubject, info.CertIssuer = auth.CertSubject, auth.CertIssuer
+		info.CertSerial, info.AccessKeyID = auth.CertSerial, auth.AccessKeyID
+	}
+	return info
 }
 
 // serve 运行读循环。
 func (c *conn) serve(ctx context.Context) error {
 	defer c.cleanup()
+	if err := c.serveConnect(ctx); err != nil {
+		return err
+	}
+	return c.serveEstablished(ctx)
+}
+
+// serveConnect 只运行会撑大栈的 CONNECT 建连阶段。Listener 路径在它成功
+// 后把连接交给一个从最小栈开始的新 goroutine；公开 Serve 的同步路径则继续
+// 在当前 goroutine 运行，以保持嵌入调用方的等待语义。
+func (c *conn) serveConnect(ctx context.Context) error {
 	// 时长从握手交给 broker 的这一刻起算，包含还没发出 CONNECT 的时间。
 	c.armLifetime()
 
@@ -112,13 +289,16 @@ func (c *conn) serve(ctx context.Context) error {
 	if err := c.handleConnect(ctx, cp); err != nil {
 		return err
 	}
+	return nil
+}
 
+func (c *conn) serveEstablished(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			c.close(reason.ServerShuttingDown, cluster.EvictAdministrative)
 			return err
 		}
-		if c.writeFailed.Load() {
+		if c.closedRC.Load()&connWriteFailedMask != 0 {
 			return errors.New("broker: 写出失败，连接终止")
 		}
 		p, err := c.readPacket(ctx)
@@ -163,7 +343,7 @@ func (c *conn) readPacket(ctx context.Context) (packet.Packet, error) {
 			switch {
 			case err == nil:
 				// 只推进游标，不搬动字节：p 还指着它们。
-				c.roff += n
+				c.roff += uint32(n)
 				return p, nil
 			case errors.Is(err, packet.ErrIncomplete):
 				// 继续读。
@@ -177,7 +357,7 @@ func (c *conn) readPacket(ctx context.Context) (packet.Packet, error) {
 			c.rlen -= c.roff
 			c.roff = 0
 		}
-		if c.rlen == len(c.rbuf) {
+		if c.rlen == uint32(len(c.rbuf)) {
 			// 缓冲不足：按需扩张，上限由最大包长配额约束。
 			max := c.b.opt.Limiter.Limit(quota.PacketSize)
 			if max <= 0 {
@@ -196,7 +376,7 @@ func (c *conn) readPacket(ctx context.Context) (packet.Packet, error) {
 		}
 		n, err := c.nc.Read(c.rbuf[c.rlen:])
 		if n > 0 {
-			c.rlen += n
+			c.rlen += uint32(n)
 		}
 		if err != nil {
 			if n > 0 && errors.Is(err, io.EOF) {
@@ -255,13 +435,14 @@ func (c *conn) dispatch(p packet.Packet) error {
 // 只能由连接自己的读协程调用：它借用连接的编码缓冲，而那归读协程独占
 // （见 ebuf 的字段注释）。从别的协程投递请走 sendForeign。
 func (c *conn) send(p packet.Packet) error {
-	buf, err := p.EncodeTo(c.ebuf[:0], c.ver)
+	// 队列必须取得字节所有权，因此即使复用连接级编码缓冲也仍要再复制
+	// 一次。直接编码到新缓冲保持每次发送一次分配，并省掉每条空闲连接
+	// 常驻的 slice header 与首个报文后被长期保留的 backing array。
+	buf, err := p.EncodeTo(nil, c.ver)
 	if err != nil {
 		return err
 	}
-	c.ebuf = buf
-	// 入队的字节必须是副本：编码缓冲会被下一个报文复用。
-	err = c.enqueue(append([]byte(nil), buf...))
+	err = c.enqueue(buf)
 	if errors.Is(err, session.ErrOutboundFull) {
 		// 出站队列满：对慢客户端施加背压的唯一正确做法是断开它，
 		// 否则服务端会为它无界积压（PRD MQTT-035）。
@@ -323,11 +504,10 @@ func (c *conn) enqueue(bytes []byte) error {
 
 // sendDirect 在没有会话运行时的阶段直接写出（仅用于 CONNACK 失败路径）。
 func (c *conn) sendDirect(p packet.Packet) {
-	buf, err := p.EncodeTo(c.ebuf[:0], c.ver)
+	buf, err := p.EncodeTo(nil, c.ver)
 	if err != nil {
 		return
 	}
-	c.ebuf = buf
 	_, _ = c.nc.Write(buf)
 }
 
@@ -337,7 +517,7 @@ func (c *conn) sendDirect(p packet.Packet) {
 // 和还没确认的那条一样的号，客户端会把它们当成同一条。
 func (c *conn) allocPacketID() uint16 {
 	for {
-		v := uint16(c.nextPacketID.Add(1))
+		v := uint16(c.retryState().nextPacketID.Add(1))
 		if v == 0 {
 			continue
 		}
@@ -360,8 +540,8 @@ func (c *conn) closeGraceful() {
 // 重连会被当成新会话，持久会话的订阅与离线队列就丢了。
 func (c *conn) close(rc reason.Code, why cluster.EvictReason) {
 	c.closeOnce.Do(func() {
-		if c.lifetimeStop != nil {
-			c.lifetimeStop()
+		if st := c.retry.Load(); st != nil && st.extra != nil && st.extra.lifetimeStop != nil {
+			st.extra.lifetimeStop()
 		}
 		c.closedRC.Store(uint32(rc) + 1)
 		c.stopRetries()
@@ -386,12 +566,15 @@ func (c *conn) close(rc reason.Code, why cluster.EvictReason) {
 // 没有目标时只关连接：0x9C 的含义是「请连到另一台服务器」，
 // 指不出来就不是这个原因码。
 func (c *conn) armLifetime() {
-	if c.info.MaxLifetime <= 0 || c.b.opt.AfterFunc == nil {
+	maxLifetime := c.maxLifetime()
+	if maxLifetime <= 0 || c.b.opt.AfterFunc == nil {
 		return
 	}
-	c.lifetimeStop = c.b.opt.AfterFunc(c.info.MaxLifetime, func() {
+	// maxLifetime > 0 保证 newConn 已经创建 extra。
+	st := c.retry.Load()
+	st.extra.lifetimeStop = c.b.opt.AfterFunc(maxLifetime, func() {
 		rc := reason.NormalDisconnection
-		if c.info.RedirectTo != "" {
+		if c.redirectTo() != "" {
 			rc = reason.UseAnotherServer
 		}
 		c.evict(rc, cluster.EvictAdministrative)
@@ -401,8 +584,8 @@ func (c *conn) armLifetime() {
 // disconnectPacket 构造服务端主动断开的 DISCONNECT。
 func (c *conn) disconnectPacket(rc reason.Code) *packet.Disconnect {
 	d := &packet.Disconnect{Code: rc}
-	if rc == reason.UseAnotherServer && c.info.RedirectTo != "" {
-		d.Props.ServerReference = []byte(c.info.RedirectTo)
+	if redirectTo := c.redirectTo(); rc == reason.UseAnotherServer && redirectTo != "" {
+		d.Props.ServerReference = []byte(redirectTo)
 		d.Props.Set(packet.PropServerReference)
 	}
 	return d
@@ -425,7 +608,7 @@ func (c *conn) evict(rc reason.Code, why cluster.EvictReason) {
 		return
 	}
 	c.evictWhy.Store(uint32(why) + 1)
-	// 编码到局部缓冲，不碰 c.ebuf——那是读协程的。
+	// 编码到局部缓冲；外部协程不共享连接读协程的任何可变缓冲。
 	if c.ver == packet.V5 && rc != reason.NormalDisconnection {
 		if buf, err := c.disconnectPacket(rc).EncodeTo(nil, c.ver); err == nil {
 			// contract:allow-time-now 写超时，不参与排序
@@ -438,7 +621,7 @@ func (c *conn) evict(rc reason.Code, why cluster.EvictReason) {
 
 // failWrite 由写出池在写失败时调用。
 func (c *conn) failWrite(error) {
-	c.writeFailed.Store(true)
+	c.closedRC.Or(connWriteFailedMask)
 	// 直接关闭底层连接，使读循环立刻解除阻塞。
 	_ = c.nc.Close()
 }
@@ -461,15 +644,17 @@ func (c *conn) persist(nowMs int64) {
 	// 存储层的 epoch 围栏能拦住会话写入，但路由表与所有权没有 epoch——
 	// 若不在此处判断，被抢占的旧连接会把新连接的订阅一并清掉。
 	// 这是集成测试才暴露出的问题：单独看会话层，围栏是完整的。
-	if c.b.lookup(c.clientID) != c {
+	if c.b.lookup(c.clientID()) != c {
 		return
 	}
 
 	ctx := context.Background()
 	st := c.rt.CloneState()
 
-	// 清洁会话直接丢弃；持久会话保留订阅与状态等待重连。
-	if st.CleanStart && st.ExpiryInterval == 0 {
+	// 非持久会话只存在于连接的运行时里，断开时不得写一条复制的 Delete：
+	// 存储里可能残留的那条旧记录，已经在 CONNECT 里、本运行时登记之前
+	// 就删掉了（见 handleConnect）。
+	if !c.persistSession {
 		// 在途额度跟着消息走。清洁会话的消息不会再被重投，
 		// 额度若只在 ACK 时归还，这个 clientId 的接收窗口就空不出来了。
 		c.releaseInflightQuota(len(st.Inflight))
@@ -481,9 +666,8 @@ func (c *conn) persist(nowMs int64) {
 		// 持久会话不在此列：它的订阅仍留在路由表里继续占用资源，
 		// 额度自然也该继续占着。
 		c.b.opt.Limiter.Release(quota.Subscriptions, "",
-			c.b.opt.Router.RemoveClient(c.clientID))
-		_ = c.b.opt.Sessions.Delete(ctx, c.clientID, c.epoch)
-		_ = c.b.opt.Owners.Release(ctx, c.clientID, c.epoch)
+			c.b.opt.Router.RemoveClient(c.clientID()))
+		_ = c.b.opt.Owners.Release(ctx, c.clientID(), c.epoch)
 	} else {
 		_ = c.b.opt.Sessions.Save(ctx, st)
 	}
@@ -491,11 +675,13 @@ func (c *conn) persist(nowMs int64) {
 
 // cleanup 在读循环退出后释放连接占用的资源并产出断开事件。
 func (c *conn) cleanup() {
+	c.releaseConnectStages()
+	c.releaseAuthInfo()
 	// rt 为 nil 表示 CONNECT 未走到创建会话运行时那一步：
 	// 认证失败、配额超限、策略拒绝都会落到这里，而此时 clientID 可能已设置。
 	// 这条路径只有端到端测试能覆盖到——单元测试里 rt 总是存在的。
-	if c.clientID == "" || c.rt == nil {
-		if c.clientID != "" {
+	if c.clientID() == "" || c.rt == nil {
+		if c.clientID() != "" {
 			c.b.unregister(c)
 		}
 		_ = c.nc.Close()
@@ -505,7 +691,7 @@ func (c *conn) cleanup() {
 	nsubs := len(c.rt.State().Subscriptions)
 
 	rc := reason.Code(0)
-	if v := c.closedRC.Load(); v > 0 {
+	if v := c.closedRC.Load() &^ connWriteFailedMask; v > 0 {
 		rc = reason.Code(v - 1)
 	}
 	// 外部协程登记过原因就用它的——被接管与被踢出的清理语义不同。
@@ -518,7 +704,7 @@ func (c *conn) cleanup() {
 
 	c.b.unregister(c)
 	c.b.opt.Limiter.Release(quota.Connections, "", 1)
-	c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID, nsubs)
+	c.b.opt.Limiter.Release(quota.SubsPerConn, c.clientID(), nsubs)
 	c.emitDisconnect(rc, now)
 }
 
