@@ -73,7 +73,7 @@ OUT_DIR=${OUT_DIR:-"docs/baseline/throughput/linux-density-$(date -u +%Y%m%dT%H%
 MQTTBENCH=${MQTTBENCH:-}
 
 mkdir -p "$OUT_DIR"
-WORK=$(mktemp -d -t openiot-density)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/openiot-density.XXXXXX") || exit 1
 bench_pid=""
 sampler_pid=""
 cleanup() {

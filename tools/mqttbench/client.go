@@ -533,9 +533,12 @@ func (cl *client) shadowLoop(r *runner, topic string, st *stats, stop <-chan str
 			return
 		default:
 		}
+		gen := st.shadowGeneration()
 		n++
 		t0 := time.Now()
-		body := fmt.Sprintf(`{"state":{"reported":{"n":%d,"ts":%d}}}`, n, t0.UnixNano())
+		body := fmt.Sprintf(`{"state":{"reported":{"n":%d,"ts":%d}},"clientToken":"%d"}`,
+			n, t0.UnixNano(), n)
+		wantToken := []byte(fmt.Sprintf(`"clientToken":"%d"`, n))
 		cl.pid++
 		if cl.pid == 0 {
 			cl.pid = 1
@@ -549,20 +552,29 @@ func (cl *client) shadowLoop(r *runner, topic string, st *stats, stop <-chan str
 			st.errs.Add(1)
 			return
 		}
-		st.published.Add(1)
+		st.shadowPublished(gen)
 		// 等 accepted。一次一条：影子按 thing 串行，发快了只会堆在队列里，
 		// 量出来的「吞吐」就变成了队列长度。
 		for {
-			_ = cl.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_ = cl.c.SetReadDeadline(time.Now().Add(r.shadowResponseTimeout))
 			p, err := cl.recv()
 			if err != nil {
 				if isTimeout(err) {
 					select {
 					case <-stop:
+						// 已计入published却在排空期限内收不到accepted，必须作为
+						// 测量错误留下；只返回会让JSON看起来是“零错误少一条”。
+						st.shadowTimedOut(gen, time.Since(t0))
 						return
 					default:
 					}
-					break
+					// 不能直接开始下一条却不记账：旧accepted若稍后到达，会被
+					// 误算成新请求的结果。clientToken负责隔离迟到回复。
+					st.shadowTimedOut(gen, time.Since(t0))
+					// 结果是歧义的：服务端可能已经提交。继续写同一个thing虽不是
+					// 重发相同报文，却会覆盖尚未确认的状态并让迟到响应产生级联
+					// 假超时。停止这个设备流，交给最终守恒门禁判失败。
+					return
 				}
 				st.errs.Add(1)
 				return
@@ -571,13 +583,33 @@ func (cl *client) shadowLoop(r *runner, topic string, st *stats, stop <-chan str
 			if !ok {
 				continue
 			}
+			// Shadow响应在服务端标为QoS 1；订阅方选择QoS 1时必须确认，
+			// 包括迟到或不属于当前clientToken的响应。只确认当前token会让
+			// 旧响应永久留在broker在途表，最终把连接拖进重传/配额故障。
+			if pb.QoS == packet.QoS1 {
+				if err := cl.send(&packet.Ack{Kind: packet.PUBACK, PacketID: pb.PacketID}); err != nil {
+					st.shadowFailed(gen)
+					return
+				}
+				if err := cl.flush(); err != nil {
+					st.shadowFailed(gen)
+					return
+				}
+			}
+			if !bytes.Contains(pb.Payload, wantToken) {
+				st.shadowStaleReply(gen)
+				continue
+			}
+			if bytes.Contains(pb.Topic, []byte("/rejected")) {
+				st.shadowRejectedReply(gen)
+				break
+			}
 			if !bytes.Contains(pb.Topic, []byte("/accepted")) {
 				continue
 			}
 			// 延迟量的是「发出更新到收到 accepted」的往返：这条路径上有
 			// 一次复制日志的提交，而那正是影子与普通主题的区别所在。
-			st.observe(float64(time.Since(t0).Nanoseconds()) / 1e6)
-			st.delivered.Add(1)
+			st.shadowDelivered(gen, float64(time.Since(t0).Nanoseconds())/1e6)
 			break
 		}
 	}

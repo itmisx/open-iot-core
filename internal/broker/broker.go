@@ -256,6 +256,16 @@ type Broker struct {
 	watchWG      sync.WaitGroup
 
 	conns atomic.Int64
+	// reserved* 把平台响应从“状态机已完成”到“进入连接出站队列”的静默
+	// 区间拆开。影子写成功但客户端收不到 accepted 时，仅看 writer 错误会
+	// 漏掉无订阅、在途登记失败和入队失败。
+	reservedResponses      atomic.Uint64
+	reservedNoSubscriber   atomic.Uint64
+	reservedServiceMaxNs   atomic.Uint64
+	reservedServiceOver1s  atomic.Uint64
+	outboundInflightQueued atomic.Uint64
+	outboundInflightFailed atomic.Uint64
+	outboundEnqueueFailed  atomic.Uint64
 	// assigned 为空 clientId 的 MQTT 5 连接分配标识。
 	assigned atomic.Uint64
 
@@ -966,17 +976,31 @@ func (b *Broker) serveHandoff(ctx context.Context, nc net.Conn, info ConnInfo,
 
 // Stats 是 broker 的运行指标。
 type Stats struct {
-	Conns  int64
-	Writer writerStats
-	Router router.Stats
+	Conns                  int64
+	Writer                 writerStats
+	Router                 router.Stats
+	ReservedResponses      uint64
+	ReservedNoSubscriber   uint64
+	ReservedServiceMaxNs   uint64
+	ReservedServiceOver1s  uint64
+	OutboundInflightQueued uint64
+	OutboundInflightFailed uint64
+	OutboundEnqueueFailed  uint64
 }
 
 // Stats 返回运行指标。
 func (b *Broker) Stats() Stats {
 	return Stats{
-		Conns:  b.conns.Load(),
-		Writer: b.writer.stats(),
-		Router: b.opt.Router.Stats(),
+		Conns:                  b.conns.Load(),
+		Writer:                 b.writer.stats(),
+		Router:                 b.opt.Router.Stats(),
+		ReservedResponses:      b.reservedResponses.Load(),
+		ReservedNoSubscriber:   b.reservedNoSubscriber.Load(),
+		ReservedServiceMaxNs:   b.reservedServiceMaxNs.Load(),
+		ReservedServiceOver1s:  b.reservedServiceOver1s.Load(),
+		OutboundInflightQueued: b.outboundInflightQueued.Load(),
+		OutboundInflightFailed: b.outboundInflightFailed.Load(),
+		OutboundEnqueueFailed:  b.outboundEnqueueFailed.Load(),
 	}
 }
 

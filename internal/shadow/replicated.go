@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // 影子的跨节点一致（契约 06、SHDW-029、CLU-082）。
@@ -45,10 +46,13 @@ type CommandLog interface {
 // Store（也就是同一份 ApplyCommand 状态机，SHDW-074 要求的那个）
 // 算出结果。发起方从 pending 里取回本节点算出的那一份。
 type ReplicatedStore struct {
-	local Store
-	log   CommandLog
-	node  string
-	seq   atomic.Uint64
+	local      Store
+	log        CommandLog
+	node       string
+	seq        atomic.Uint64
+	waitCount  atomic.Uint64
+	waitOver1s atomic.Uint64
+	waitMaxNs  atomic.Uint64
 
 	mu sync.Mutex
 	// pending 是「谁在等哪条命令的结果」。
@@ -56,6 +60,11 @@ type ReplicatedStore struct {
 	// 只有发起命令的那个节点会在这里登记；别的节点同样应用命令，
 	// 但没人等结果，deliver 直接丢掉——那不是错误，是正常情形。
 	pending map[string]*outcome
+	// waiters 只用于「提案可能在远端 leader 完成」的分片路径。Propose 返回
+	// 只能证明 leader 已应用，不能证明发起节点的本地副本也已经 apply；本地
+	// apply 直接关闭对应 channel，比每条命令再做一次 ReadIndex/Barrier 少一轮
+	// 共识，同时仍保证 accepted 之前本地事务已经提交。
+	waiters map[string]chan struct{}
 }
 
 // outcome 是一条命令在本节点应用后的产物。
@@ -77,6 +86,7 @@ func NewReplicatedStore(local Store, log CommandLog, node string) (*ReplicatedSt
 	return &ReplicatedStore{
 		local: local, log: log, node: node,
 		pending: make(map[string]*outcome),
+		waiters: make(map[string]chan struct{}),
 	}, nil
 }
 
@@ -102,10 +112,12 @@ func (s *ReplicatedStore) Apply(ctx context.Context, cmd Command) (*Result, erro
 
 	s.mu.Lock()
 	s.pending[id] = nil
+	s.waiters[id] = make(chan struct{})
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		delete(s.pending, id)
+		delete(s.waiters, id)
 		s.mu.Unlock()
 	}()
 
@@ -169,8 +181,62 @@ func (s *ReplicatedStore) deliver(id string, res *Result, applyErr error) {
 	s.mu.Lock()
 	if _, waiting := s.pending[id]; waiting {
 		s.pending[id] = &outcome{res: res, err: applyErr}
+		if done := s.waiters[id]; done != nil {
+			close(done)
+			delete(s.waiters, id)
+		}
 	}
 	s.mu.Unlock()
+}
+
+// WaitCommitted 等待 id 在本节点完成 apply 并提交本地事务。
+//
+// 分片提案若被路由到远端 leader，SyncPropose 返回时发起节点的 follower 可能
+// 仍落后。旧路径为每条写再执行一次 Barrier（ReadIndex）；这里直接等待状态机
+// apply 的交付信号，既保留线性一致的响应语义，也避免额外的共识往返。
+func (s *ReplicatedStore) WaitCommitted(ctx context.Context, id string) error {
+	s.mu.Lock()
+	got, waiting := s.pending[id]
+	done := s.waiters[id]
+	s.mu.Unlock()
+	if !waiting {
+		return fmt.Errorf("shadow: 命令 %s 没有等待中的请求", id)
+	}
+	if got != nil {
+		return nil
+	}
+	if done == nil {
+		return fmt.Errorf("shadow: 命令 %s 缺少本地应用等待器", id)
+	}
+	// contract:allow-time-now 只做本地副本追平耗时的差值计算。这一段是
+	// 「提案已在 leader 完成、而本节点 follower 还没 apply」的观测口径
+	// （正常 leader 路径应为 0），用来识别误走 follower 或副本追平长尾；
+	// 它不参与影子版本号、排序或任何可重放的状态。
+	started := time.Now()
+	s.waitCount.Add(1)
+	defer func() {
+		elapsed := uint64(time.Since(started))
+		for old := s.waitMaxNs.Load(); elapsed > old; old = s.waitMaxNs.Load() {
+			if s.waitMaxNs.CompareAndSwap(old, elapsed) {
+				break
+			}
+		}
+		if elapsed > uint64(time.Second) {
+			s.waitOver1s.Add(1)
+		}
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// CommitWaitStats 返回leader提案完成后，本地副本仍未交付apply结果的等待。
+// 正常leader路径应为0；非零用于识别误走follower或副本追平长尾。
+func (s *ReplicatedStore) CommitWaitStats() (count, over1s, maxNs uint64) {
+	return s.waitCount.Load(), s.waitOver1s.Load(), s.waitMaxNs.Load()
 }
 
 // DeliverCommitted 供独立分片状态机在整批事务提交后交付结果。

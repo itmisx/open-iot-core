@@ -62,6 +62,7 @@ func (c *conn) trackAndSend(out *packet.Publish, src *router.Message, subIDs []u
 		return
 	}
 	if !c.b.opt.Limiter.Acquire(quota.OutboundInflight, c.clientID(), 1) {
+		c.b.outboundInflightQueued.Add(1)
 		if src != nil {
 			c.pushQueued(src, uint8(out.QoS), subIDs, out.Retain)
 		}
@@ -87,6 +88,7 @@ func (c *conn) trackAndSend(out *packet.Publish, src *router.Message, subIDs []u
 		ExpiryUnixMs: c.inflightDeadline(msgExpiry),
 	}
 	if c.rt == nil || c.rt.AddInflight(c.epoch, m) != nil {
+		c.b.outboundInflightFailed.Add(1)
 		c.releaseInflightQuota(1)
 		return
 	}
@@ -97,6 +99,7 @@ func (c *conn) trackAndSend(out *packet.Publish, src *router.Message, subIDs []u
 		return
 	}
 	if err := c.sendForeign(out); err != nil {
+		c.b.outboundEnqueueFailed.Add(1)
 		if errors.Is(err, session.ErrDetached) || (c.clientID() != "" && c.b.lookup(c.clientID()) != c) {
 			c.undoInflight(m.PacketID)
 		}

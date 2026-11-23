@@ -237,6 +237,14 @@ func TestMultiProcessRaft(t *testing.T) {
 	}
 
 	// 再杀掉一个：失去多数派，写入必须失败而读取照常。
+	//
+	// 判据是「计数不再变化」，而不是某个绝对条数。postProposeOK 会跨节点
+	// 重试到成功，而提案**不带 ID**：负载高时一次提案可能客户端超时（记为
+	// 失败）而服务端已经提交，重试就又提交一份，于是绝对条数会是 3 而不是
+	// 2——那是仓库自己记过的「模糊写失败分不清请求没到还是应答丢了」，不是
+	// 本用例要验的东西。先记下此刻的条数，失去多数派之后它必须一个字节都
+	// 不涨。这一条在 make gate 的全量插桩下真的红过。
+	before := len(getApplied(t, "http://"+https["a"]+"/applied"))
 	_ = cmds["b"].Process.Kill()
 	_, _ = cmds["b"].Process.Wait()
 	deadline := time.Now().Add(10 * time.Second)
@@ -250,8 +258,12 @@ func TestMultiProcessRaft(t *testing.T) {
 	if last == nil {
 		t.Fatal("只剩一个节点时写入应当失败")
 	}
-	if got := getApplied(t, "http://"+https["a"]+"/applied"); len(got) != 2 {
-		t.Fatalf("失败后 a 的状态机有 %d 条，期望 2", len(got))
+	if got := getApplied(t, "http://"+https["a"]+"/applied"); len(got) != before {
+		t.Fatalf("失去多数派之后状态机从 %d 条变成了 %d 条：写入没有真的被拒",
+			before, len(got))
+	}
+	if before < 2 {
+		t.Fatalf("失去多数派之前只应用了 %d 条，前面的提交没生效", before)
 	}
 }
 

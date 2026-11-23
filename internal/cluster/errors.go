@@ -17,6 +17,10 @@ var (
 	// ErrNoQuorum 没有多数派。写入失败而读取照常（CLU-042）：
 	// 设备连接、订阅、收发都只读本地视图。
 	ErrNoQuorum = errors.New("cluster: 没有多数派，写入被拒绝")
+	// ErrRequestUnsent 表示节点间应用协议在写出请求前就失败（目标地址
+	// 缺失或拨号失败）。它与 ErrNoQuorum 的“可能已经提交但应答丢失”
+	// 不同：上层只有看到这条错误时才可以安全改投另一个副本。
+	ErrRequestUnsent = errors.New("cluster: 请求未发送")
 	// ErrDisk 日志落盘失败。
 	ErrDisk = errors.New("cluster: 日志落盘失败")
 	// ErrDraining 节点正在排空，不再接受新写入（CLU-063）。

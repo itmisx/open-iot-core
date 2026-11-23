@@ -70,7 +70,7 @@ func TestMillionCapacityConfig(t *testing.T) {
 			cfg.Cluster.Voters, len(rep.Peers), len(rep.Replicas))
 	}
 	if rep.SessionShards != 8 || rep.SessionReplicationFactor != 3 ||
-		rep.ShadowShards != 8 || rep.ShadowReplicationFactor != 3 {
+		rep.ShadowShards != 4 || rep.ShadowReplicationFactor != 3 {
 		t.Fatalf("容量分片/RF错误: session=%d/%d shadow=%d/%d",
 			rep.SessionShards, rep.SessionReplicationFactor,
 			rep.ShadowShards, rep.ShadowReplicationFactor)

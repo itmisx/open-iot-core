@@ -74,6 +74,12 @@ func (f *shardFSM) count(shard uint64) int {
 	return len(f.byShard[shard])
 }
 
+func (f *shardFSM) entries(shard uint64) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.byShard[shard]...)
+}
+
 func (f *shardFSM) shardsUsed() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -113,6 +119,162 @@ func TestShardRoutingIsDeterministic(t *testing.T) {
 	if len(seen) < 6 {
 		t.Errorf("200 个 clientId 只用到 %d 个分片（共 8），分布太偏", len(seen))
 	}
+}
+
+// TestShardLeaderFailureKeepsCommittedOrder 是 SHDW-062 的共识层故障门禁：
+// 真正停掉当前 leader 的副本（不是礼貌的 leader transfer），等剩余多数派
+// 自动选出新 leader，再写第二个版本。两个存活状态机必须保留故障前已确认的
+// 前缀并严格追加，不能从空状态重新开始或把版本顺序倒回去。
+func TestShardLeaderFailureKeepsCommittedOrder(t *testing.T) {
+	ids := []NodeID{"a", "b", "c"}
+	groups, addrs := newTLSCluster(t, ids)
+	allGroups := make([]*TLSGroup, 0, len(ids))
+	for _, id := range ids {
+		allGroups = append(allGroups, groups[id])
+	}
+	_ = waitLeader(t, allGroups, 10*time.Second)
+
+	replicas := replicasOf(addrs)
+	fsms := make(map[NodeID]*shardFSM, len(ids))
+	shards := make(map[NodeID]*ShardGroup, len(ids))
+	const base = uint64(50)
+	for _, id := range ids {
+		id := id
+		fsm := newShardFSM()
+		sg, err := groups[id].StartShardGroup(ShardOptions{
+			Base: base, Count: 1, LayoutName: "failover-shadow-layout.json",
+			Label: "影子故障门禁", Replicas: replicas, Peers: addrs,
+			Bootstrap: id == "a", Apply: fsm.apply, AppliedIndex: fsm.appliedIndex,
+			SnapshotTo:   func(uint64, io.Writer) error { return nil },
+			RestoreFrom:  func(uint64, io.Reader) error { return nil },
+			ApplyTimeout: 5 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("节点 %s 起影子故障门禁分片: %v", id, err)
+		}
+		fsms[id], shards[id] = fsm, sg
+		t.Cleanup(func() { _ = sg.Close() })
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		ready := true
+		for _, id := range ids {
+			ready = ready && shards[id].Ready()
+		}
+		if ready {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, id := range ids {
+		if !shards[id].Ready() {
+			t.Fatalf("节点 %s 的影子故障门禁分片未就绪", id)
+		}
+	}
+	leaders := 0
+	for _, id := range ids {
+		view := shards[id].LocalLeadership()
+		if len(view) != 1 || !view[0].Ready || view[0].Leader == "" {
+			t.Fatalf("节点 %s 的本地leader视图=%+v", id, view)
+		}
+		if view[0].IsLeader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("故障前报告leader的副本数=%d，期望1", leaders)
+	}
+
+	if _, err := shards["a"].ProposeShard(base, []byte("version-1")); err != nil {
+		t.Fatalf("故障前写入: %v", err)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if fsms["a"].count(base) == 1 && fsms["b"].count(base) == 1 &&
+			fsms["c"].count(base) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, id := range ids {
+		if got := fsms[id].entries(base); len(got) != 1 || got[0] != "version-1" {
+			t.Fatalf("节点 %s 故障前状态=%v", id, got)
+		}
+		view := shards[id].LocalLeadership()
+		if len(view) != 1 || view[0].AppliedIndex == 0 {
+			t.Fatalf("节点 %s 没有暴露已持久化applied index: %+v", id, view)
+		}
+	}
+
+	leaderReplica, _, ok, err := shards["a"].nh.GetLeaderID(base)
+	if err != nil || !ok {
+		t.Fatalf("读取待故障 leader: replica=%d ready=%v err=%v", leaderReplica, ok, err)
+	}
+	leaderID := shards["a"].replicaNode[leaderReplica]
+	if leaderID == "" {
+		t.Fatalf("leader replica %d 没有节点映射", leaderReplica)
+	}
+	failureAt := time.Now()
+	if err := shards[leaderID].nh.StopReplica(base, leaderReplica); err != nil {
+		t.Fatalf("停止 leader %s/%d: %v", leaderID, leaderReplica, err)
+	}
+
+	survivors := make([]NodeID, 0, 2)
+	for _, id := range ids {
+		if id != leaderID {
+			survivors = append(survivors, id)
+		}
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	newLeader := uint64(0)
+	for time.Now().Before(deadline) {
+		leader, _, ready, leaderErr := shards[survivors[0]].nh.GetLeaderID(base)
+		if leaderErr == nil && ready && leader != 0 && leader != leaderReplica {
+			newLeader = leader
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if newLeader == 0 {
+		t.Fatalf("停止 leader %s 后剩余多数派未在5秒内选出新 leader", leaderID)
+	}
+	failoverDuration := time.Since(failureAt)
+	leaders = 0
+	for _, id := range survivors {
+		view := shards[id].LocalLeadership()
+		if len(view) != 1 || !view[0].Ready || view[0].Leader == "" {
+			t.Fatalf("存活节点 %s 的故障后leader视图=%+v", id, view)
+		}
+		if view[0].IsLeader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("故障后存活副本报告leader的数量=%d，期望1", leaders)
+	}
+
+	if _, err := shards[survivors[0]].ProposeShard(base, []byte("version-2")); err != nil {
+		t.Fatalf("切换 leader 后写入: %v", err)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if fsms[survivors[0]].count(base) == 2 && fsms[survivors[1]].count(base) == 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, id := range survivors {
+		got := fsms[id].entries(base)
+		if len(got) != 2 || got[0] != "version-1" || got[1] != "version-2" {
+			t.Fatalf("存活节点 %s 在 leader 故障后的提交序列=%v", id, got)
+		}
+		if fsms[id].appliedIndex(base) < 2 {
+			t.Fatalf("存活节点 %s applied index 回退到 %d", id, fsms[id].appliedIndex(base))
+		}
+	}
+	t.Logf("停止 leader %s 后由 replica %d 接任，恢复写入耗时 %s",
+		leaderID, newLeader, failoverDuration)
 }
 
 func TestSessionShardsAreIndependentLogs(t *testing.T) {
@@ -439,6 +601,36 @@ func TestSelectiveSessionReplicasServeNonMemberAccessNode(t *testing.T) {
 		}
 	}
 
+	// 本地副本的leader判断必须越过旧缓存读取NodeHost当前任期。否则本节点
+	// 曾任leader后换届，影子路由会误走本地Apply并等待follower追平。
+	local := shards[NodeID("a")]
+	localThing := ""
+	for i := 0; i < 10000; i++ {
+		candidate := fmt.Sprintf("local-leader-cache-%d", i)
+		if local.HasLocalReplica(candidate) {
+			localThing = candidate
+			break
+		}
+	}
+	if localThing == "" {
+		t.Fatal("没有找到a承载的测试thing")
+	}
+	localShard := local.ShardOf(localThing)
+	actualReplica, _, ready, err := local.nh.GetLeaderID(localShard)
+	if err != nil || !ready {
+		t.Fatalf("读取本地分片leader: replica=%d ready=%v err=%v", actualReplica, ready, err)
+	}
+	for _, stale := range local.placement.members(localShard) {
+		if stale != actualReplica {
+			local.rememberLeader(localShard, stale)
+			break
+		}
+	}
+	if got, ok := local.LeaderNode(localThing); !ok || got != local.replicaNode[actualReplica] {
+		t.Fatalf("本地副本使用了陈旧leader缓存: got=%q ok=%v want=%q", got, ok,
+			local.replicaNode[actualReplica])
+	}
+
 	// 每个节点恰好缺一个分片；挑出那个分片对应的 clientId，从非副本
 	// Access 节点验证读、写、线性 Barrier 和 ownership。
 	access := NodeID("d")
@@ -454,6 +646,19 @@ func TestSelectiveSessionReplicasServeNonMemberAccessNode(t *testing.T) {
 		t.Fatal("没有找到 d 不承载的分片")
 	}
 	shard := shards[access].ShardOf(clientID)
+	// 非副本 Access 的冷路径必须通过状态探针解析真实 leader；第二次调用
+	// 应命中缓存。生产影子 RF=3 的正常写路由依赖的正是这条路径。
+	resolvedLeader, ok := shards[access].LeaderNode(clientID)
+	if !ok || resolvedLeader == "" {
+		t.Fatalf("非副本Access无法解析shard=%d leader: node=%q ok=%v", shard, resolvedLeader, ok)
+	}
+	if cached, ok := shards[access].LeaderNode(clientID); !ok || cached != resolvedLeader {
+		t.Fatalf("leader缓存=%q ok=%v，期望%q", cached, ok, resolvedLeader)
+	}
+	shards[access].ForgetLeader(clientID, resolvedLeader)
+	if refreshed, ok := shards[access].LeaderNode(clientID); !ok || refreshed == "" {
+		t.Fatalf("leader缓存失效后无法重新解析: node=%q ok=%v", refreshed, ok)
+	}
 	if _, err := shards[access].Propose(clientID, []byte("from-access")); err != nil {
 		t.Fatalf("非副本写入: %v", err)
 	}

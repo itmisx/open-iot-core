@@ -39,6 +39,29 @@ func TestQuotaOverridesResolve(t *testing.T) {
 	}
 }
 
+func TestInitialQuotaMembersUsesClusterPeers(t *testing.T) {
+	var standalone config.Config
+	standalone.Node.Mode = config.ModeStandalone
+	standalone.Cluster.Replication.Peers = map[string]string{"ignored": "127.0.0.1:1"}
+	if got := initialQuotaMembers(&standalone); got != 1 {
+		t.Fatalf("单机配额分母=%d，期望1", got)
+	}
+
+	var clustered config.Config
+	clustered.Node.Mode = config.ModeBootstrap
+	clustered.Cluster.Replication.Peers = map[string]string{
+		"a": "127.0.0.1:1", "b": "127.0.0.1:2", "c": "127.0.0.1:3",
+		"d": "127.0.0.1:4", "e": "127.0.0.1:5",
+	}
+	if got := initialQuotaMembers(&clustered); got != 5 {
+		t.Fatalf("五节点初始配额分母=%d，期望5", got)
+	}
+	clustered.Cluster.Replication.Peers = nil
+	if got := initialQuotaMembers(&clustered); got != 1 {
+		t.Fatalf("成员未知时配额分母=%d，期望安全回退1", got)
+	}
+}
+
 // TestQuotaOverridesRejectsUnknown 钉住未知配额名拒绝启动（QTA-110）。
 //
 // 不静默忽略：一个把 connections 写成 connection 的部署会以默认的 50 万

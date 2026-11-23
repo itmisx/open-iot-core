@@ -228,6 +228,23 @@ func (a *adminServer) collectMessages(e *metrics.Encoder, node metrics.Label) {
 	e.Help(metricPrefix+"writer_pending", "当前待写出的连接数", metrics.TypeGauge)
 	e.GaugeInt(metricPrefix+"writer_pending", int64(st.Writer.Pending), node)
 
+	for _, m := range []struct {
+		name, help string
+		v          uint64
+	}{
+		{"reserved_responses_total", "平台保留主题累计响应数", st.ReservedResponses},
+		{"reserved_response_no_subscriber_total", "平台响应没有匹配本地订阅的次数", st.ReservedNoSubscriber},
+		{"reserved_service_over_1s_total", "平台保留主题服务处理超过1秒的次数", st.ReservedServiceOver1s},
+		{"outbound_inflight_queued_total", "出站QoS消息因在途窗口满而进入会话队列的次数", st.OutboundInflightQueued},
+		{"outbound_inflight_failed_total", "出站QoS消息在途登记失败而未发送的次数", st.OutboundInflightFailed},
+		{"outbound_enqueue_failed_total", "出站QoS消息编码后进入连接队列失败的次数", st.OutboundEnqueueFailed},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeCounter)
+		e.CounterUint(metricPrefix+m.name, m.v, node)
+	}
+	e.Help(metricPrefix+"reserved_service_max_ms", "进程启动以来平台保留主题服务最大处理耗时", metrics.TypeGauge)
+	e.Gauge(metricPrefix+"reserved_service_max_ms", float64(st.ReservedServiceMaxNs)/float64(time.Millisecond), node)
+
 	e.Help(metricPrefix+"subscriptions_total", "累计订阅与退订数", metrics.TypeCounter)
 	for _, op := range []struct {
 		unsub bool
@@ -362,6 +379,26 @@ func (a *adminServer) collectShadowShards(e *metrics.Encoder, node metrics.Label
 	e.Help(metricPrefix+"shadow_shard_count", "影子分片数（真实 raft 日志条数）",
 		metrics.TypeGauge)
 	e.GaugeInt(metricPrefix+"shadow_shard_count", int64(g.ShardCount()), node)
+	e.Help(metricPrefix+"shadow_shard_ready",
+		"本节点承载的影子分片是否已经识别 leader", metrics.TypeGauge)
+	e.Help(metricPrefix+"shadow_shard_is_leader",
+		"本节点是否为该影子分片的当前 leader", metrics.TypeGauge)
+	e.Help(metricPrefix+"shadow_shard_applied_index",
+		"本节点影子分片已持久化应用的Raft日志序号", metrics.TypeGauge)
+	for _, lead := range g.LocalLeadership() {
+		shard := metrics.Label{Name: "shard", Value: strconv.FormatUint(lead.Shard, 10)}
+		ready, isLeader := int64(0), int64(0)
+		if lead.Ready {
+			ready = 1
+		}
+		if lead.IsLeader {
+			isLeader = 1
+		}
+		e.GaugeInt(metricPrefix+"shadow_shard_ready", ready, node, shard)
+		e.GaugeInt(metricPrefix+"shadow_shard_is_leader", isLeader, node, shard)
+		e.Gauge(metricPrefix+"shadow_shard_applied_index", float64(lead.AppliedIndex),
+			node, shard)
+	}
 	e.Help(metricPrefix+"shadow_proposals_total",
 		"累计影子提案数，按发起时本节点是否为该分片 leader", metrics.TypeCounter)
 	for _, m := range []struct {
@@ -377,9 +414,44 @@ func (a *adminServer) collectShadowShards(e *metrics.Encoder, node metrics.Label
 	e.Help(metricPrefix+"shadow_raft_proposals_total",
 		"实际提交给 Raft 的影子日志条数（二级合批后的物理提案数）", metrics.TypeCounter)
 	e.CounterUint(metricPrefix+"shadow_raft_proposals_total", st.RaftProposals, node)
+	for _, m := range []struct {
+		name, help string
+		v          uint64
+	}{
+		{"shadow_leader_merge_access_batches_total", "leader 二次合批已消费的 Access 侧影子批次数", st.LeaderMergeAccessBatches},
+		{"shadow_leader_merge_logical_total", "leader 二次合批已装入 Raft 日志的逻辑影子命令数", st.LeaderMergeLogical},
+		{"shadow_leader_merge_physical_total", "leader 二次合批实际提交的物理影子 Raft 日志数", st.LeaderMergePhysical},
+		{"shadow_leader_merge_full_total", "leader 二次合批达到当前配置上限的影子日志数", st.LeaderMergeFull},
+		{"shadow_leader_merge_drained_total", "leader 二次合批未满且已耗尽当前影子队列快照的日志数", st.LeaderMergeDrained},
+		{"shadow_leader_merge_blocked_total", "leader 二次合批未满且被字节上限或无效命令截断的影子日志数", st.LeaderMergeBlocked},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeCounter)
+		e.CounterUint(metricPrefix+m.name, m.v, node)
+	}
+	for _, m := range []struct {
+		name, help string
+		v          int64
+	}{
+		{"shadow_leader_merge_queued", "当前在 shard leader 等待二次合并的影子提案数", st.LeaderMergeQueued},
+		{"shadow_leader_merge_in_flight", "当前由 shard leader 提交给 Raft 的二次合并影子日志数", st.LeaderMergeInFlight},
+		{"shadow_leader_merge_peak_queued", "进程启动以来影子 leader 二次合并排队峰值", st.LeaderMergePeakQueued},
+		{"shadow_leader_merge_peak_in_flight", "进程启动以来影子 leader 提交 Raft 的在途日志峰值", st.LeaderMergePeakInFlight},
+	} {
+		e.Help(metricPrefix+m.name, m.help, metrics.TypeGauge)
+		e.GaugeInt(metricPrefix+m.name, m.v, node)
+	}
 	e.Help(metricPrefix+"shadow_proposal_duration_ms",
 		"影子提案自发起到本地副本应用返回的耗时", metrics.TypeHistogram)
 	e.Histogram(metricPrefix+"shadow_proposal_duration_ms", st.Duration, node)
+	if a.s.shadowRepl != nil {
+		waits, over1s, maxNs := a.s.shadowRepl.CommitWaitStats()
+		e.Help(metricPrefix+"shadow_commit_waits_total", "leader提案返回后仍等待本地影子apply结果的次数", metrics.TypeCounter)
+		e.CounterUint(metricPrefix+"shadow_commit_waits_total", waits, node)
+		e.Help(metricPrefix+"shadow_commit_wait_over_1s_total", "等待本地影子apply结果超过1秒的次数", metrics.TypeCounter)
+		e.CounterUint(metricPrefix+"shadow_commit_wait_over_1s_total", over1s, node)
+		e.Help(metricPrefix+"shadow_commit_wait_max_ms", "进程启动以来本地影子apply结果最大等待耗时", metrics.TypeGauge)
+		e.Gauge(metricPrefix+"shadow_commit_wait_max_ms", float64(maxNs)/float64(time.Millisecond), node)
+	}
 	e.Help(metricPrefix+"shadow_remote_reads_total",
 		"由非副本节点发起的逻辑影子读数", metrics.TypeCounter)
 	e.CounterUint(metricPrefix+"shadow_remote_reads_total", a.s.shadowRoute.remoteReads.Load(), node)
@@ -607,6 +679,9 @@ func countExpiringSoon(certs []registry.Certificate, nowMs int64) int64 {
 // collectQuota 暴露配额指标（OBS-029）。
 func (a *adminServer) collectQuota(e *metrics.Encoder, node metrics.Label) {
 	stats := a.s.lim.Stats()
+	e.Help(metricPrefix+"quota_global_rate_members",
+		"聚合型全局速率配额当前等分的Raft成员数", metrics.TypeGauge)
+	e.GaugeInt(metricPrefix+"quota_global_rate_members", a.s.quotaMembers.Load(), node)
 	e.Help(metricPrefix+"quota_rate_buckets", "当前常驻的速率令牌桶数", metrics.TypeGauge)
 	e.GaugeInt(metricPrefix+"quota_rate_buckets", a.s.lim.RateBucketCount(), node)
 	e.Help(metricPrefix+"quota_rate_buckets_swept_total",

@@ -11,7 +11,7 @@ cd /Users/solly/data/develop/github/open-iot-core
 NODES=${NODES:-3}; SHARDS=${SHARDS:-8}
 CONNS=${CONNS:-1500}; CONC=${CONC:-256}
 BASE=${BASE:-44000}
-W=$(mktemp -d -t openiot-connprobe)
+W=$(mktemp -d "${TMPDIR:-/tmp}/openiot-connprobe.XXXXXX") || exit 1
 PIDS=()
 cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -9 "$p" 2>/dev/null; done; rm -rf "$W"; }
 trap cleanup EXIT INT TERM

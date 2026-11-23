@@ -125,6 +125,9 @@ type Server struct {
 	// remoteThings 是通告来的设备归属表，只在集群模式下非 nil。
 	remoteThings *cluster.RemoteThings
 	lim          *quota.Local
+	// quotaMembers 是聚合型全局速率在本节点的等分分母。热路径只读原子值；
+	// 后台根据Raft成员表低频刷新，避免每次限流都做SyncGetMembership。
+	quotaMembers atomic.Int64
 	bus          *events.Bus
 	tracer       *trace.Tracer
 	ca           *pki.CA
@@ -220,7 +223,12 @@ func New(opt Options) (*Server, error) {
 	if qerr != nil {
 		return nil, qerr
 	}
-	s.lim = quota.NewLocal(quota.Options{Now: s.now, Overrides: qov})
+	quotaMembers := initialQuotaMembers(&s.cfg)
+	s.quotaMembers.Store(int64(quotaMembers))
+	s.lim = quota.NewLocal(quota.Options{
+		Now: s.now, Overrides: qov,
+		GlobalRateDivisor: func() int { return int(s.quotaMembers.Load()) },
+	})
 	s.bus = events.New(events.Options{Node: cluster.NodeID(s.mf.NodeID), Now: s.now})
 	ropt := router.Options{
 		Self: cluster.NodeID(s.mf.NodeID), Limits: limits, Now: s.now,
@@ -392,6 +400,16 @@ func New(opt Options) (*Server, error) {
 	s.admin = newAdminServer(s, adminToken)
 	assembled = true
 	return s, nil
+}
+
+func initialQuotaMembers(cfg *config.Config) int {
+	if cfg == nil || cfg.Node.Mode == config.ModeStandalone {
+		return 1
+	}
+	if members := len(cfg.Cluster.Replication.Peers); members > 0 {
+		return members
+	}
+	return 1
 }
 
 // buildAuthenticator 按配置选择认证器。
@@ -593,6 +611,9 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := s.startReplication(ctx); err != nil {
 			return err
 		}
+		// join配置通常只写自己，不能等监听设备端口之后才把配额分母从1
+		// 刷成真实成员数；复制组已追平，此时成员表已是权威。
+		s.refreshQuotaMembers()
 		// 显式启用的影子分片必须在 metadata Barrier 之后启动：旧路径里
 		// 可能还有已提交但未应用的影子命令，先起新日志会让新旧两条日志
 		// 对同一文档的顺序不确定。
@@ -679,18 +700,35 @@ func (s *Server) Run(ctx context.Context) error {
 
 const quotaSweepInterval = 100 * time.Millisecond
 
+const quotaMemberRefreshTicks = 10
+
 // runQuotaSweep 每次只扫一个令牌桶分片；64 个分片约 6.4 秒一轮。
 // 这样百万设备重连后能及时回收，又不会一次长时间挡住 CONNECT 热路径。
 func (s *Server) runQuotaSweep(ctx context.Context) {
 	t := time.NewTicker(quotaSweepInterval)
 	defer t.Stop()
+	ticks := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			s.lim.SweepRateBuckets(1)
+			ticks++
+			if ticks%quotaMemberRefreshTicks == 0 {
+				s.refreshQuotaMembers()
+			}
 		}
+	}
+}
+
+func (s *Server) refreshQuotaMembers() {
+	if s.repl == nil {
+		s.quotaMembers.Store(1)
+		return
+	}
+	if members := s.repl.Members(); len(members) > 0 {
+		s.quotaMembers.Store(int64(len(members)))
 	}
 }
 
@@ -905,6 +943,13 @@ func (s *Server) shutdown() error {
 	s.closeOnce.Do(func() {
 		s.log.Info("开始优雅关闭", "超时", ShutdownTimeout)
 		s.ready.Set(compListeners, false, "正在关闭")
+		// 先让节点间应用协议停止接单并断开在途连接。否则旧 leader 的
+		// handler 会一直卡到 apply timeout，对端既收不到 ErrDraining，
+		// 也无法把后续影子写路由给新 leader，形成约10秒的数据面黑洞。
+		// Drain 不关闭 Raft 传输，共识组仍可在后面的顺序里正常收尾。
+		if s.repl != nil {
+			s.repl.Drain()
+		}
 
 		// 先叫停全部后台协程。它们登记在同一个 WaitGroup 上，
 		// 不先取消就会把第 5 步的等待拖到超时。

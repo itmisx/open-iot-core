@@ -5,6 +5,9 @@
 集群一组。入库的结果在 [`docs/baseline/throughput.md`](../../docs/baseline/throughput.md)，
 原始数据与环境记录在 `docs/baseline/throughput/`。
 
+`make bench-verify-test`不启动服务，只用确定性假证据验证百万连接和影子生产
+聚合器会接受完整结果，并拒绝重复节点、重复leader、错误RF等伪证据。
+
 它不在 `make gate` 里：门禁只依赖 Go 工具链，而这套要起进程、要 `openssl`
 （集群的复制证书）与 `python3`（汇总表），两组跑完二十分钟上下。
 
@@ -151,14 +154,118 @@ HAProxy 类终结器，但引用证书 DN/序列号变量的策略需要保留 D
 | 脚本 | 回答的问题 | 旋钮 |
 | --- | --- | --- |
 | `connect-attribution.sh` | 建连慢在哪一层？ | `NODES`（1 或 3）、`SHARDS`、`CONNS`、`CONC`、`BASE`、`OUT` |
-| `shadow-attribution.sh` | 影子的吞吐是被并发限住还是被串行化限住？ | `OUT` |
+| `shadow-attribution.sh` | 影子的吞吐是被并发限住还是被串行化限住？真实 shard leader 崩溃后版本是否连续？ | `NODES`（1、3或5）、`SHADOW_SHARDS`、`SHADOW_RF`、`MQTT_TLS`（1为设备mTLS）、`SHADOW_RESPONSE_QOS`（历史对比默认0）、`SHADOW_RESPONSE_TIMEOUT`（默认5s）、`RTT`、`LADDER`、`DURATION`、`BASE`、`OUT`、`FAILOVER`、`OPENIOTD_BIN`、`MQTTBENCH_BIN` |
+| `shadow-production-linux.sh` | 已部署的五台Linux是否达到影子生产长稳门槛？ | `BROKERS`、`ADMINS`、`TOKEN_FILES`、`HOST_EVIDENCE_FILES`、设备mTLS材料、`MIN_RATE`、`MAX_P99_MS`、`MIN_MERGE_RATIO` |
 
 两条判读规则，都是踩过才写下来的：
 
 - **建连那一栏必须多轮取中位数。** 它的轮间离散比量级还大（同一天量到过 27 到
   163），单轮对单轮比较过一次，结论是反的。
-- **吞吐随并发平、延迟随并发线性涨 = 某一级被串行化。** 影子那一栏就是这个
-  形状（并发 1 到 100，吞吐 132 到 185，p50 7.5 到 526 ms）。
+- **吞吐随并发平、延迟随并发线性涨 = 某一级被串行化。** 旧影子路径就是这个
+  形状（并发 1 到 100，吞吐 132 到 185，p50 7.5 到 526 ms）；组提交修复后
+  单节点随并发升到11,661/s。生产拓扑用
+  `MQTT_TLS=1 NODES=5 SHADOW_SHARDS=4 SHADOW_RF=3`，不要拿三节点RF=all或明文
+  listener替代。影子轮结束时会停止新请求并排空当前在途accepted，JSON里的
+  `published == delivered`因此可作为严格无丢失门禁。脚本还会抓取全部节点的
+  指标并把`shadowMergeLogical`、`shadowMergePhysical`、实际Raft日志数和leader
+  路由分布写入每条JSON；少一个节点的指标就整轮失败，不能用局部计数归因。
+  会话合批因返回位图保持64条，影子不读取该位图而使用256条上限；`满批`按
+  当前组自己的配置上限解释，不能固定读成64。
+
+默认由脚本从当前源码构建两个二进制；跨容器或远程归因时可传
+`OPENIOTD_BIN`和`MQTTBENCH_BIN`，脚本会复制并使用指定的可执行文件。两者应从
+同一提交、同一目标平台构建，避免被测服务与压测协议来自不同版本。
+
+影子请求发布的QoS与accepted/rejected响应订阅的QoS是两个独立旋钮。历史归因
+数据用QoS 0响应，`shadow-attribution.sh`为可比性继续默认
+`SHADOW_RESPONSE_QOS=0`；生产门禁固定使用QoS 1响应并逐条PUBACK。否则高负载时
+出站QoS 0响应可被丢弃：服务端已经成功提交、proposal errors仍为0，但压测器
+只能把收不到的accepted记成歧义超时，会把响应可靠性误判为影子写入能力。
+
+真实五机最终验收不再使用会自行拉起本机进程的归因脚本，而是在Linux负载机上
+直接指向候选集群：
+
+```bash
+BROKERS=10.0.0.11:8883,10.0.0.12:8883,10.0.0.13:8883,10.0.0.14:8883,10.0.0.15:8883 \
+ADMINS=http://10.0.0.11:9090,http://10.0.0.12:9090,http://10.0.0.13:9090,http://10.0.0.14:9090,http://10.0.0.15:9090 \
+TOKEN_FILES=/secure/n1.token,/secure/n2.token,/secure/n3.token,/secure/n4.token,/secure/n5.token \
+HOST_EVIDENCE_FILES=/evidence/n1.json,/evidence/n2.json,/evidence/n3.json,/evidence/n4.json,/evidence/n5.json \
+TLS_CA=/secure/root-ca.pem TLS_CERT=/secure/device.pem TLS_KEY=/secure/device.key \
+TLS_SERVER_NAME=mqtt.example.internal SETUP=0 EXPECTED_SHADOW_API_RATE=0 \
+tests/bench/shadow-production-linux.sh
+```
+
+默认硬门槛是五个不同`node_id`且同一`cluster_id`、4分片/RF=3、60秒、至少
+8,000 accepted/s、p99与单请求最大延迟均不超过1秒、最大accepted断档不超过1秒、零错误、发送与accepted逐条相等、leader平均
+合批至少96条/物理日志，并确认每个节点的全局速率分母都是5。输出目录保留
+各节点前后metrics、health、环境、原始JSONL和`summary.json`。门禁强制读取并
+归档五份主机证据，要求`machineId`与数据盘/云卷`diskId`分别唯一；不同ID能证明
+使用了不同块设备或云卷，但不能单独证明它们不共享同一底层存储阵列故障域，后者
+仍须结合云厂商/存储拓扑核对。
+容量轮和故障轮都以QoS 1订阅accepted/rejected并确认每条响应；这不改变影子
+update请求的发布QoS，只保证“已提交但响应在出站过载时丢失”不会制造假超时。
+生产响应期限为20秒，覆盖远程请求的10秒Raft apply加5秒拨号硬预算；它不代替
+p99一秒门槛，最大延迟仍写入原始结果。歧义超时后该设备流立即停止，绝不继续
+写同一个thing而把一次慢提交放大成迟到token与级联假超时。
+
+每台broker先在本机采集证据；块设备有唯一serial时可省略`DISK_ID`，云盘、
+overlay或设备映射必须显式传云卷/物理盘唯一ID：
+
+```bash
+NODE_ID=node-a DATA_DIR=/var/lib/openiot DISK_ID=vol-012345 \
+  tests/bench/shadow-host-evidence-linux.sh > /evidence/n1.json
+```
+
+生产脚本要求五份证据的`machineId`与`diskId`分别唯一，并把原件复制进结果目录。
+容量轮默认要求候选集群临时配置`shadow_api_rate: 0`，脚本会从每个节点overview
+核实，避免8,000/s准入阀把数据路径上限测成配额上限；完成后应恢复生产8,000/s。
+
+要在长稳通过后继续执行真实进程故障轮，显式传一个可执行钩子：
+
+```bash
+FAILOVER_HOOK=/secure/stop-openiot-node RESTORE_HOOK=/secure/start-openiot-node \
+  tests/bench/shadow-production-linux.sh
+```
+
+两个钩子都收到`node_id admin_url broker_addr`三个参数；前者必须停止对应进程并
+等到health端点不可达后返回，后者负责重新启动同一节点。脚本不会自行SSH。故障轮默认预置200个
+临时设备，从不承载目标分片的Access节点持续更新，杀掉真实leader后要求5秒内
+恢复版本化写入、accepted最大断档不超过3秒、成功率至少99%，并严格检查
+`published = accepted + rejected + timeout`及恢复后仍有accepted。最终状态与原始
+负载写入`failover-summary.json`和`failover-load.json`。切换验证通过后脚本调用恢复
+钩子，核对原`node_id`与`cluster_id`，要求目标分片重新ready、持久化applied index
+不低于存活leader的追平目标，并从恢复节点读到version 2；缺少恢复钩子时故障轮
+不会启动。
+
+设置`FAILOVER=1`时，脚本会在阶梯结束后读取
+`openiot_shadow_shard_is_leader`，选择一个真实影子leader：先经另一个存活节点
+写入版本1，杀掉leader进程，等剩余多数派选举，再以expected version 1写入
+版本2并跨节点读取核对。结果以`scenario=shadow/failover`追加到同一JSONL。
+设置`FAILOVER_CLIENTS`后还会让全部客户端持续更新同一目标shard；
+`FAILOVER_DURATION`、`FAILOVER_WARMUP`、`FAILOVER_KILL_DELAY`控制故障窗口。
+设置`KEEP_WORK=1`可保留临时节点目录与日志，用于诊断慢阶段；默认仍自动清理。
+门禁要求`published = accepted + rejected + timeout`、恢复后仍有accepted，并记录
+`maxAcceptedGapMs`。该结果表示本拓扑的恢复窗口与版本前缀安全；同机loopback
+仍不冒充五台独立Linux上的最终故障吞吐。例如：
+
+```bash
+NODES=3 SHADOW_SHARDS=4 MQTT_TLS=1 FAILOVER=1 FAILOVER_CLIENTS=200 \
+  FAILOVER_DURATION=20s FAILOVER_WARMUP=2s FAILOVER_KILL_DELAY=2 LADDER=1 \
+  DURATION=1s WARMUP=1s OUT=/tmp/shadow-failover.jsonl \
+  tests/bench/shadow-attribution.sh
+```
+
+生产路由对照用五节点RF=3，并故意从不承载目标分片的Access入口发压：
+
+```bash
+NODES=5 SHADOW_SHARDS=4 SHADOW_RF=3 MQTT_TLS=1 FAILOVER=1 \
+  FAILOVER_CLIENTS=200 FAILOVER_DURATION=15s FAILOVER_WARMUP=2s \
+  FAILOVER_KILL_DELAY=2 LADDER=1 DURATION=1s WARMUP=1s \
+  OUT=/tmp/shadow-failover-n5-rf3.jsonl tests/bench/shadow-attribution.sh
+```
+
+同机loopback最终轮恢复1.499秒、accepted最大断档1.356秒，
+36,161次发布中35,961 accepted、200 rejected、0 timeout。
 
 另有两个 Go 侧的探针，设环境变量才跑、不进门禁：
 `internal/cluster` 的 `TestShardProposeCeiling`（`OPENIOT_SHARD_CEILING=1`，

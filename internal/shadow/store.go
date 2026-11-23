@@ -82,17 +82,31 @@ type Store interface {
 // 存储层只负责"读出、应用、写回"的原子性与持久性，语义仍在此处。
 // 若让存储层自己实现一遍合并，两个 Store 的语义会慢慢分叉。
 func ApplyCommand(cur *Document, cmd Command) (*Document, *Result, error) {
+	return applyCommand(cur, cmd, false)
+}
+
+// ApplyCommandOwned 是持久化状态机使用的低分配入口。调用方把 cur 的
+// 所有权交给本函数，返回后不得再访问或修改它；作为交换，Previous 可以
+// 直接复用 cur，Current 可以直接复用 next，不必为结果再深拷贝两遍。
+//
+// 普通 Store 和外部语义测试继续使用 ApplyCommand：它保留输入、输出互不
+// 别名的强隔离。只有刚从事务内私有字节解码出来的文档才适合走这个入口。
+func ApplyCommandOwned(cur *Document, cmd Command) (*Document, *Result, error) {
+	return applyCommand(cur, cmd, true)
+}
+
+func applyCommand(cur *Document, cmd Command, owned bool) (*Document, *Result, error) {
 	switch cmd.Kind {
 	case CmdUpdate:
-		return applyUpdate(cur, cmd)
+		return applyUpdate(cur, cmd, owned)
 	case CmdDelete:
-		return applyDelete(cur, cmd)
+		return applyDelete(cur, cmd, owned)
 	default:
 		return nil, nil, ErrInternal
 	}
 }
 
-func applyUpdate(cur *Document, cmd Command) (*Document, *Result, error) {
+func applyUpdate(cur *Document, cmd Command, owned bool) (*Document, *Result, error) {
 	curVersion := int64(0)
 	if cur != nil {
 		curVersion = cur.Version
@@ -105,7 +119,10 @@ func applyUpdate(cur *Document, cmd Command) (*Document, *Result, error) {
 	var prev *Document
 	next := &Document{}
 	if cur != nil {
-		prev = cur.Clone()
+		prev = cur
+		if !owned {
+			prev = cur.Clone()
+		}
 		next = cur.Clone()
 	}
 	if next.Desired == nil {
@@ -145,9 +162,13 @@ func applyUpdate(cur *Document, cmd Command) (*Document, *Result, error) {
 	next.UpdatedAtSec = cmd.NowSec
 
 	d := delta(next.Desired, next.Reported)
+	current := next
+	if !owned {
+		current = next.Clone()
+	}
 	res := &Result{
 		Previous:  prev,
-		Current:   next.Clone(),
+		Current:   current,
 		Version:   next.Version,
 		Changed:   changed,
 		Delta:     d,
@@ -156,7 +177,7 @@ func applyUpdate(cur *Document, cmd Command) (*Document, *Result, error) {
 	return next, res, nil
 }
 
-func applyDelete(cur *Document, cmd Command) (*Document, *Result, error) {
+func applyDelete(cur *Document, cmd Command, owned bool) (*Document, *Result, error) {
 	if cur == nil {
 		return nil, nil, errNotFound(cmd.Shadow)
 	}
@@ -165,8 +186,12 @@ func applyDelete(cur *Document, cmd Command) (*Document, *Result, error) {
 	}
 	// PRD SHDW-028：删除后版本重置，重新创建从 1 开始。
 	// 实现上即"把文档整个丢掉"，下一次 applyUpdate 的 curVersion 为 0。
+	previous := cur
+	if !owned {
+		previous = cur.Clone()
+	}
 	return nil, &Result{
-		Previous: cur.Clone(),
+		Previous: previous,
 		Current:  nil,
 		Version:  cur.Version,
 		Changed:  true,

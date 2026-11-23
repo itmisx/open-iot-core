@@ -100,11 +100,33 @@ func (s *ShadowStore) List(thing string) []string {
 }
 
 // Apply 应用一条命令。
+//
+// 并发更新走 bbolt 的合并提交：每个调用仍然在自己的事务回调里完成
+// 「读当前影子 -> 应用命令 -> 写回」，但底层可以把不同 thing 的回调装进
+// 同一个写事务，只做一次 fsync。false 不表示异步或放松持久性；InTx 仍在
+// 事务提交并同步落盘后才返回。它只允许底层等待一个有界窗口并合并并发写。
+//
+// lane 锁必须覆盖整个 InTx 调用，而不只覆盖事务回调。同一 thing 的后一条
+// 命令只有在前一条已经提交后才能进入队列，否则 bbolt 在重试/拆批时可能改变
+// 两条命令的执行顺序，破坏影子 version 与 expectedVersion 的语义。
+//
+// bbolt 的 Batch 在同批某个回调失败时可能重试其余回调，所以事务体必须幂等，
+// 并且 Result 只能在 InTx 成功返回后交给调用方。applyShadowTo 每次都从传入的
+// tx 重新读取状态，外部只保留最后一次执行产生的 Result，满足这个约束。
 func (s *ShadowStore) Apply(_ context.Context, cmd shadow.Command) (*shadow.Result, error) {
 	lane := s.lane(cmd.Thing)
 	lane.Lock()
 	defer lane.Unlock()
-	return applyShadowTo(shadowKVReadWriter{KV: s.kv}, cmd)
+	var res *shadow.Result
+	err := s.kv.InTx(false, func(tx Tx) error {
+		var err error
+		res, err = applyShadowTo(tx, cmd)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // ApplyTx 在调用方已有的写事务里应用影子命令。
@@ -122,11 +144,6 @@ type shadowReadWriter interface {
 	Delete([]byte) error
 }
 
-type shadowKVReadWriter struct{ KV }
-
-func (w shadowKVReadWriter) Set(key, value []byte) error { return w.KV.Set(key, value, true) }
-func (w shadowKVReadWriter) Delete(key []byte) error     { return w.KV.Delete(key, true) }
-
 func applyShadowTo(dst shadowReadWriter, cmd shadow.Command) (*shadow.Result, error) {
 
 	key := shadowKey(cmd.Thing, cmd.Shadow)
@@ -143,14 +160,23 @@ func applyShadowTo(dst shadowReadWriter, cmd shadow.Command) (*shadow.Result, er
 		return nil, err
 	}
 
-	next, res, aerr := shadow.ApplyCommand(cur, cmd)
+	// cur 是刚从当前事务的私有字节解码出来的，没有任何外部观察者。
+	// 交出所有权可避免为 Previous 与 Current 再深拷贝整棵影子树；next 在
+	// 返回前已经编码入事务，之后只由不可变的响应路径读取。
+	next, res, aerr := shadow.ApplyCommandOwned(cur, cmd)
 	if aerr != nil {
 		return nil, aerr
 	}
 
-	// 落盘用 sync：影子更新一旦被确认（accepted 已发出），设备就认为
-	// 状态已被接受。此时若因进程崩溃丢失，设备不会重发，
-	// 云端与设备的认知就永久分叉了。
+	// 写入必须在 accepted 发出之前落盘。
+	//
+	// 影子更新一旦被确认，设备就认为状态已被接受；此时若因进程崩溃丢失，
+	// 设备不会重发，云端与设备的认知就永久分叉。
+	//
+	// 这里不再有 per-call 的 sync 标志：写入经传入的 tx 进入外层事务，而
+	// 那个事务（Apply 走 bbolt 的 Batch、分片状态机走整批提交）在提交时
+	// fsync，InTx 在落盘之后才返回。合并并发写只省 fsync 次数，不放松
+	// 这条约束——改动这一段时别把它读成「现在是异步写」。
 	if next == nil {
 		if err := dst.Delete(key); err != nil {
 			return nil, err

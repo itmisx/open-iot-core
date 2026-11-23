@@ -12,7 +12,7 @@ cd "$(dirname "$0")/../.."
 MQTT_PORT=${MQTT_PORT:-28883}
 ALPN_PORT=${ALPN_PORT:-28443}
 ADMIN_PORT=${ADMIN_PORT:-29090}
-WORK=${WORK:-$(mktemp -d -t openiot-sdk-test)}
+WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/openiot-sdk-test.XXXXXX")} || exit 1
 VENV="${WORK}/venv"
 BIN="${WORK}/openiotd"
 DATA="${WORK}/data"

@@ -22,7 +22,7 @@ if [ "$#" -lt 2 ]; then
   exit 2
 fi
 
-work=$(mktemp -d -t openiot-density-verify)
+work=$(mktemp -d "${TMPDIR:-/tmp}/openiot-density-verify.XXXXXX") || exit 1
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT INT TERM
 rows="$work/rows.tsv"

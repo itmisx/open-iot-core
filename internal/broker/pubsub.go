@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"time"
 
 	"github.com/itmisx/open-iot-core/internal/authz"
 	"github.com/itmisx/open-iot-core/internal/cluster"
@@ -306,10 +307,24 @@ func (c *conn) serveReserved(ctx context.Context, name string, payload []byte) {
 	if svc == nil {
 		return
 	}
+	// contract:allow-time-now 只做保留主题服务耗时的差值计算（影子写入那一段，
+	// OBS-148 的同类）。注入时钟只有毫秒墙上时间，而这里要分辨的是「时间在
+	// 平台服务里还是在投递上」——1,200 并发那一轮的 10 秒尾部就是靠这一段
+	// 与 Raft proposal 的对照定位到 WAL 的。它不参与排序或版本比较。
+	started := time.Now()
 	msgs, ok := svc.HandleReserved(ctx, ReservedRequest{
 		Topic: name, Payload: payload,
 		ClientID: c.clientID(), Thing: c.princ.AuthzCtx.Thing,
 	})
+	elapsed := uint64(time.Since(started))
+	for old := c.b.reservedServiceMaxNs.Load(); elapsed > old; old = c.b.reservedServiceMaxNs.Load() {
+		if c.b.reservedServiceMaxNs.CompareAndSwap(old, elapsed) {
+			break
+		}
+	}
+	if elapsed > uint64(time.Second) {
+		c.b.reservedServiceOver1s.Add(1)
+	}
 	if !ok {
 		return
 	}
@@ -321,7 +336,13 @@ func (c *conn) serveReserved(ctx context.Context, name string, payload []byte) {
 		if msgs[i].QoS1 {
 			m.QoS = 1
 		}
-		c.b.route(nil, m, nil)
+		delivered := c.b.route(nil, m, nil)
+		if i == 0 {
+			c.b.reservedResponses.Add(1)
+			if delivered == 0 {
+				c.b.reservedNoSubscriber.Add(1)
+			}
+		}
 	}
 }
 

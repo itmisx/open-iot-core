@@ -79,6 +79,12 @@ cover:
 
 # TST-010：协议层与策略层不低于 95%，整体不低于 85%
 .PHONY: cover-check
+# 整体覆盖率那一步的输出先收进临时文件，失败时再打出来。
+#
+# 原先它是 >/dev/null：成功时挡掉了几十行 ok 噪声，失败时也把**唯一的线索**
+# 一起挡掉了——整个 gate 里最容易失败的就是这一步（它紧跟在 test-race 之后，
+# 整包再跑一遍而资源还没回落），而失败现场只剩一行
+# 「make: *** [cover-check] Error 1」，连哪个包哪条用例都看不到。
 cover-check:
 	@for pkg in $(STRICT_PKGS); do \
 		$(GO) test -coverprofile=$(COVERFILE).strict -coverpkg=$$pkg $$pkg >/dev/null || exit 1; \
@@ -86,8 +92,14 @@ cover-check:
 		printf "%-24s 覆盖率: %s%%（门槛 95%%）\n" "$$pkg" "$$pct"; \
 		awk -v p=$$pct -v n=$$pkg 'BEGIN { if (p+0 < 95) { print n" 低于门槛 95%"; exit 1 } }' || exit 1; \
 	done
-	@$(GO) test -coverprofile=$(COVERFILE) \
-		-coverpkg=$$(echo $(COVER_PKGS) | tr ' ' ,) $(COVER_PKGS) >/dev/null
+	@out=$$(mktemp); \
+	if ! $(GO) test -coverprofile=$(COVERFILE) \
+		-coverpkg=$$(echo $(COVER_PKGS) | tr ' ' ,) $(COVER_PKGS) >$$out 2>&1; then \
+		grep -E "^(FAIL|--- FAIL|panic)" $$out | head -20; \
+		echo "（完整输出：$$out）"; \
+		exit 1; \
+	fi; \
+	rm -f $$out
 	@pct=$$($(GO) tool cover -func=$(COVERFILE) | tail -1 | awk '{gsub("%","",$$3); print $$3}'); \
 	echo "整体覆盖率:        $$pct%（门槛 85%）"; \
 	awk -v p=$$pct 'BEGIN { if (p+0 < 85) { print "低于门槛 85%"; exit 1 } }'
@@ -168,6 +180,15 @@ bench:
 .PHONY: bench-e2e
 bench-e2e:
 	@bash tests/bench/run.sh
+
+# 生产验收聚合器的确定性假证据测试；不启动broker，也不需要网络。
+.PHONY: bench-verify-test
+bench-verify-test:
+	@bash tests/bench/verify-million-density-test.sh
+	@bash tests/bench/shadow-production-verify-test.sh
+	@bash tests/bench/shadow-failover-verify-test.sh
+	@bash tests/bench/shadow-host-evidence-verify-test.sh
+	@bash tests/bench/shadow-recovery-verify-test.sh
 
 # TST-072：依赖漏洞扫描
 .PHONY: vuln

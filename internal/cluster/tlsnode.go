@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/gob"
@@ -112,6 +113,11 @@ type TLSGroup struct {
 	// ownAccepted 是入站的 markOwn 连接计数，见 intake 里的说明。
 	ownAccepted atomic.Int64
 	draining    atomic.Bool
+	// ownConns 只跟踪本项目协议的入站长连接，不含 Dragonboat 的 Raft
+	// 连接。进入 drain 时主动关掉它们，让对端正在等待的写立刻解除；
+	// 否则优雅停机会留下整整一个 reqTO 的黑洞窗口。
+	ownMu    sync.Mutex
+	ownConns map[net.Conn]struct{}
 	// learned 是拨号时学到的"地址到节点 ID"。
 	//
 	// 新加入的节点配置里只有自己（peers 只需写自己，见 Peers 的说明），
@@ -414,13 +420,26 @@ func (g *TLSGroup) Snapshot() error {
 	return grp.Snapshot()
 }
 
-// Drain 标记排空。之后 Propose 返回 ErrDraining。
-func (g *TLSGroup) Drain() { g.draining.Store(true) }
+// Drain 标记排空。之后 Propose 返回 ErrDraining，并立即断开本项目协议的
+// 入站连接。Raft 连接归 Dragonboat 管理，继续存活到 Close 以完成正常收尾。
+func (g *TLSGroup) Drain() {
+	g.draining.Store(true)
+	g.ownMu.Lock()
+	conns := make([]net.Conn, 0, len(g.ownConns))
+	for c := range g.ownConns {
+		conns = append(conns, c)
+	}
+	g.ownMu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
 
 // Close 停掉复制组与监听。
 func (g *TLSGroup) Close() error {
 	var err error
 	g.closeOnce.Do(func() {
+		g.Drain()
 		if grp := g.g(); grp != nil {
 			err = grp.Close()
 		}
@@ -433,6 +452,9 @@ func (g *TLSGroup) Close() error {
 				err = cerr
 			}
 		}
+		// Drain 与关闭监听之间仍可能接入一条连接。它会明确回复
+		// ErrDraining；监听关闭后再扫一次，避免其空闲读协程残留。
+		g.Drain()
 	})
 	return err
 }
@@ -477,8 +499,19 @@ func (g *TLSGroup) intake(c net.Conn) {
 		// 握手次数只有服务端数得到，而「每条消息一次握手」这个缺陷
 		// （CLU-038）在功能上完全看不出来——它只在吞吐上显形，而那正是
 		// 现有三套验收都不看的东西。
+		g.ownMu.Lock()
+		if g.ownConns == nil {
+			g.ownConns = make(map[net.Conn]struct{})
+		}
+		g.ownConns[c] = struct{}{}
+		g.ownMu.Unlock()
 		g.ownAccepted.Add(1)
-		defer func() { _ = c.Close() }()
+		defer func() {
+			g.ownMu.Lock()
+			delete(g.ownConns, c)
+			g.ownMu.Unlock()
+			_ = c.Close()
+		}()
 		g.handleOwn(c, peer)
 	default:
 		_ = c.Close()
@@ -628,6 +661,12 @@ func (g *TLSGroup) dispatch(req wireMsg) wireResp {
 		}
 		return wireResp{OK: true, Found: found, Data: data}
 	case wireShardStatusKind:
+		// drain后的本地Raft视图可能仍短暂显示自己是leader，但本节点已
+		// 明确不再接写。继续把它报告给非副本Access会反复污染leader
+		// 缓存，直到整个进程退出才恢复，实测形成约10秒黑洞。
+		if g.draining.Load() {
+			return wireResp{Err: ErrDraining.Error()}
+		}
 		shards := g.shardGroup(req.Shard)
 		if shards == nil {
 			return wireResp{Err: ErrNotMember.Error()}
@@ -647,6 +686,9 @@ func (g *TLSGroup) dispatch(req wireMsg) wireResp {
 		}
 		return wireResp{OK: true}
 	case wireShadowWriteKind, wireShadowReadKind:
+		if req.Kind == wireShadowWriteKind && g.draining.Load() {
+			return wireResp{Err: ErrDraining.Error()}
+		}
 		g.shadowMu.RLock()
 		fn := g.shadowWrite
 		if req.Kind == wireShadowReadKind {
@@ -734,10 +776,21 @@ func (g *TLSGroup) SetShadowHandlers(write, read func([]byte) ([]byte, error)) {
 }
 
 func (g *TLSGroup) ForwardShadowWrite(to NodeID, data []byte) ([]byte, error) {
-	resp, ok := g.roundTrip(to, wireMsg{
+	// 影子数据面不能让一条发往旧 leader 的模糊写占住 MQTT 连接
+	// 整整一个 applyTO（默认 10 秒）。它仍然绝不自动重试：只是在一个拨号
+	// 预算后把“可能已提交、应答丢失”交回设备，下一条独立更新再解析
+	// 新 leader。正常提案 p99 远低于该预算；共识内部的 applyTO 不受影响。
+	timeout := g.dialTO
+	if timeout <= 0 || timeout > g.reqTO {
+		timeout = g.reqTO
+	}
+	resp, ok, sent := g.roundTripTrackedTimeout(to, wireMsg{
 		Kind: wireShadowWriteKind, From: string(g.id), Data: data,
-	})
+	}, timeout)
 	if !ok {
+		if !sent {
+			return nil, ErrRequestUnsent
+		}
 		return nil, ErrNoQuorum
 	}
 	if err := errFromWire(resp); err != nil {
@@ -763,10 +816,16 @@ func (g *TLSGroup) ForwardShadowRead(to NodeID, data []byte) ([]byte, error) {
 // 分片 leader。它不重试：连接断开时无法区分「未送达」与
 // 「已提交但应答丢失」，自动重发会破坏写入语义。
 func (g *TLSGroup) forwardShard(to NodeID, shard uint64, data []byte) (uint64, error) {
-	resp, ok := g.roundTrip(to, wireMsg{
+	resp, ok, sent := g.roundTripTracked(to, wireMsg{
 		Kind: wireShardPropose, From: string(g.id), Shard: shard, Data: data,
 	})
 	if !ok {
+		// 拨号前失败能证明请求没有到过旧 leader。把它与“写出后应答
+		// 丢失”的模糊失败分开，上层才可以在换届期间安全地改走本地
+		// NodeHost；两者都压成 ErrNoQuorum 会制造 503 重试风暴。
+		if !sent {
+			return 0, ErrRequestUnsent
+		}
 		return 0, ErrNoQuorum
 	}
 	if err := errFromWire(resp); err != nil {
@@ -936,7 +995,9 @@ func (g *TLSGroup) dialPeer(addr string, expect NodeID) (net.Conn, error) {
 		return nil
 	}
 	conn := tls.Client(raw, cfg)
-	if err := conn.Handshake(); err != nil {
+	handshakeCtx, cancel := context.WithTimeout(context.Background(), g.dialTO)
+	defer cancel()
+	if err := conn.HandshakeContext(handshakeCtx); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}
@@ -1019,32 +1080,52 @@ func (g *TLSGroup) idOf(addr string) NodeID {
 // 第二条是「复用一条已被对端关掉的连接」这件事必须罕见的理由，而那由
 // peerIdleTimeout 明显小于 peerServerIdleTimeout 来保证。
 func (g *TLSGroup) roundTrip(to NodeID, req wireMsg) (wireResp, bool) {
+	resp, ok, _ := g.roundTripTracked(to, req)
+	return resp, ok
+}
+
+// roundTripTracked 比 roundTrip 多回报请求是否可能已经写入连接。
+// sent=false 只允许出现在没有目标地址或拨号失败时；Encode 一旦被调用，
+// 即使它返回错误也可能已经写出部分帧，必须保守地视为已发送。
+func (g *TLSGroup) roundTripTracked(to NodeID, req wireMsg) (wireResp, bool, bool) {
+	return g.roundTripTrackedTimeout(to, req, g.reqTO)
+}
+
+func (g *TLSGroup) roundTripTrackedTimeout(to NodeID, req wireMsg,
+	timeout time.Duration,
+) (wireResp, bool, bool) {
 	addr := g.addrOf(to)
 	if addr == "" {
-		return wireResp{}, false
+		return wireResp{}, false, false
 	}
 	if pc := g.pool.take(to, addr); pc != nil {
-		resp, err := pc.exchange(&req, g.reqTO)
+		resp, err := pc.exchange(&req, timeout)
 		if err == nil {
 			g.pool.put(to, pc)
-			return resp, true
+			return resp, true, true
 		}
 		pc.close()
+		// 同一对端的一条长连接失效，通常意味着对端 drain、重启或
+		// 地址后的进程已经更换。池中其余空闲连接属于同一代，继续
+		// 逐条试用会让每条独立写都先遭遇一次模糊失败；一次最多256条，
+		// 实测RF=3故障切换因此形成约10秒黑洞。当前请求仍不重试，
+		// 这里只淘汰尚未承载请求的空闲连接，不改变写入语义。
+		g.pool.drop(to)
 		if !retryableKind(req.Kind) {
-			return wireResp{}, false
+			return wireResp{}, false, true
 		}
 	}
 	pc, err := g.dialOwn(to, addr)
 	if err != nil {
-		return wireResp{}, false
+		return wireResp{}, false, false
 	}
-	resp, err := pc.exchange(&req, g.reqTO)
+	resp, err := pc.exchange(&req, timeout)
 	if err != nil {
 		pc.close()
-		return wireResp{}, false
+		return wireResp{}, false, true
 	}
 	g.pool.put(to, pc)
-	return resp, true
+	return resp, true, true
 }
 
 // retryableKind 报告这类请求能不能在新连接上重发一次。见 roundTrip。
@@ -1054,8 +1135,25 @@ func retryableKind(kind uint8) bool {
 }
 
 func (g *TLSGroup) forwardShardStatus(to NodeID, shard uint64) (uint64, bool, error) {
-	resp, ok := g.roundTrip(to, wireMsg{Kind: wireShardStatusKind, From: string(g.id), Shard: shard})
-	if !ok {
+	// leader 状态是冷路径幂等查询，不应使用为共识提案预留的
+	// applyTO+dialTO 长超时。故障后首个放置副本通常恰好是旧 leader，
+	// 若让它的半开连接占满 10 秒，后面已健康的副本根本没机会回答。
+	// 冷路径也刻意不复用池中旧代连接：正常写 RPC 可能还在那条连接
+	// 上等模糊结果，leader 发现若再依赖它就形成循环等待。一次性
+	// mTLS 探测只在缓存缺失/故障时发生，稳态写路径仍是零额外握手。
+	addr := g.addrOf(to)
+	if addr == "" {
+		return 0, false, ErrNoQuorum
+	}
+	pc, err := g.dialOwn(to, addr)
+	if err != nil {
+		return 0, false, ErrNoQuorum
+	}
+	defer pc.close()
+	resp, err := pc.exchange(&wireMsg{
+		Kind: wireShardStatusKind, From: string(g.id), Shard: shard,
+	}, g.dialTO)
+	if err != nil {
 		return 0, false, ErrNoQuorum
 	}
 	if err := errFromWire(resp); err != nil {
@@ -1133,6 +1231,8 @@ func errFromWire(resp wireResp) error {
 		return ErrNotLeader
 	case ErrNoQuorum.Error():
 		return ErrNoQuorum
+	case ErrRequestUnsent.Error():
+		return ErrRequestUnsent
 	case ErrDraining.Error():
 		return ErrDraining
 	case ErrStaleEpoch.Error():

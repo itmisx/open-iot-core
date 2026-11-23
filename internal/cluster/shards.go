@@ -98,6 +98,13 @@ type ShardOptions struct {
 	// 提案再次合并。返回值 widths 描述合并结果位图中每个输入占几位；
 	// consumed 是实际消费的输入前缀。nil 表示关闭 leader 侧二级合批。
 	MergeProposals func(items [][]byte) (merged []byte, widths []uint8, consumed int, err error)
+	// MergeMaxItems 是一次二级合批最多查看的输入数。0保持会话历史值64。
+	// 上限256用于不依赖uint64返回位图的状态机（例如影子）；会话必须保持64。
+	MergeMaxItems int
+	// MergeIgnoresResult 表示合并提案的调用方不读取状态机uint64返回值。
+	// 只有这类状态机才允许widths总和超过64；每个请求仍分别等待同一条
+	// Raft日志完成，错误也逐请求返回。
+	MergeIgnoresResult bool
 
 	ApplyTimeout time.Duration
 }
@@ -109,10 +116,18 @@ type ShardGroup struct {
 	count   uint64
 	replica uint64
 	applyTO time.Duration
+	applied func(shard uint64) uint64
 	// transport 复用集群已有的 TLS 长连接池；replicaNode 把
 	// Dragonboat 的数字副本号还原为对端节点 ID。
 	transport   *TLSGroup
 	replicaNode map[uint64]NodeID
+	// leaderCache 按本组offset缓存最近一次权威leader副本号。非副本
+	// Access节点靠Ready的状态探针填充它，使影子RPC稳态直达leader，
+	// 不必每次写先敲放置表首项或额外做一次状态查询。
+	leaderCache []atomic.Uint64
+	// leaderProbe 把非副本 Access 的冷路径解析限制为每分片单飞。
+	// 并发请求共享一个有界完成信号，不各自建链，也不产生拒绝风暴。
+	leaderProbe []atomic.Pointer[leaderProbeState]
 	// placement 把当前 RF=all 也表达成显式放置表。后续切 RF=3 时，
 	// 启动哪些本地副本、读请求发给谁和 leader 均衡都必须读同一张表，
 	// 不能各自再算一遍。
@@ -126,6 +141,8 @@ type ShardGroup struct {
 	claimReadMu  sync.Mutex
 	claimReads   map[claimedSessionKey]sessionReadResult
 	merge        func(items [][]byte) ([]byte, []uint8, int, error)
+	mergeMax     int
+	mergeNoValue bool
 	mergeMu      sync.Mutex
 	mergeWG      sync.WaitGroup
 	mergeLane    map[uint64]*leaderProposalLane
@@ -140,6 +157,12 @@ type leaderProposalRequest struct {
 	done chan leaderProposalResult
 }
 
+type leaderProbeState struct {
+	done chan struct{}
+}
+
+const leaderResolveTimeout = 3 * time.Second
+
 type leaderProposalResult struct {
 	value uint64
 	err   error
@@ -148,10 +171,10 @@ type leaderProposalResult struct {
 type leaderProposalLane struct {
 	running bool
 	pending []*leaderProposalRequest
-	// items/batch 由本 lane 唯一 worker 复用，避免每个物理 Raft
-	// 提案分配两个最多 64 项的临时切片。
-	items [64][]byte
-	batch [64]*leaderProposalRequest
+	// items/batch 由本 lane 唯一worker复用，避免每个物理Raft提案分配
+	// 临时切片。会话长度64；不使用返回位图的影子可配置到256。
+	items [][]byte
+	batch []*leaderProposalRequest
 }
 
 type sessionReadRequest struct {
@@ -186,6 +209,8 @@ const (
 const (
 	leaderProposalMergeDelay      = time.Millisecond
 	leaderProposalRequestCacheMax = 4096
+	leaderProposalMergeDefaultMax = 64
+	leaderProposalMergeHardMax    = 256
 )
 
 // shardStats 是提案侧的观测（OBS-148）。
@@ -271,6 +296,43 @@ type ShardStats struct {
 	LeaderMergeBlocked       uint64
 	// Duration 是提案到应用返回的耗时分布，单位毫秒。
 	Duration metrics.Snapshot
+}
+
+// ShardLeadership 是本节点承载的一个分片当前看到的 leader 状态。
+// 非本地副本不返回：调用方抓齐所有节点即可得到完整布局，同时不会让
+// 每个 Access 节点为不承载的分片额外发状态 RPC。
+type ShardLeadership struct {
+	Shard        uint64
+	Leader       NodeID
+	Ready        bool
+	IsLeader     bool
+	AppliedIndex uint64
+}
+
+// LocalLeadership 返回本节点各本地副本的 leader 视图，供运维指标和
+// 故障注入脚本精确选择目标。该方法只读 Dragonboat 本地状态，不走网络。
+func (s *ShardGroup) LocalLeadership() []ShardLeadership {
+	out := make([]ShardLeadership, 0, s.count)
+	for i := uint64(0); i < s.count; i++ {
+		shard := s.shardBase() + i
+		if !s.placement.contains(shard, s.replica) {
+			continue
+		}
+		leaderReplica, _, ready, err := s.nh.GetLeaderID(shard)
+		applied := uint64(0)
+		if s.applied != nil {
+			applied = s.applied(shard)
+		}
+		if err != nil || !ready {
+			out = append(out, ShardLeadership{Shard: shard, AppliedIndex: applied})
+			continue
+		}
+		out = append(out, ShardLeadership{
+			Shard: shard, Leader: s.replicaNode[leaderReplica], Ready: true,
+			IsLeader: leaderReplica == s.replica, AppliedIndex: applied,
+		})
+	}
+	return out
 }
 
 // Stats 返回提案侧读数（OBS-148）。
@@ -418,6 +480,153 @@ func (s *ShardGroup) ReplicaNodes(clientID string) []NodeID {
 		}
 	}
 	return out
+}
+
+func (s *ShardGroup) rememberLeader(shard, leader uint64) {
+	if leader == 0 || shard < s.shardBase() {
+		return
+	}
+	off := shard - s.shardBase()
+	if off >= uint64(len(s.leaderCache)) || !s.placement.contains(shard, leader) {
+		return
+	}
+	s.leaderCache[off].Store(leader)
+}
+
+// LeaderNode 返回当前已知的权威leader。缓存为空时只做幂等状态查询，
+// 不发送写；选举窗口返回false，让上层快速拒绝而不是把写挂进旧任期。
+func (s *ShardGroup) LeaderNode(clientID string) (NodeID, bool) {
+	shard := s.ShardOf(clientID)
+	off := shard - s.shardBase()
+	// 本节点承载该分片时，NodeHost 的当前任期视图是权威来源，必须先于
+	// 缓存。旧顺序会在本节点曾是 leader、换届后仍缓存自己时把 follower
+	// 误判成 leader；影子层随后走本地 Apply，leader 已提交后又同步等待这个
+	// follower 追平，最坏正好卡满10秒 apply预算。非副本才需要跨节点探针
+	// 缓存，因为它的 NodeHost 根本不认识这个 shard。
+	if s.placement.contains(shard, s.replica) && s.nh != nil {
+		leader, _, ready, err := s.nh.GetLeaderID(shard)
+		if err == nil && ready {
+			s.rememberLeader(shard, leader)
+			return s.replicaNode[leader], s.replicaNode[leader] != ""
+		}
+		return "", false
+	}
+	if off < uint64(len(s.leaderCache)) {
+		if leader := s.leaderCache[off].Load(); leader != 0 {
+			if node := s.replicaNode[leader]; node != "" {
+				return node, true
+			}
+		}
+	}
+	if s.transport == nil {
+		return "", false
+	}
+	if off >= uint64(len(s.leaderProbe)) {
+		return "", false
+	}
+	probe := &leaderProbeState{done: make(chan struct{})}
+	if !s.leaderProbe[off].CompareAndSwap(nil, probe) {
+		probe = s.leaderProbe[off].Load()
+		if probe != nil {
+			timer := time.NewTimer(leaderResolveTimeout)
+			select {
+			case <-probe.done:
+				timer.Stop()
+			case <-timer.C:
+			}
+		}
+		// 单飞发起者若找到 leader 已写入缓存；否则本次快速失败，
+		// 下一条独立请求再开启新一轮，避免同一批等待者同时重试。
+		if leader := s.leaderCache[off].Load(); leader != 0 {
+			if node := s.replicaNode[leader]; node != "" {
+				return node, true
+			}
+		}
+		return "", false
+	}
+	defer func() {
+		s.leaderProbe[off].CompareAndSwap(probe, nil)
+		close(probe.done)
+	}()
+	members := s.placement.members(shard)
+	type statusResult struct {
+		replica uint64
+		leader  uint64
+		ready   bool
+		err     error
+	}
+	// 状态查询是幂等的：并行问全部放置副本，用第一个有效的权威视图。
+	// 这是故障窗口冷路径，稳态直接命中 leaderCache，不增加写入扇出。
+	quorum := len(members)/2 + 1
+	deadline := time.NewTimer(leaderResolveTimeout)
+	defer deadline.Stop()
+	for {
+		results := make(chan statusResult, len(members))
+		probes := 0
+		for _, replica := range members {
+			node := s.replicaNode[replica]
+			if node == "" {
+				continue
+			}
+			probes++
+			go func() {
+				leader, ready, err := s.transport.forwardShardStatus(node, shard)
+				results <- statusResult{replica: replica, leader: leader, ready: ready, err: err}
+			}()
+		}
+		responses := 0
+		round := time.NewTimer(250 * time.Millisecond)
+	roundLoop:
+		for responses < probes {
+			var result statusResult
+			select {
+			case result = <-results:
+			case <-round.C:
+				break roundLoop
+			case <-deadline.C:
+				return "", false
+			}
+			responses++
+			if result.err == nil && result.ready && s.placement.contains(shard, result.leader) &&
+				result.leader == result.replica {
+				// follower 在换届窗口可能仍暂存旧 leader；只接受
+				// 新 leader 对自己身份的自证。
+				round.Stop()
+				s.rememberLeader(shard, result.leader)
+				leaderNode := s.replicaNode[result.leader]
+				return leaderNode, leaderNode != ""
+			}
+			if responses >= quorum {
+				break roundLoop
+			}
+		}
+		round.Stop()
+		// 多数副本尚未看到可自证的 leader，留在同一次单飞中低频
+		// 重探，不唤醒所有设备形成同步重试波。
+		retry := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-retry.C:
+		case <-deadline.C:
+			retry.Stop()
+			return "", false
+		}
+	}
+}
+
+// ForgetLeader 只在目标仍是缓存值时失效它，避免并发请求把刚学到的新
+// leader清掉。模糊写失败不能重试当前请求，但必须让下一条独立请求重查。
+func (s *ShardGroup) ForgetLeader(clientID string, target NodeID) {
+	shard := s.ShardOf(clientID)
+	off := shard - s.shardBase()
+	if off >= uint64(len(s.leaderCache)) {
+		return
+	}
+	for replica, node := range s.replicaNode {
+		if node == target {
+			s.leaderCache[off].CompareAndSwap(replica, 0)
+			return
+		}
+	}
 }
 
 // HasLocalReplica 报告本节点是否承载 clientId 所属分片。
@@ -638,14 +847,19 @@ func (s *ShardGroup) ProposeShard(shard uint64, data []byte) (uint64, error) {
 	// leader 的位置在提案**之前**取：之后取到的是这一轮
 	// 复制结束时的状态，而要归因的是这条提案走了哪条路。
 	leader, _, ok, leaderErr := s.nh.GetLeaderID(shard)
+	if leaderErr == nil && ok {
+		s.rememberLeader(shard, leader)
+	}
 	var value uint64
 	var err error
 	switch {
 	case leaderErr != nil || !ok:
 		s.stats.unknown.Add(1)
-		// 选举窗口里不知道该路由给谁，保留 Dragonboat 原有
-		// 的提交路径；它若仍未就绪会在下面统一转成 ErrNotLeader。
-		value, err = s.syncPropose(shard, data)
+		// 选举窗口里的这条新请求还没有发送。不能直接 SyncPropose：
+		// Dragonboat 会把它挂在“暂无leader”的旧视图上，即使约1秒后
+		// 完成换届也要等满 apply timeout。等权威视图出现再提交，既不
+		// 重发也不会把每个客户端各挂住一条请求。
+		value, err = s.proposeAfterLeaderChange(shard, 0, data)
 	case leader == s.replica:
 		s.stats.local.Add(1)
 		value, err = s.proposeLocalLeader(shard, data)
@@ -656,6 +870,15 @@ func (s *ShardGroup) ProposeShard(shard uint64, data []byte) (uint64, error) {
 			err = ErrNotLeader
 		} else {
 			value, err = s.transport.forwardShard(to, shard, data)
+			if errors.Is(err, ErrRequestUnsent) || errors.Is(err, ErrDraining) {
+				// 旧 leader 已经不可拨达且这条请求确定没有发出去。
+				// 等本地视图真正进入新一届再提交；立刻 SyncPropose 会把
+				// 请求挂在旧任期上，实测即使约1秒后选出新 leader，也要
+				// 等满10秒 apply timeout 才释放，造成整条 shard 断流。
+				// 不能在模糊的 ErrNoQuorum 上走这里，否则应答丢失会把
+				// 同一条命令应用两遍。
+				value, err = s.proposeAfterLeaderChange(shard, leader, data)
+			}
 		}
 	}
 	s.stats.observe(float64(nowMonotonic().Sub(start).Microseconds()) / 1000)
@@ -678,10 +901,12 @@ func (s *ShardGroup) proposePlaced(shard uint64, data []byte) (uint64, error) {
 		}
 		value, err := s.transport.forwardShard(to, shard, data)
 		if err == nil {
+			s.rememberLeader(shard, replica)
 			return value, nil
 		}
 		lastErr = err
-		if !errors.Is(err, ErrNotLeader) {
+		if !errors.Is(err, ErrNotLeader) && !errors.Is(err, ErrRequestUnsent) &&
+			!errors.Is(err, ErrDraining) {
 			return 0, err
 		}
 	}
@@ -689,6 +914,46 @@ func (s *ShardGroup) proposePlaced(shard uint64, data []byte) (uint64, error) {
 		lastErr = ErrNotLeader
 	}
 	return 0, lastErr
+}
+
+// proposeAfterLeaderChange 等本地 NodeHost 的权威 leader 视图离开 oldLeader，
+// 再把一条“已证明尚未发送”的命令交给新 leader。故障窗口才走这条冷路径，
+// 10ms 轮询不会进入正常写入热路径，也不会为每条成功更新增加 timer。
+func (s *ShardGroup) proposeAfterLeaderChange(shard, oldLeader uint64, data []byte) (uint64, error) {
+	deadline := time.NewTimer(s.applyTO)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		leader, _, ready, err := s.nh.GetLeaderID(shard)
+		if err == nil && ready && leader != 0 && leader != oldLeader {
+			s.rememberLeader(shard, leader)
+			if leader == s.replica {
+				return s.proposeLocalLeader(shard, data)
+			}
+			to := s.replicaNode[leader]
+			if to != "" && s.transport != nil {
+				value, forwardErr := s.transport.forwardShard(to, shard, data)
+				switch {
+				case forwardErr == nil:
+					return value, nil
+				case errors.Is(forwardErr, ErrNotLeader),
+					errors.Is(forwardErr, ErrRequestUnsent),
+					errors.Is(forwardErr, ErrDraining):
+					// 明确未接收，可以继续等下一次权威视图；若这个
+					// 新 leader 也失效，必须等 leader ID 再次变化。
+					oldLeader = leader
+				default:
+					return 0, forwardErr
+				}
+			}
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			return 0, ErrNotLeader
+		}
+	}
 }
 
 // syncPropose 在本 NodeHost 上提交并统一 Dragonboat 的就绪/超时错误。
@@ -732,7 +997,10 @@ func (s *ShardGroup) proposeLocalLeader(shard uint64, data []byte) (uint64, erro
 	req.data = data
 	lane := s.mergeLane[shard]
 	if lane == nil {
-		lane = &leaderProposalLane{}
+		lane = &leaderProposalLane{
+			items: make([][]byte, s.mergeMax),
+			batch: make([]*leaderProposalRequest, s.mergeMax),
+		}
 		s.mergeLane[shard] = lane
 	}
 	lane.pending = append(lane.pending, req)
@@ -765,8 +1033,8 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 			return
 		}
 		limit := len(lane.pending)
-		if limit > 64 {
-			limit = 64
+		if limit > s.mergeMax {
+			limit = s.mergeMax
 		}
 		items := lane.items[:limit]
 		for i := 0; i < limit; i++ {
@@ -805,19 +1073,29 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 		if logical == 0 {
 			logical = 1
 		}
+		if !s.mergeNoValue && logical > 64 {
+			err := errors.New("cluster: 需要返回位图的合并提案超过64条")
+			for _, req := range batch {
+				req.done <- leaderProposalResult{err: err}
+			}
+			clear(items)
+			clear(batch)
+			continue
+		}
 		s.stats.mergeAccessBatches.Add(uint64(consumed))
 		s.stats.mergeLogical.Add(logical)
 		s.stats.mergePhysical.Add(1)
 		switch {
-		case logical == 64:
+		case logical >= uint64(s.mergeMax):
 			s.stats.mergeFull.Add(1)
 		case consumed == len(items):
 			s.stats.mergeDrained.Add(1)
 		default:
 			s.stats.mergeBlocked.Add(1)
 		}
-		// 单项不改写，保留状态机完整的 uint64 返回值；多项才按 widths
-		// 拆位图。session merger 保证总宽度不超过 64。
+		// 单项不改写，保留状态机完整的uint64返回值；多项会话提案按
+		// widths拆位图。影子通过pending ID交付结果，不读这个位图，因而可
+		// 安全超过64条；显式配置mergeNoValue后统一回0。
 		if consumed == 1 {
 			inFlight := s.stats.mergeInFlight.Add(1)
 			raiseAtomicPeak(&s.stats.mergePeakInFlight, inFlight)
@@ -832,6 +1110,14 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 		raiseAtomicPeak(&s.stats.mergePeakInFlight, inFlight)
 		value, err := s.syncProposeIfLeader(shard, merged)
 		s.stats.mergeInFlight.Add(-1)
+		if s.mergeNoValue {
+			for _, req := range batch {
+				req.done <- leaderProposalResult{err: err}
+			}
+			clear(items)
+			clear(batch)
+			continue
+		}
 		offset := uint(0)
 		for i, req := range batch {
 			width := uint(widths[i])
@@ -905,9 +1191,11 @@ func (s *ShardGroup) Ready() bool {
 	for i := uint64(0); i < s.count; i++ {
 		shard := s.shardBase() + i
 		if s.placement.contains(shard, s.replica) {
-			if _, _, ok, err := s.nh.GetLeaderID(shard); err != nil || !ok {
+			leader, _, ok, err := s.nh.GetLeaderID(shard)
+			if err != nil || !ok {
 				return false
 			}
+			s.rememberLeader(shard, leader)
 			continue
 		}
 		if !s.remoteShardReady(shard) {
@@ -926,7 +1214,8 @@ func (s *ShardGroup) remoteShardReady(shard uint64) bool {
 		if node == "" {
 			continue
 		}
-		if _, ready, err := s.transport.forwardShardStatus(node, shard); err == nil && ready {
+		if leader, ready, err := s.transport.forwardShardStatus(node, shard); err == nil && ready {
+			s.rememberLeader(shard, leader)
 			return true
 		}
 	}
@@ -938,6 +1227,9 @@ func (s *ShardGroup) localShardStatus(shard uint64) (uint64, bool, error) {
 		return 0, false, ErrNotMember
 	}
 	leader, _, ok, err := s.nh.GetLeaderID(shard)
+	if err == nil && ok {
+		s.rememberLeader(shard, leader)
+	}
 	return leader, ok, err
 }
 
@@ -1100,12 +1392,24 @@ func (g *TLSGroup) StartShardGroup(opt ShardOptions) (*ShardGroup, error) {
 	}
 	s := &ShardGroup{
 		nh: dg.nh, base: base, count: count, replica: replica, applyTO: opt.ApplyTimeout,
-		placement: placement,
-		read:      opt.ReadSession,
-		readLane:  make(map[uint64]*sessionReadLane),
-		merge:     opt.MergeProposals,
-		mergeLane: make(map[uint64]*leaderProposalLane),
-		transport: g, replicaNode: make(map[uint64]NodeID, len(opt.Replicas)),
+		applied:      opt.AppliedIndex,
+		placement:    placement,
+		leaderCache:  make([]atomic.Uint64, count),
+		leaderProbe:  make([]atomic.Pointer[leaderProbeState], count),
+		read:         opt.ReadSession,
+		readLane:     make(map[uint64]*sessionReadLane),
+		merge:        opt.MergeProposals,
+		mergeMax:     opt.MergeMaxItems,
+		mergeNoValue: opt.MergeIgnoresResult,
+		mergeLane:    make(map[uint64]*leaderProposalLane),
+		transport:    g, replicaNode: make(map[uint64]NodeID, len(opt.Replicas)),
+	}
+	if s.mergeMax == 0 {
+		s.mergeMax = leaderProposalMergeDefaultMax
+	}
+	if s.mergeMax < 1 || s.mergeMax > leaderProposalMergeHardMax {
+		return nil, fmt.Errorf("cluster: leader提案合批上限%d超出1到%d",
+			s.mergeMax, leaderProposalMergeHardMax)
 	}
 	s.readRemote = s.readRemoteSessions
 	for id, n := range opt.Replicas {

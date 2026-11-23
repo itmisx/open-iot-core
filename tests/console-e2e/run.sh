@@ -16,7 +16,7 @@ cd "$(dirname "$0")/../.."
 
 MQTT_PORT=${MQTT_PORT:-39283}
 ADMIN_PORT=${ADMIN_PORT:-39290}
-WORK=${WORK:-$(mktemp -d -t openiot-console-e2e)}
+WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/openiot-console-e2e.XXXXXX")} || exit 1
 BIN="${WORK}/openiotd"
 DATA="${WORK}/data"
 # 截图默认跟着临时目录一起被删。想留下来看就传 SHOTS=某个目录——

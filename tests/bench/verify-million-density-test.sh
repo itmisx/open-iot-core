@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-work=$(mktemp -d -t openiot-density-verify-test)
+work=$(mktemp -d "${TMPDIR:-/tmp}/openiot-density-verify-test.XXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT INT TERM
 

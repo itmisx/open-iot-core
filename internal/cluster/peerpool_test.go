@@ -1,7 +1,9 @@
 package cluster
 
 import (
+	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -109,6 +111,120 @@ func TestShardProposeIsNotRetriedOnDeadPooledConnection(t *testing.T) {
 	// 下一次独立调用要能新建连接并拿到对端的真实答复。
 	if _, err := a.forwardShard("b", shardSessionBase, []byte("x")); err == ErrNoQuorum {
 		t.Fatal("第二次分片提案仍然 ErrNoQuorum：坏连接没有被丢出池子")
+	}
+}
+
+// 拨号失败发生在任何请求字节写出之前，可以由分片层安全地等待新 leader；
+// 它必须与死连接上的模糊失败分开，否则换届期间每个新请求都会立即 503。
+func TestShardProposeMarksDialFailureAsUnsent(t *testing.T) {
+	g := &TLSGroup{
+		id: "a", peers: map[NodeID]string{"b": "127.0.0.1:1"},
+		dialTO: 20 * time.Millisecond, reqTO: 20 * time.Millisecond,
+	}
+	if _, err := g.forwardShard("b", shardSessionBase, []byte("x")); !errors.Is(err, ErrRequestUnsent) {
+		t.Fatalf("拨号失败 = %v，期望确定未发送", err)
+	}
+}
+
+func TestShadowWriteMarksDialFailureAsUnsent(t *testing.T) {
+	g := &TLSGroup{
+		id: "a", peers: map[NodeID]string{"b": "127.0.0.1:1"},
+		dialTO: 20 * time.Millisecond, reqTO: 20 * time.Millisecond,
+	}
+	if _, err := g.ForwardShadowWrite("b", []byte(`{"v":1}`)); !errors.Is(err, ErrRequestUnsent) {
+		t.Fatalf("影子RPC拨号失败 = %v，期望确定未发送", err)
+	}
+}
+
+// 影子写已经到达对端后，应答超时属于“可能已经提交”的模糊结果：调用方要
+// 尽快释放 MQTT 工作协程，但传输层绝不能换连接自动再发一次。设备只有携带
+// version 才能在收到失败后自行确认或重试。
+func TestShadowWriteTimeoutIsBoundedAndNotRetried(t *testing.T) {
+	groups, _ := newTLSPair(t)
+	a, b := groups["a"], groups["b"]
+
+	// 先完成握手并把连接放进池中，让被测超时只覆盖应答等待，而不是
+	// 把本机 TLS 调度抖动混进这个语义测试。
+	b.SetShadowHandlers(func(raw []byte) ([]byte, error) { return raw, nil }, nil)
+	if _, err := a.ForwardShadowWrite("b", []byte("warmup")); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	b.SetShadowHandlers(func(raw []byte) ([]byte, error) {
+		calls.Add(1)
+		entered <- struct{}{}
+		<-release
+		return raw, nil
+	}, nil)
+	a.dialTO = 40 * time.Millisecond
+
+	result := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, err := a.ForwardShadowWrite("b", []byte("possibly-committed"))
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("影子写未到达对端")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNoQuorum) {
+			close(release)
+			t.Fatalf("应答超时 = %v，期望模糊失败 ErrNoQuorum", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(release)
+		t.Fatal("影子写未受 dial timeout 约束")
+	}
+	elapsed := time.Since(started)
+	close(release)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("影子写超时耗时 %v，未按短预算返回", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("模糊影子写被自动发送 %d 次，期望 1 次", got)
+	}
+}
+
+func TestDrainClosesInboundOwnConnections(t *testing.T) {
+	groups, _ := newTLSPair(t)
+	a, b := groups["a"], groups["b"]
+	b.SetMeshHandler(func(NodeID, MeshPayload) {})
+	if err := a.SendMesh("b", MeshPayload{Frames: []Frame{{
+		Version: FrameVersion, Origin: "a", Topic: "t",
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	// 再放一条同代空闲连接。第一条失败必须把它一起淘汰；否则第二次
+	// 独立写仍会撞上陈旧连接，拿不到新连接上的明确 ErrDraining。
+	pc, err := a.dialOwn("b", a.addrOf("b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.pool.put("b", pc)
+	deadline := time.Now().Add(time.Second)
+	for b.ownAccepted.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if b.ownAccepted.Load() < 2 {
+		t.Fatal("第二条节点连接未在drain前完成入站登记")
+	}
+	b.Drain()
+	// 池中连接在对端 drain 时被主动关闭。写请求不能在这条模糊边界
+	// 自动重发，因此第一次必须立即失败；第二次新连接得到明确未接收的
+	// ErrDraining，供 ShardGroup 安全等待新 leader。
+	if _, err := a.forwardShard("b", shardSessionBase, []byte("x")); err != ErrNoQuorum {
+		t.Fatalf("drain 断开的在途边界 = %v，期望 ErrNoQuorum", err)
+	}
+	if _, err := a.forwardShard("b", shardSessionBase, []byte("x")); err != ErrDraining {
+		t.Fatalf("drain 后的新请求 = %v，期望 ErrDraining", err)
 	}
 }
 

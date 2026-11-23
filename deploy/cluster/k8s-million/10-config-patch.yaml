@@ -19,7 +19,7 @@ data:
         pump_interval: 200ms
         session_shards: 8
         session_replication_factor: 3
-        shadow_shards: 8
+        shadow_shards: 4
         shadow_replication_factor: 3
         peers:
           openiotd-0: "openiotd-0.openiotd-peers:7946"

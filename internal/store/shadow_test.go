@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/itmisx/open-iot-core/internal/shadow"
+	bolt "go.etcd.io/bbolt"
 )
 
 const nowSec = 1_700_000_000
@@ -88,6 +91,147 @@ func TestShadowStoreApplyTxSeesEarlierBatchWrite(t *testing.T) {
 	doc, ok := s.Get("d1", "")
 	if !ok || doc.Version != 2 {
 		t.Fatalf("提交后的影子 = %+v, ok=%v", doc, ok)
+	}
+}
+
+// TestShadowStoreConcurrentApplyMergesTransactions 是影子吞吐的防回退门禁。
+// 功能测试无法发现「每条更新重新退化成一次 fsync」：数据仍然完全正确，只是
+// 吞吐会重新钉在单盘同步延迟的倒数。这里直接数 bbolt 的提交序号，要求并发
+// 更新产生的物理事务数严格少于逻辑更新数。
+func TestShadowStoreConcurrentApplyMergesTransactions(t *testing.T) {
+	kv, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = kv.Close() }()
+	bkv := kv.(*boltKV)
+	// 给慢CI足够时间让64个goroutine都进入同一批；生产仍使用bbolt默认值。
+	bkv.db.MaxBatchDelay = 100 * time.Millisecond
+	s := NewShadowStore(kv)
+
+	txID := func() int {
+		t.Helper()
+		var id int
+		if err := bkv.db.View(func(tx *bolt.Tx) error {
+			id = tx.ID()
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	const n = 64
+	before := txID()
+	start := make(chan struct{})
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = s.Apply(context.Background(), upd(
+				fmt.Sprintf("batch-device-%d", i), "",
+				shadow.Object{"reported": shadow.Object{"online": true}},
+			))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("第 %d 条更新失败: %v", i, err)
+		}
+	}
+	commits := txID() - before
+	if commits >= n {
+		t.Fatalf("%d 条并发更新产生 %d 个事务，合并提交未生效", n, commits)
+	}
+	for i := 0; i < n; i++ {
+		if doc, ok := s.Get(fmt.Sprintf("batch-device-%d", i), ""); !ok || doc.Version != 1 {
+			t.Fatalf("第 %d 条更新未正确提交: doc=%+v ok=%v", i, doc, ok)
+		}
+	}
+}
+
+func TestShadowStoreBatchIsolatesVersionConflict(t *testing.T) {
+	kv, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = kv.Close() }()
+	s := NewShadowStore(kv)
+	if _, err := s.Apply(context.Background(), upd("conflict", "",
+		shadow.Object{"reported": shadow.Object{"n": 1}})); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 32
+	start := make(chan struct{})
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			cmd := upd(fmt.Sprintf("valid-%d", i), "",
+				shadow.Object{"reported": shadow.Object{"n": i}})
+			if i == 0 {
+				cmd.Thing = "conflict"
+				cmd.ExpectVersion = 99
+			}
+			_, errs[i] = s.Apply(context.Background(), cmd)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	var domain *shadow.Error
+	if !errors.As(errs[0], &domain) || domain.Code != 409 {
+		t.Fatalf("版本冲突 = %v，期望409", errs[0])
+	}
+	for i := 1; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("有效更新 %d 被同批冲突拖累: %v", i, errs[i])
+		}
+		if doc, ok := s.Get(fmt.Sprintf("valid-%d", i), ""); !ok || doc.Version != 1 {
+			t.Fatalf("有效更新 %d 未提交: doc=%+v ok=%v", i, doc, ok)
+		}
+	}
+	if doc, _ := s.Get("conflict", ""); doc == nil || doc.Version != 1 {
+		t.Fatalf("冲突更新改写了影子: %+v", doc)
+	}
+}
+
+type shadowCommitFailKV struct {
+	*MemKV
+	err error
+}
+
+func (k *shadowCommitFailKV) InTx(_ bool, fn func(Tx) error) error {
+	k.MemKV.mu.Lock()
+	defer k.MemKV.mu.Unlock()
+	tx := &memTx{m: k.MemKV, pending: map[string][]byte{}}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	// 模拟事务体已经算完，但存储引擎在提交阶段失败；pending 故意不落主表。
+	return k.err
+}
+
+func TestShadowStoreCommitFailureNeverReturnsResult(t *testing.T) {
+	boom := errors.New("注入的提交失败")
+	kv := &shadowCommitFailKV{MemKV: NewMemKV().(*MemKV), err: boom}
+	defer func() { _ = kv.Close() }()
+	s := NewShadowStore(kv)
+	res, err := s.Apply(context.Background(), upd("device", "",
+		shadow.Object{"reported": shadow.Object{"online": true}}))
+	if !errors.Is(err, boom) || res != nil {
+		t.Fatalf("提交失败返回 result=%+v err=%v", res, err)
+	}
+	if _, ok := s.Get("device", ""); ok {
+		t.Fatal("提交失败仍写入了影子")
 	}
 }
 

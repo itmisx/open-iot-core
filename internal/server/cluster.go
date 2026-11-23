@@ -336,7 +336,7 @@ func decodeShadowShardEnvelopes(raw []byte) ([]shadowShardEnvelope, error) {
 		return nil, err
 	}
 	if len(env.Batch) > 0 {
-		if env.ID != "" || len(env.Raw) != 0 || len(env.Batch) > 64 {
+		if env.ID != "" || len(env.Raw) != 0 || len(env.Batch) > shadowProposalBatchMax {
 			return nil, errors.New("影子分片批命令格式无效")
 		}
 		for i := range env.Batch {
@@ -352,11 +352,13 @@ func decodeShadowShardEnvelopes(raw []byte) ([]shadowShardEnvelope, error) {
 	return []shadowShardEnvelope{env}, nil
 }
 
+const shadowProposalBatchMax = 256
+
 func mergeShadowShardProposals(items [][]byte) ([]byte, []uint8, int, error) {
 	if len(items) == 0 {
 		return nil, nil, 0, errors.New("没有可合并的影子提案")
 	}
-	batch := make([]shadowShardEnvelope, 0, 64)
+	batch := make([]shadowShardEnvelope, 0, shadowProposalBatchMax)
 	widths := make([]uint8, 0, len(items))
 	bytesUsed, consumed := 0, 0
 	for _, item := range items {
@@ -367,7 +369,8 @@ func mergeShadowShardProposals(items [][]byte) ([]byte, []uint8, int, error) {
 			}
 			break
 		}
-		if len(batch)+len(envs) > 64 || (consumed > 0 && bytesUsed+len(item) > 1<<20) {
+		if len(batch)+len(envs) > shadowProposalBatchMax ||
+			(consumed > 0 && bytesUsed+len(item) > 1<<20) {
 			break
 		}
 		batch = append(batch, envs...)
@@ -382,7 +385,7 @@ func mergeShadowShardProposals(items [][]byte) ([]byte, []uint8, int, error) {
 	return raw, widths, consumed, err
 }
 
-// startShadowShards 把新影子写入从单一 metadata 日志拆到 8 条独立日志。
+// startShadowShards 把新影子写入从单一 metadata 日志拆到配置数量的独立日志。
 // 先保持 RF=all，使现有任意节点本地读与滚动升级语义不变；下一阶段再在
 // 服务转发与远程读完成后切 RF=3，届时才减少每节点存储。
 func (s *Server) startShadowShards(replicas map[cluster.NodeID]uint64) error {
@@ -431,6 +434,10 @@ func (s *Server) startShadowShards(replicas map[cluster.NodeID]uint64) error {
 			return s.shadows.RestoreShadowShard(shard, owns(shard), r)
 		},
 		MergeProposals: mergeShadowShardProposals,
+		MergeMaxItems:  shadowProposalBatchMax,
+		// 影子结果由ApplyBatch在事务提交后按pending ID逐条交付，不使用
+		// 状态机的uint64结果位图，所以二级合批可以安全超过会话的64条上限。
+		MergeIgnoresResult: true,
 	})
 	if err != nil {
 		return fmt.Errorf("server: 启动影子分区组失败: %w", err)
@@ -518,20 +525,29 @@ func (s *Server) applyForwardedShadow(ctx context.Context, _ cluster.NodeID,
 	if shards == nil {
 		return nil, errors.New("server: 影子分片未启动")
 	}
-	if shards.HasLocalReplica(cmd.Thing) {
-		return s.shadowRepl.Apply(ctx, cmd)
+	leader, ready := shards.LeaderNode(cmd.Thing)
+	if !ready {
+		return nil, cluster.ErrNotLeader
 	}
-	owner, ok := shards.PreferredNode(cmd.Thing)
-	if !ok {
-		return nil, cluster.ErrNotMember
+	// 只有本节点就是 leader 时才走本地 Apply。旧路径只判断“有本地副本”，
+	// 因而接入落在 follower 时会先把提案转给 leader，leader 已提交后还要
+	// 同步等这个 follower 的本地状态机追平；共享盘或 follower 短暂停顿会把
+	// 极少数 accepted 拖到客户端超时，而写其实早已成功。
+	//
+	// 非 leader 直接转发完整影子写并使用 leader 状态机算出的结果。读路径
+	// 本来就先做 Barrier，所以不需要拿 accepted 充当本地 follower 已追平的
+	// 屏障；复制与持久化语义不变，也没有重试歧义写。
+	if leader == cluster.NodeID(s.mf.NodeID) {
+		return s.shadowRepl.Apply(ctx, cmd)
 	}
 	raw, err := shadow.EncodeCommand(cmd)
 	if err != nil {
 		return nil, err
 	}
-	response, err := s.repl.ForwardShadowWrite(owner, raw)
+	response, err := s.repl.ForwardShadowWrite(leader, raw)
 	s.shadowRoute.remoteWrites.Add(1)
 	if err != nil {
+		shards.ForgetLeader(cmd.Thing, leader)
 		s.shadowRoute.remoteWriteErrors.Add(1)
 		return nil, err
 	}
@@ -1080,15 +1096,10 @@ func (l shadowLog) AppendShadow(ctx context.Context, id string, raw []byte) erro
 		if _, err := shadowShards.Propose(cmd.Thing, env); err != nil {
 			return err
 		}
-		// 提案可能直达远端 leader；等本地 RF=all 副本应用后 pending 才有结果。
-		timeout := 10 * time.Second
-		if deadline, ok := ctx.Deadline(); ok {
-			timeout = time.Until(deadline)
-			if timeout <= 0 {
-				return context.DeadlineExceeded
-			}
-		}
-		return shadowShards.Barrier(cmd.Thing, timeout)
+		// 提案可能直达远端 leader；SyncPropose 返回不代表发起节点的本地副本
+		// 已经 apply。直接等本地状态机提交事务时交付 pending 结果，避免每条
+		// 写再做一次 ReadIndex/Barrier，同时保持 accepted 前已经本地落盘。
+		return l.s.shadowRepl.WaitCommitted(ctx, id)
 	}
 	_, err := l.s.replStore.Apply(ctx, meta.Command{
 		ID:     id,

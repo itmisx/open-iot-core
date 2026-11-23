@@ -1046,6 +1046,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		"openiot_runtime_sys_bytes{",
 		"openiot_runtime_memory_limit_bytes{",
 		"openiot_meta_revision{",
+		"openiot_quota_global_rate_members{",
 		"openiot_events_dropped_total{",
 	} {
 		if !strings.Contains(body, want) {

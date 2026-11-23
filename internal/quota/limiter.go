@@ -79,16 +79,17 @@ type counterShard struct {
 	m  map[bucketKey]int64
 }
 
-// Local 是 Limiter 的单节点实现。
-//
-// 全局配额在此处等同精确判定：节点数为一，分摊即全额。集群实现会替换
-// AllowGlobal 的内部逻辑为「本地额度加周期再均衡」，而调用方不变
-// （PRD ARCH-032）。
+// Local 是无网络往返的本地判定器。聚合型全局速率可通过
+// GlobalRateDivisor按成员数等分；按负载周期再均衡仍属于ARCH-032的后续层。
 type Local struct {
 	defs [numQuotas]Def
 	// nowUnixMs 是注入的时钟（契约 08）。令牌桶只用它做补充计算，
 	// 不用于比较事件先后。
 	nowUnixMs func() int64
+	// globalRateDivisor 返回当前承担同一份全集群额度的节点数。它只作用于
+	// subject为空的聚合型全局速率；每clientId之类的配额不能简单除以节点数，
+	// 否则limit=1会变成0，仍需一致哈希或协调者解决。
+	globalRateDivisor func() int
 
 	buckets  [bucketShards]bucketShard
 	counters [bucketShards]counterShard
@@ -111,11 +112,14 @@ type Options struct {
 	// Overrides 覆盖默认配额。键为配额编号，值为新的 Limit；
 	// Limit 为 0 表示取消该项限制。
 	Overrides map[ID]int
+	// GlobalRateDivisor 为聚合型全局速率提供本地等分的分母。nil或返回小于2
+	// 等同单节点。回调必须很轻；AllowGlobal会在热路径调用它。
+	GlobalRateDivisor func() int
 }
 
 // NewLocal 创建单节点配额判定器。
 func NewLocal(opt Options) *Local {
-	l := &Local{nowUnixMs: opt.Now}
+	l := &Local{nowUnixMs: opt.Now, globalRateDivisor: opt.GlobalRateDivisor}
 	if l.nowUnixMs == nil {
 		// 没有时钟时速率配额无法判定，退化为只做计数与大小判定。
 		l.nowUnixMs = func() int64 { return 0 }
@@ -149,8 +153,33 @@ func (l *Local) AllowLocal(id ID, subject string, n int) bool {
 }
 
 func (l *Local) AllowGlobal(_ context.Context, id ID, subject string, n int) bool {
-	// 单节点：分摊即全额，与本地判定等价。
+	// 聚合型速率在集群下按当前成员数等分；判定仍完全本地，不给热路径
+	// 增加协调往返。按负载动态再均衡是更高一层能力。
 	return l.allow(id, subject, n, ScopeGlobal)
+}
+
+func (l *Local) effectiveRate(d Def, subject string) (limit, burst int) {
+	limit, burst = d.Limit, d.Burst
+	if d.Scope != ScopeGlobal || subject != "" || l.globalRateDivisor == nil {
+		return limit, burst
+	}
+	divisor := l.globalRateDivisor()
+	if divisor < 2 {
+		return limit, burst
+	}
+	if limit > 0 {
+		limit /= divisor
+		if limit < 1 {
+			limit = 1
+		}
+	}
+	if burst > 0 {
+		burst /= divisor
+		if burst < 1 {
+			burst = 1
+		}
+	}
+	return limit, burst
 }
 
 // allow 判定一项速率配额。wantScope 用于在开发期捕获作用域用错的调用。
@@ -165,7 +194,8 @@ func (l *Local) allow(id ID, subject string, n int, wantScope Scope) bool {
 		l.stats[id].rejected.add(1)
 		return false
 	}
-	if d.Limit <= 0 {
+	limit, burst := l.effectiveRate(d, subject)
+	if limit <= 0 {
 		l.stats[id].allowed.add(1)
 		return true
 	}
@@ -175,9 +205,8 @@ func (l *Local) allow(id ID, subject string, n int, wantScope Scope) bool {
 		return false
 	}
 
-	burst := d.Burst
 	if burst <= 0 {
-		burst = d.Limit
+		burst = limit
 	}
 	capTokens := int64(burst) * milliScale
 	want := int64(n) * milliScale
@@ -191,9 +220,14 @@ func (l *Local) allow(id ID, subject string, n int, wantScope Scope) bool {
 		b = bucket{tokens: capTokens, lastMs: now}
 		l.rateBucketCount.add(1)
 	}
+	// 成员增加会缩小本节点份额；已有桶可能仍带着旧的较大余额，必须
+	// 在本次判定前立即钳住，不能等下一次补充才生效。
+	if b.tokens > capTokens {
+		b.tokens = capTokens
+	}
 	// 懒补充：经过的毫秒数乘以每秒速率，正好是千分之一令牌的增量。
 	if elapsed := now - b.lastMs; elapsed > 0 {
-		b.tokens += elapsed * int64(d.Limit)
+		b.tokens += elapsed * int64(limit)
 		if b.tokens > capTokens {
 			b.tokens = capTokens
 		}
@@ -235,16 +269,16 @@ func (l *Local) SweepRateBuckets(maxShards int) int {
 		removedInShard := 0
 		for key, b := range sh.m {
 			d := l.defs[key.id]
-			if d.Kind != Rate || d.Limit <= 0 {
+			limit, burst := l.effectiveRate(d, key.subject)
+			if d.Kind != Rate || limit <= 0 {
 				continue
 			}
-			burst := d.Burst
 			if burst <= 0 {
-				burst = d.Limit
+				burst = limit
 			}
 			capTokens := int64(burst) * milliScale
 			if b.tokens >= capTokens ||
-				(now > b.lastMs && b.tokens+(now-b.lastMs)*int64(d.Limit) >= capTokens) {
+				(now > b.lastMs && b.tokens+(now-b.lastMs)*int64(limit) >= capTokens) {
 				delete(sh.m, key)
 				removed++
 				removedInShard++

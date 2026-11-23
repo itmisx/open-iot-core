@@ -63,6 +63,10 @@ func TestQuotaTableIsComplete(t *testing.T) {
 	if QuotaCount() != int(numQuotas) || len(Defaults()) != int(numQuotas) {
 		t.Error("配额总数不一致")
 	}
+	shadowRate, ok := Lookup(ShadowAPIRate)
+	if !ok || shadowRate.Limit != 8_000 || shadowRate.Burst != 8_000 {
+		t.Fatalf("影子全局配额 = %#v，期望基于长稳容量的8000/8000", shadowRate)
+	}
 }
 
 // TestScopeMismatchIsRejected 固定住一条设计决策：
@@ -134,6 +138,70 @@ func TestRateLimitTokenBucket(t *testing.T) {
 	}
 	if n != 10 {
 		t.Errorf("长时间空闲后可用令牌 = %d，期望等于桶容量 10", n)
+	}
+}
+
+func TestGlobalAggregateRateIsSharedAcrossMembers(t *testing.T) {
+	clk := &fakeClock{ms: 1}
+	members := 2
+	l := NewLocal(Options{
+		Now: clk.now,
+		Overrides: map[ID]int{
+			ShadowAPIRate: 8,
+		},
+		GlobalRateDivisor: func() int { return members },
+	})
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		if !l.AllowGlobal(ctx, ShadowAPIRate, "", 1) {
+			t.Fatalf("两节点本地份额的第%d个令牌被拒绝", i+1)
+		}
+	}
+	if l.AllowGlobal(ctx, ShadowAPIRate, "", 1) {
+		t.Fatal("两节点中的一个节点放行超过全集群额度的一半")
+	}
+	// 对外展示的仍是全集群配置值，不应把本地份额冒充运维配置。
+	if got := l.Limit(ShadowAPIRate); got != 8 {
+		t.Fatalf("展示的全集群limit=%d，期望8", got)
+	}
+}
+
+func TestGlobalAggregateRateClampsExistingBucketAfterJoin(t *testing.T) {
+	clk := &fakeClock{ms: 1}
+	members := 1
+	l := NewLocal(Options{
+		Now: clk.now, Overrides: map[ID]int{ShadowAPIRate: 8},
+		GlobalRateDivisor: func() int { return members },
+	})
+	ctx := context.Background()
+	if !l.AllowGlobal(ctx, ShadowAPIRate, "", 1) {
+		t.Fatal("单节点首个令牌被拒绝")
+	}
+	// 桶里还剩7个令牌；扩为两节点后必须立即钳到本地4个，而不是继续
+	// 消耗旧余额，导致成员刚加入时全集群短时放大。
+	members = 2
+	for i := 0; i < 4; i++ {
+		if !l.AllowGlobal(ctx, ShadowAPIRate, "", 1) {
+			t.Fatalf("扩容后的第%d个本地令牌被拒绝", i+1)
+		}
+	}
+	if l.AllowGlobal(ctx, ShadowAPIRate, "", 1) {
+		t.Fatal("扩容后仍可消耗旧成员数下的较大余额")
+	}
+}
+
+func TestGlobalPerSubjectRateIsNotDivided(t *testing.T) {
+	clk := &fakeClock{ms: 1}
+	l := NewLocal(Options{
+		Now:               clk.now,
+		GlobalRateDivisor: func() int { return 5 },
+	})
+	ctx := context.Background()
+	if !l.AllowGlobal(ctx, ConnectRatePerClient, "device-1", 1) {
+		t.Fatal("每clientId的limit=1不能按节点数除成零")
+	}
+	if l.AllowGlobal(ctx, ConnectRatePerClient, "device-1", 1) {
+		t.Fatal("同一节点内每clientId限流失效")
 	}
 }
 

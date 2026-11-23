@@ -156,9 +156,12 @@ var defaults = [numQuotas]Def{
 	RetainedCount:        {RetainedCount, "retained_count", ScopeGlobal, Count, 500_000, 0, "QTA-040"},
 	RetainedRate:         {RetainedRate, "retained_rate", ScopeGlobal, Rate, 500, 500, "QTA-041"},
 	RetainedRatePerTopic: {RetainedRatePerTopic, "retained_rate_per_topic", ScopeGlobal, Rate, 1, 1, "QTA-042"},
-	ShadowAPIRate:        {ShadowAPIRate, "shadow_api_rate", ScopeGlobal, Rate, 4_000, 4_000, "QTA-065"},
-	CertRegisterRate:     {CertRegisterRate, "cert_register_rate", ScopeGlobal, Rate, 15, 15, "QTA-080"},
-	HandshakeRate:        {HandshakeRate, "handshake_rate", ScopeGlobal, Rate, 3_000, 3_000, "NET-042"},
+	// 五节点4分片RF=3、真实mTLS的两轮60秒本机耐久基线为
+	// 15,896--16,165/s；8,000保留约50%持续容量余量。server把这种
+	// subject为空的聚合速率按当前成员数等分；按负载周期再均衡仍待ARCH-032。
+	ShadowAPIRate:    {ShadowAPIRate, "shadow_api_rate", ScopeGlobal, Rate, 8_000, 8_000, "QTA-065"},
+	CertRegisterRate: {CertRegisterRate, "cert_register_rate", ScopeGlobal, Rate, 15, 15, "QTA-080"},
+	HandshakeRate:    {HandshakeRate, "handshake_rate", ScopeGlobal, Rate, 3_000, 3_000, "NET-042"},
 }
 
 // Defaults 返回默认配额表的副本。

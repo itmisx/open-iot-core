@@ -596,14 +596,14 @@ func (r *runner) fanoutScenario(res *result, n int, setup bool) error {
 // 判据取 accepted 的到达数而不是 PUBACK：PUBACK 只说明 broker 收下了报文，
 // 而影子的那一步才是这个场景要量的东西。
 func (r *runner) shadowScenario(res *result, n int, setup bool) error {
-	names := r.names("h", n)
+	names := r.shadowNames("h", n)
 	if setup {
 		if err := r.seed(names); err != nil {
 			return err
 		}
 	}
 	st := newStats()
-	var wg sync.WaitGroup
+	var wg, drained sync.WaitGroup
 	stop := make(chan struct{})
 	for i := 0; i < n; i++ {
 		cl, err := r.dial(r.pubAddrs[i%len(r.pubAddrs)], names[i])
@@ -611,19 +611,32 @@ func (r *runner) shadowScenario(res *result, n int, setup bool) error {
 			return fmt.Errorf("客户端 %d 建连失败: %w", i, err)
 		}
 		acc := fmt.Sprintf("$aws/things/%s/shadow/update/accepted", names[i])
-		if err := cl.subscribe(acc, packet.QoS0); err != nil {
+		if err := cl.subscribe(acc, r.shadowResponseQoS); err != nil {
 			return fmt.Errorf("客户端 %d 订阅 accepted 失败: %w", i, err)
+		}
+		rej := fmt.Sprintf("$aws/things/%s/shadow/update/rejected", names[i])
+		if err := cl.subscribe(rej, r.shadowResponseQoS); err != nil {
+			return fmt.Errorf("客户端 %d 订阅 rejected 失败: %w", i, err)
 		}
 		topic := fmt.Sprintf("$aws/things/%s/shadow/update", names[i])
 		wg.Add(1)
+		drained.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			cl.shadowLoop(r, topic, st, stop)
+			drained.Done()
 			cl.goodbye()
 			cl.close()
 		}(i)
 	}
-	return r.measure(res, st, stop, &wg)
+	if r.shadowReadyFile != "" {
+		if err := os.WriteFile(r.shadowReadyFile, []byte("ready\n"), 0o600); err != nil {
+			close(stop)
+			wg.Wait()
+			return fmt.Errorf("写shadow ready文件: %w", err)
+		}
+	}
+	return r.measureDrained(res, st, stop, &drained, &wg)
 }
 
 // measure 统一处理「预热 → 清零 → 测量 → 收尾」。
@@ -631,14 +644,33 @@ func (r *runner) shadowScenario(res *result, n int, setup bool) error {
 // 清零不可省：建连与首轮订阅把一批延迟很高的样本留在直方图里，不清零的
 // p99 实际上是在描述建连阶段。
 func (r *runner) measure(res *result, st *stats, stop chan struct{}, wg *sync.WaitGroup) error {
+	return r.measureWithDrain(res, st, stop, nil, wg)
+}
+
+// measureDrained is used by the shadow closed loop. At the end of the nominal
+// window it stops starting new updates, waits for each already-published update
+// to receive accepted, and includes that drain time in Seconds. This makes
+// published == delivered a real loss check instead of letting warm-up replies
+// accidentally cancel the requests still in flight at the end of the window.
+func (r *runner) measureDrained(res *result, st *stats, stop chan struct{}, drained, wg *sync.WaitGroup) error {
+	return r.measureWithDrain(res, st, stop, drained, wg)
+}
+
+func (r *runner) measureWithDrain(res *result, st *stats, stop chan struct{}, drained, wg *sync.WaitGroup) error {
 	time.Sleep(r.warmup)
 	st.reset()
 	t0 := time.Now()
 	time.Sleep(r.duration)
+	if drained != nil {
+		close(stop)
+		drained.Wait()
+	}
 	el := time.Since(t0).Seconds()
 	pub, del, ack, errs := st.snapshot()
 	p50, p99, pmax := st.percentiles()
-	close(stop)
+	if drained == nil {
+		close(stop)
+	}
 	wg.Wait()
 
 	res.Seconds = el
@@ -653,6 +685,18 @@ func (r *runner) measure(res *result, st *stats, stop chan struct{}, wg *sync.Wa
 	res.LatencyP99Ms = p99
 	res.LatencyMaxMs = pmax
 	res.Errors = errs
+	rejected, timeouts, lastOKNs, maxGapNs := st.shadowFailures()
+	res.ShadowRejected = rejected
+	res.ShadowTimeouts = timeouts
+	res.ShadowStaleReplies = st.shadowStaleReplies()
+	res.ShadowResponseTimeoutMs = r.shadowResponseTimeout.Milliseconds()
+	timeoutMinNs, timeoutMaxNs := st.shadowTimeoutRange()
+	res.ShadowTimeoutMinMs = float64(timeoutMinNs) / float64(time.Millisecond)
+	res.ShadowTimeoutMaxMs = float64(timeoutMaxNs) / float64(time.Millisecond)
+	if lastOKNs > 0 {
+		res.ShadowLastAcceptedUnixMs = lastOKNs / int64(time.Millisecond)
+	}
+	res.ShadowMaxAcceptedGapMs = float64(maxGapNs) / float64(time.Millisecond)
 	// 已经做过接线判定时，投递 0 条是一个合法结果——刻意过载那一档要记录的
 	// 正是它。没做过判定的场景（影子）保持原来的硬失败：那里的 0 只可能是
 	// 没接通。

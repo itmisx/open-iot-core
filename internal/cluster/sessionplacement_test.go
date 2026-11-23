@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"sync/atomic"
 	"testing"
 )
 
@@ -217,6 +218,54 @@ func TestShadowWireSeparatesReadRetryFromWriteAmbiguity(t *testing.T) {
 	}
 	if !retryableKind(wireShadowReadKind) {
 		t.Fatal("idempotent shadow read is not retryable")
+	}
+	g.Drain()
+	write = g.dispatch(wireMsg{Kind: wireShadowWriteKind, Data: []byte("z")})
+	read = g.dispatch(wireMsg{Kind: wireShadowReadKind, Data: []byte("z")})
+	if write.Err != ErrDraining.Error() {
+		t.Fatalf("drain期间影子写 = %+v，期望ErrDraining", write)
+	}
+	if !read.OK || string(read.Data) != "r:z" {
+		t.Fatalf("drain期间只读影子RPC不应被拒: %+v", read)
+	}
+}
+
+func TestShardLeaderCacheInvalidatesOnlyMatchingTarget(t *testing.T) {
+	p, err := newShardPlacement(2, map[NodeID]uint64{
+		"a": 1, "b": 2, "c": 3, "d": 4, "e": 5,
+	}, 4, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &ShardGroup{
+		base: 2, count: 4, replica: 4, placement: p,
+		replicaNode: map[uint64]NodeID{1: "a", 2: "b", 3: "c", 4: "d", 5: "e"},
+		leaderCache: make([]atomic.Uint64, 4),
+	}
+	thing := "cache-target"
+	shard := s.ShardOf(thing)
+	s.rememberLeader(shard, p.members(shard)[1])
+	leader, ok := s.LeaderNode(thing)
+	if !ok || leader == "" {
+		t.Fatalf("缓存leader = %q, %v", leader, ok)
+	}
+	s.ForgetLeader(thing, "not-the-leader")
+	if got, ok := s.LeaderNode(thing); !ok || got != leader {
+		t.Fatalf("无关目标清掉leader缓存: %q, %v", got, ok)
+	}
+	s.ForgetLeader(thing, leader)
+	off := shard - s.shardBase()
+	if got := s.leaderCache[off].Load(); got != 0 {
+		t.Fatalf("匹配目标未清掉leader缓存: %d", got)
+	}
+}
+
+func TestDrainingNodeDoesNotAdvertiseStaleShardLeader(t *testing.T) {
+	g := &TLSGroup{}
+	g.Drain()
+	resp := g.dispatch(wireMsg{Kind: wireShardStatusKind, Shard: 2})
+	if resp.Err != ErrDraining.Error() {
+		t.Fatalf("drain节点的shard状态 = %+v，期望ErrDraining", resp)
 	}
 }
 

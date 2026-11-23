@@ -9,7 +9,7 @@ cd "$(dirname "$0")/../.."
 
 MQTT_PORT=${MQTT_PORT:-39883}
 ADMIN_PORT=${ADMIN_PORT:-39091}
-WORK=${WORK:-$(mktemp -d -t openiot-aws-sdk)}
+WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/openiot-aws-sdk.XXXXXX")} || exit 1
 VENV="${WORK}/venv"
 BIN="${WORK}/openiotd"
 DATA="${WORK}/data"

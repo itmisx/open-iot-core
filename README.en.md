@@ -252,7 +252,7 @@ RESULTS=docs/baseline/throughput make bench-e2e
 | **Connects, non-persistent session** (concurrency 256) | **33,321 conn/s**, 12,000 held, p50 5.11 ms | **23,540 conn/s**, 6,000 held, p50 10.25 ms |
 | **Connects, persistent session** | same as above (standalone skips consensus) | **3,227 conn/s** (concurrency 2048, 6,000 held), p50 497 ms, p99 991 ms |
 | **Memory per connection** | **2,306 bytes** (heap growth ÷ connections, at 12,000 held) | — |
-| **Shadow updates** (through the replicated log) | **166 updates/s** (at concurrency 5; flat at 154–166 from 1 to 100, reproducible) | **456–1,476 updates/s** at concurrency 200 (4 samples — **this machine cannot resolve a ceiling**) |
+| **Shadow updates** (through the replicated log) | **14,314 updates/s** (concurrency 800), p50 53.1 ms, p99 95.4 ms | **15,282 updates/s** (concurrency 3200, 4 shards), p50 198.3 ms, p99 293.0 ms |
 
 **Four preconditions**: the load generator and the server share one machine; traffic goes
 to the plaintext endpoint (no TLS handshake); authentication is `insecure-none` while
@@ -275,16 +275,14 @@ Reading the table:
   reach only ~1,156/s at concurrency 256, 1,922 at 512, and 3,227 at 2048 — **a figure
   taken at low concurrency is capped by the load generator, not by the server**. The
   concurrency used is stated in parentheses for both rows.
-- **The shadow row has opposite shapes on one node and three**, so don't read it as
-  "a cluster is always slower": on a single node throughput stays at 154–166 updates/s
-  from concurrency 1 to 100 while latency grows linearly (it is serialized — adding
-  concurrency does nothing; CLU-190's group commit took the apply layer from 160 to
-  1,318 updates/s and end-to-end up 39%, but the shape did not change — the remaining
-  serialization is upstream and not yet located); on three nodes it rises with concurrency but
-  varies by 3.2× between runs at high concurrency (four samples at concurrency 200 read
-  456 / 489 / 1,199 / 1,476), so this machine cannot give a ceiling. Control-plane writes
-  (shadow, thing creation, certificate issuance) go through this replicated log; the
-  device data plane does not.
+- **The shadow row is higher on three nodes than on one**, so don't read it as "a
+  cluster is always slower". It also needs enough concurrency: a single node tops out
+  at concurrency 800 (at 1600 throughput is flat while p50 doubles), and three nodes
+  with 4 shards top out at concurrency 3200 (6400 is lower). Cluster deployments must
+  enable `shadow_shards` — the compose and k8s manifests under `deploy/cluster` already
+  set 4. Without it, shadow writes go through the single metadata log, whose high point
+  on this machine is 337 updates/s. Control-plane writes (shadow, thing creation,
+  certificate issuance) go through the replicated log; the device data plane does not.
 
 Every ladder rung, the raw JSONL and the measurement protocol are in
 [`docs/baseline/throughput.md`](docs/baseline/throughput.md).

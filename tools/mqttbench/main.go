@@ -43,6 +43,16 @@ func main() {
 			"管理HTTP的专用本地源IP；大连接轮用于隔离设备临时端口池")
 		token        = flag.String("token", "", "管理面令牌")
 		clients      = flag.Int("clients", 1000, "connect/shadow 场景的客户端数")
+		shadowShards = flag.Int("shadow-shards", 0,
+			"shadow场景只生成落在指定分片的设备时使用的分片数；0表示不筛选")
+		shadowShard = flag.Int("shadow-shard", -1,
+			"shadow场景的目标绝对分片号，须与-shadow-shards一起使用")
+		shadowReadyFile = flag.String("shadow-ready-file", "",
+			"shadow客户端全部建连并订阅后写入该文件；故障注入脚本用于同步杀节点")
+		shadowResponseQoS = flag.Int("shadow-response-qos", 0,
+			"shadow accepted/rejected订阅QoS，0或1；生产可靠性门禁使用1")
+		shadowResponseTimeout = flag.Duration("shadow-response-timeout", 5*time.Second,
+			"等待shadow accepted/rejected的上限；生产值应大于服务端Raft apply硬上限")
 		clientOffset = flag.Int("client-offset", 0,
 			"设备编号起点；多个 load generator 并行时用不重叠区间")
 		pairs     = flag.Int("pairs", 200, "pairs 场景的收发对数")
@@ -95,25 +105,30 @@ func main() {
 	_ = setupConc // 保留旧脚本兼容；单个元数据组不从并发批提交中获益。
 
 	r := &runner{
-		pubAddrs:        splitAddrs(*brokers),
-		subAddrs:        splitAddrs(*subBroker),
-		admin:           strings.TrimRight(*admin, "/"),
-		token:           *token,
-		qos:             packet.QoS(*qos),
-		payload:         max(*payload, 8),
-		inflight:        max(*inflight, 1),
-		rate:            *rate,
-		duration:        *duration,
-		warmup:          *warmup,
-		conc:            max(*conc, 1),
-		prefix:          *prefix,
-		clientOffset:    *clientOffset,
-		holdUntilUnix:   *holdUntil,
-		verifyHeld:      *verifyHeld,
-		connectProgress: *progress,
-		reconnect:       *reconnect,
-		reconnectDelay:  *reconnectDelay,
-		reconnectShift:  *reconnectShift,
+		pubAddrs:              splitAddrs(*brokers),
+		subAddrs:              splitAddrs(*subBroker),
+		admin:                 strings.TrimRight(*admin, "/"),
+		token:                 *token,
+		qos:                   packet.QoS(*qos),
+		payload:               max(*payload, 8),
+		inflight:              max(*inflight, 1),
+		rate:                  *rate,
+		duration:              *duration,
+		warmup:                *warmup,
+		conc:                  max(*conc, 1),
+		prefix:                *prefix,
+		clientOffset:          *clientOffset,
+		shadowShards:          *shadowShards,
+		shadowShard:           *shadowShard,
+		shadowReadyFile:       *shadowReadyFile,
+		shadowResponseQoS:     packet.QoS(*shadowResponseQoS),
+		shadowResponseTimeout: *shadowResponseTimeout,
+		holdUntilUnix:         *holdUntil,
+		verifyHeld:            *verifyHeld,
+		connectProgress:       *progress,
+		reconnect:             *reconnect,
+		reconnectDelay:        *reconnectDelay,
+		reconnectShift:        *reconnectShift,
 	}
 	var adminIP net.IP
 	if *adminSourceIP != "" {
@@ -144,6 +159,12 @@ func main() {
 	}
 	if *clientOffset < 0 {
 		die("-client-offset 不能为负数")
+	}
+	if (*shadowShards == 0) != (*shadowShard < 0) {
+		die("-shadow-shards 与 -shadow-shard 必须一起提供")
+	}
+	if *shadowShards < 0 || (*shadowShards > 0 && (*shadowShard < 2 || *shadowShard >= 2+*shadowShards)) {
+		die("目标影子分片必须落在 [2, 2+shadow-shards) 范围")
 	}
 	if *holdUntil < 0 {
 		die("-hold-until-unix 不能为负数")
@@ -207,13 +228,20 @@ func main() {
 	if r.qos > packet.QoS1 {
 		die("只支持 QoS 0 与 QoS 1：QoS 2 的四步握手测的是重传簿记，不是吞吐")
 	}
+	if r.shadowResponseQoS > packet.QoS1 {
+		die("-shadow-response-qos只支持0或1")
+	}
+	if r.shadowResponseTimeout <= 0 {
+		die("-shadow-response-timeout必须大于0")
+	}
 
 	res := &result{
-		Scenario:     *label,
-		QoS:          int(r.qos),
-		Payload:      r.payload,
-		Nodes:        len(r.pubAddrs),
-		ClientOffset: *clientOffset,
+		Scenario:          *label,
+		QoS:               int(r.qos),
+		Payload:           r.payload,
+		Nodes:             len(r.pubAddrs),
+		ClientOffset:      *clientOffset,
+		ShadowResponseQoS: *shadowResponseQoS,
 	}
 	if res.Scenario == "" {
 		res.Scenario = *scenario
@@ -288,33 +316,47 @@ type result struct {
 	LoadGeneratorRuntimePerConn  int64   `json:"loadGeneratorRuntimeSysPerConn,omitempty"`
 	LoadGeneratorRSSBytesPerConn int64   `json:"loadGeneratorRssBytesPerConn,omitempty"`
 
-	PublishPerSec float64 `json:"publishPerSec,omitempty"`
-	DeliverPerSec float64 `json:"deliverPerSec,omitempty"`
-	AckedPerSec   float64 `json:"ackedPerSec,omitempty"`
-	LatencyP50Ms  float64 `json:"latencyP50Ms,omitempty"`
-	LatencyP99Ms  float64 `json:"latencyP99Ms,omitempty"`
-	LatencyMaxMs  float64 `json:"latencyMaxMs,omitempty"`
-	Published     int64   `json:"published,omitempty"`
-	Delivered     int64   `json:"delivered,omitempty"`
-	Errors        int64   `json:"errors,omitempty"`
-	FirstError    string  `json:"firstError,omitempty"`
-	Seconds       float64 `json:"seconds,omitempty"`
+	PublishPerSec            float64 `json:"publishPerSec,omitempty"`
+	DeliverPerSec            float64 `json:"deliverPerSec,omitempty"`
+	AckedPerSec              float64 `json:"ackedPerSec,omitempty"`
+	LatencyP50Ms             float64 `json:"latencyP50Ms,omitempty"`
+	LatencyP99Ms             float64 `json:"latencyP99Ms,omitempty"`
+	LatencyMaxMs             float64 `json:"latencyMaxMs,omitempty"`
+	Published                int64   `json:"published,omitempty"`
+	Delivered                int64   `json:"delivered,omitempty"`
+	Errors                   int64   `json:"errors,omitempty"`
+	ShadowRejected           int64   `json:"shadowRejected,omitempty"`
+	ShadowTimeouts           int64   `json:"shadowTimeouts,omitempty"`
+	ShadowStaleReplies       int64   `json:"shadowStaleReplies,omitempty"`
+	ShadowResponseQoS        int     `json:"shadowResponseQos,omitempty"`
+	ShadowResponseTimeoutMs  int64   `json:"shadowResponseTimeoutMs,omitempty"`
+	ShadowTimeoutMinMs       float64 `json:"shadowTimeoutMinMs,omitempty"`
+	ShadowTimeoutMaxMs       float64 `json:"shadowTimeoutMaxMs,omitempty"`
+	ShadowLastAcceptedUnixMs int64   `json:"shadowLastAcceptedUnixMs,omitempty"`
+	ShadowMaxAcceptedGapMs   float64 `json:"shadowMaxAcceptedGapMs,omitempty"`
+	FirstError               string  `json:"firstError,omitempty"`
+	Seconds                  float64 `json:"seconds,omitempty"`
 }
 
 type runner struct {
-	pubAddrs  []string
-	subAddrs  []string
-	admin     string
-	adminHTTP *http.Client
-	token     string
-	qos       packet.QoS
-	payload   int
-	inflight  int
-	rate      int
-	duration  time.Duration
-	warmup    time.Duration
-	conc      int
-	prefix    string
+	pubAddrs              []string
+	subAddrs              []string
+	admin                 string
+	adminHTTP             *http.Client
+	token                 string
+	qos                   packet.QoS
+	payload               int
+	inflight              int
+	rate                  int
+	duration              time.Duration
+	warmup                time.Duration
+	conc                  int
+	prefix                string
+	shadowShards          int
+	shadowShard           int
+	shadowReadyFile       string
+	shadowResponseQoS     packet.QoS
+	shadowResponseTimeout time.Duration
 	// clientOffset 让多个压测进程共享 prefix，同时使用互不重叠的设备编号。
 	clientOffset int
 	// holdUntilUnix 让多个压测进程在同一个绝对时刻之前都保持连接。

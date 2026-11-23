@@ -18,7 +18,7 @@ cd "$(dirname "$0")/../.."
 
 MQTT_PORT=${MQTT_PORT:-39483}
 ADMIN_PORT=${ADMIN_PORT:-39490}
-WORK=${WORK:-$(mktemp -d -t openiot-examples)}
+WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/openiot-examples.XXXXXX")} || exit 1
 BIN="${WORK}/openiotd"
 DATA="${WORK}/data"
 

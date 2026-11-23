@@ -47,6 +47,27 @@ func (r *runner) names(kind string, n int) []string {
 	return out
 }
 
+// shadowNames 可把故障轮的全部设备固定到一个影子分片。普通吞吐轮不筛选，
+// 仍保持连续编号；筛选只改变候选编号的密度，不改变名字或稳定哈希算法。
+func (r *runner) shadowNames(kind string, n int) []string {
+	if r.shadowShards == 0 {
+		return r.names(kind, n)
+	}
+	out := make([]string, 0, n)
+	for candidate := r.clientOffset; len(out) < n; candidate++ {
+		name := fmt.Sprintf("%s-%s%06d", r.prefix, kind, candidate)
+		var h uint64 = 14695981039346656037
+		for i := 0; i < len(name); i++ {
+			h ^= uint64(name[i])
+			h *= 1099511628211
+		}
+		if 2+int(h%uint64(r.shadowShards)) == r.shadowShard {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func splitAddrs(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {

@@ -29,7 +29,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 MODE=${MODE:-both}
-WORK=${WORK:-$(mktemp -d -t openiot-bench)}
+WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/openiot-bench.XXXXXX")} || exit 1
 RESULTS=${RESULTS:-}
 BASE_PORT=${BASE_PORT:-42000}
 

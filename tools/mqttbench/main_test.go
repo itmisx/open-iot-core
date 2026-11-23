@@ -162,6 +162,70 @@ func TestClientFlushWritesAllAndReleasesBuffer(t *testing.T) {
 	}
 }
 
+func TestShadowLoopAcknowledgesQoS1Response(t *testing.T) {
+	clientSide, brokerSide := net.Pipe()
+	defer clientSide.Close()
+	defer brokerSide.Close()
+	cl := newClient(clientSide, packet.V311)
+	broker := newClient(brokerSide, packet.V311)
+	st := newStats()
+	st.reset() // generation 1 is measured; generation 0 is warm-up.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		cl.shadowLoop(&runner{shadowResponseTimeout: time.Second},
+			"$aws/things/d/shadow/update", st, stop)
+		close(done)
+	}()
+
+	req, err := broker.recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, ok := req.(*packet.Publish)
+	if !ok || !bytes.Contains(pub.Payload, []byte(`"clientToken":"1"`)) {
+		t.Fatalf("首条影子请求=%T %#v", req, req)
+	}
+	// 先关 stop，再发响应。
+	//
+	// 反过来写是有竞态的：shadowLoop 处理完响应就跳出内层循环并回到外层的
+	// select，而那时 close(stop) 可能还没发生——于是它发出第 2 条请求、阻塞
+	// 一个响应期限、记一次超时，下面三条断言（停止、published=1、零错误）
+	// 全都落空。这一轮在 make gate 的全量 -race 下真的红过一次，而单独跑
+	// 三次都是绿的。
+	//
+	// 这个顺序是确定的：此刻 shadowLoop 正阻塞在 recv() 上，关闭 stop 不会
+	// 打断它；等它确认完响应跳出内层循环时，外层 select 必然已经可见。
+	close(stop)
+	if err := broker.send(&packet.Publish{
+		Topic:   []byte("$aws/things/d/shadow/update/accepted"),
+		Payload: []byte(`{"version":1,"clientToken":"1"}`),
+		QoS:     packet.QoS1, PacketID: 77,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.flush(); err != nil {
+		t.Fatal(err)
+	}
+	ackPacket, err := broker.recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, ok := ackPacket.(*packet.Ack)
+	if !ok || ack.Kind != packet.PUBACK || ack.PacketID != 77 {
+		t.Fatalf("Shadow QoS1确认=%T %#v", ackPacket, ackPacket)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shadowLoop确认响应后没有停止")
+	}
+	pubN, delivered, _, errs := st.snapshot()
+	if pubN != 1 || delivered != 1 || errs != 0 {
+		t.Fatalf("统计 published=%d delivered=%d errors=%d", pubN, delivered, errs)
+	}
+}
+
 func TestVerifyHeldConnectionsUsesApplicationPing(t *testing.T) {
 	const good = 8
 	r := &runner{conc: 4}
@@ -440,6 +504,73 @@ func TestStatsResetClearsLatency(t *testing.T) {
 	p50, p99, pmax := s.percentiles()
 	if p50 != 0 || p99 != 0 || pmax != 0 {
 		t.Fatalf("直方图未清零: p50=%v p99=%v max=%v", p50, p99, pmax)
+	}
+}
+
+// TestShadowStatsExcludeWarmupInFlight pins the boundary where a request is
+// sent during warm-up but its accepted reply arrives after reset. It must not
+// produce delivered > published in the measured window.
+func TestShadowStatsExcludeWarmupInFlight(t *testing.T) {
+	s := newStats()
+	warmupGen := s.shadowGeneration()
+	s.shadowPublished(warmupGen)
+	s.shadowFailed(warmupGen)
+
+	s.reset()
+	s.shadowDelivered(warmupGen, 900)
+	measureGen := s.shadowGeneration()
+	s.shadowPublished(measureGen)
+	s.shadowDelivered(measureGen, 12)
+	s.shadowPublished(measureGen)
+	s.shadowDelivered(measureGen, 12)
+	s.shadowFailed(measureGen)
+
+	pub, del, _, errs := s.snapshot()
+	if pub != 2 || del != 2 || errs != 1 {
+		t.Fatalf("测量窗口计数 = published %d delivered %d errors %d，期望 2/2/1", pub, del, errs)
+	}
+	p50, _, pmax := s.percentiles()
+	if p50 == 0 || pmax != 12 {
+		t.Fatalf("测量窗口延迟 = p50 %.3f max %.3f，预热样本不应进入直方图", p50, pmax)
+	}
+}
+
+func TestShadowFailureStatsAreGenerationScoped(t *testing.T) {
+	s := newStats()
+	warmup := s.shadowGeneration()
+	s.reset()
+	measured := s.shadowGeneration()
+	s.shadowRejectedReply(warmup)
+	s.shadowTimedOut(warmup)
+	s.shadowRejectedReply(measured)
+	s.shadowTimedOut(measured)
+	rejected, timeouts, _, _ := s.shadowFailures()
+	_, _, _, errs := s.snapshot()
+	if rejected != 1 || timeouts != 1 || errs != 2 {
+		t.Fatalf("rejected=%d timeouts=%d errors=%d，期望1/1/2", rejected, timeouts, errs)
+	}
+}
+
+func TestShadowNamesCanTargetOneShard(t *testing.T) {
+	r := &runner{prefix: "failover", shadowShards: 4, shadowShard: 3}
+	names := r.shadowNames("h", 1000)
+	if len(names) != 1000 {
+		t.Fatalf("设备数=%d，期望1000", len(names))
+	}
+	seen := map[string]bool{}
+	for _, name := range names {
+		if seen[name] {
+			t.Fatalf("重复设备名 %s", name)
+		}
+		seen[name] = true
+		var h uint64 = 14695981039346656037
+		for i := 0; i < len(name); i++ {
+			h ^= uint64(name[i])
+			h *= 1099511628211
+		}
+		if got := 2 + int(h%4); got != 3 {
+			t.Fatalf("%s落到分片%d，期望3", name, got)
+		}
 	}
 }
 

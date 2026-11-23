@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/itmisx/open-iot-core/internal/events"
 )
@@ -18,6 +19,11 @@ import (
 
 const eventLogName = "events.jsonl"
 
+const (
+	eventLogSyncInterval = 100 * time.Millisecond
+	eventLogSyncBatch    = 256
+)
+
 func (s *Server) watchEvents(ctxDone <-chan struct{}) {
 	defer s.wg.Done()
 	path := filepath.Join(s.dd.Root(), eventLogName)
@@ -26,7 +32,41 @@ func (s *Server) watchEvents(ctxDone <-chan struct{}) {
 		s.log.Error("事件日志无法打开", "错误", err.Error())
 		return
 	}
-	defer func() { _ = f.Close() }()
+	w := bufio.NewWriterSize(f, 64<<10)
+	enc := json.NewEncoder(w)
+	pending := 0
+	flush := func() bool {
+		if pending == 0 {
+			return true
+		}
+		if err := w.Flush(); err != nil {
+			s.log.Error("事件日志刷新失败", "错误", err.Error())
+			return false
+		}
+		if err := f.Sync(); err != nil {
+			s.log.Error("事件日志同步失败", "错误", err.Error())
+			return false
+		}
+		pending = 0
+		if st, err := f.Stat(); err == nil && st.Size() > 8<<20 {
+			_ = f.Close()
+			_ = os.Rename(path, path+".1")
+			f, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				s.log.Error("事件日志无法轮转", "错误", err.Error())
+				return false
+			}
+			w = bufio.NewWriterSize(f, 64<<10)
+			enc = json.NewEncoder(w)
+		}
+		return true
+	}
+	defer func() {
+		_ = flush()
+		_ = f.Close()
+	}()
+	ticker := time.NewTicker(eventLogSyncInterval)
+	defer ticker.Stop()
 
 	ch, cancel := s.bus.Subscribe(events.Filter{
 		Kinds: events.KindConn.Mask() | events.KindSubscription.Mask() |
@@ -38,23 +78,24 @@ func (s *Server) watchEvents(ctxDone <-chan struct{}) {
 		select {
 		case <-ctxDone:
 			return
+		case <-ticker.C:
+			if !flush() {
+				return
+			}
 		case ev, ok := <-ch:
 			if !ok {
 				return
 			}
-			if err := json.NewEncoder(f).Encode(toSSE(&ev)); err != nil {
+			if err := enc.Encode(toSSE(&ev)); err != nil {
 				s.log.Error("事件日志写入失败", "错误", err.Error())
+				return
+			}
+			pending++
+			if pending < eventLogSyncBatch {
 				continue
 			}
-			_ = f.Sync()
-			if st, err := f.Stat(); err == nil && st.Size() > 8<<20 {
-				_ = f.Close()
-				_ = os.Rename(path, path+".1")
-				f, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-				if err != nil {
-					s.log.Error("事件日志无法轮转", "错误", err.Error())
-					return
-				}
+			if !flush() {
+				return
 			}
 		}
 	}

@@ -28,7 +28,7 @@ data:
         key_file: /etc/openiotd/repl/tls.key
         ca_file: /etc/openiotd/repl/ca.crt
         pump_interval: 200ms
-        shadow_shards: 8
+        shadow_shards: 4
         shadow_replication_factor: 3
         # 初始成员用 headless Service 给出的稳定 DNS 名。
         # 这是 StatefulSet 而不是 Deployment 的原因之一：Pod 名字和

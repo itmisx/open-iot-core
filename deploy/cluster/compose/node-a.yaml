@@ -18,7 +18,7 @@ cluster:
     key_file: /etc/openiotd/pki/node-a.key
     ca_file: /etc/openiotd/pki/ca.pem
     pump_interval: 200ms
-    shadow_shards: 8
+    shadow_shards: 4
     shadow_replication_factor: 3
     # 初始成员。拨号用的名字就是 compose 的服务名；复制层不按主机名
     # 校验对端，身份按证书的 CommonName 认（CLU-069、CLU-102），

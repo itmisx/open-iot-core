@@ -1,0 +1,1 @@
+{"scenario":"shadow/failover","nodes":3,"shadowShards":4,"shadowRF":0,"mqttTLS":true,"leader":"a","shard":2,"access":"b","recoveryMs":1230,"version":2,"prefixPreserved":true}

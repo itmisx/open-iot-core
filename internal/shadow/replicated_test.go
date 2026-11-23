@@ -364,6 +364,54 @@ func TestReplicatedShadowTransactionalDeliveryWaitsForCommit(t *testing.T) {
 	}
 }
 
+func TestReplicatedShadowWaitCommittedUsesLocalApplySignal(t *testing.T) {
+	rs, err := NewReplicatedStore(NewMemStore(), &fakeLog{}, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "id-wait"
+	rs.mu.Lock()
+	rs.pending[id] = nil
+	rs.waiters[id] = make(chan struct{})
+	rs.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- rs.WaitCommitted(context.Background(), id) }()
+	select {
+	case err := <-done:
+		t.Fatalf("本地 apply 前等待提前结束: %v", err)
+	default:
+	}
+
+	rs.DeliverCommitted(id, &Result{Version: 7}, nil)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	rs.mu.Lock()
+	got := rs.pending[id]
+	rs.mu.Unlock()
+	if got == nil || got.res == nil || got.res.Version != 7 {
+		t.Fatalf("交付结果 = %+v", got)
+	}
+}
+
+func TestReplicatedShadowWaitCommittedHonorsContext(t *testing.T) {
+	rs, err := NewReplicatedStore(NewMemStore(), &fakeLog{}, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "id-timeout"
+	rs.mu.Lock()
+	rs.pending[id] = nil
+	rs.waiters[id] = make(chan struct{})
+	rs.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := rs.WaitCommitted(ctx, id); !errors.Is(err, context.Canceled) {
+		t.Fatalf("等待错误 = %v，期望 context.Canceled", err)
+	}
+}
+
 // TestReplicatedShadowRefusesBrokenEntry 解不开的条目要让 apply 失败。
 func TestReplicatedShadowRefusesBrokenEntry(t *testing.T) {
 	rs, err := NewReplicatedStore(NewMemStore(), &fakeLog{}, "a")

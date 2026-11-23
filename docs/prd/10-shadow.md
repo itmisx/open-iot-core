@@ -122,8 +122,8 @@ SHDW-021 标注"最容易做错"。实现时把规则逐条固化，每条都有
 | ID | 需求 | 状态 |
 | --- | --- | --- |
 | SHDW-060 | 写入须经 `Partitioner` 判定归属，本地直接处理，否则转发 owner。单机下转发分支不进入但必须存在。 | v0.1 |
-| SHDW-061 | 分区组失去 quorum 时，受影响 thing 的影子写入拒绝，消息收发不受影响。故障域限制在 1/64 key 空间。 | v0.4 |
-| SHDW-062 | leader 切换后 `version` 不得回退。须有故障注入测试验证。 | v0.4 |
+| SHDW-061 | 分区组失去 quorum 时，受影响 thing 的影子写入拒绝，消息收发不受影响。故障域限制在 1/`shadow_shards` key 空间。 | v0.4 |
+| SHDW-062 | leader 切换后 `version` 不得回退。`TestShardLeaderFailureKeepsCommittedOrder` 真正停止当前 shard leader 副本，等待剩余多数派自动选举，再断言存活副本严格保留故障前提交前缀、追加后续版本且 applied index 不回退；礼貌的 leader transfer 不能替代该门禁。2026-11-22 本机三轮恢复写入为 0.924--1.097 秒，五轮均低于 5 秒硬门禁。真进程带负载故障轮仍属于部署验收。 | v0.4 |
 
 ## 8. 持久化（实现期补充）
 

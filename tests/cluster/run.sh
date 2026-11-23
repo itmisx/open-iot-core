@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 BASE_PORT=${BASE_PORT:-41000}
-WORK=${WORK:-$(mktemp -d -t openiot-cluster)}
+WORK=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/openiot-cluster.XXXXXX")} || exit 1
 BIN="${WORK}/openiotd"
 
 

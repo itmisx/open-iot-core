@@ -65,6 +65,33 @@ func TestApplyShadowBatchKeepsDomainErrorDeterministic(t *testing.T) {
 	}
 }
 
+func TestApplyShadowBatchSupportsExtendedPhysicalEntry(t *testing.T) {
+	s := NewShadowStore(NewMemKV())
+	const n = 256
+	ents := make([]ShadowEntry, n)
+	for i := range ents {
+		ents[i] = ShadowEntry{Index: 42, Data: encodedShadowCmd(t, shadow.Command{
+			Kind: shadow.CmdUpdate, Thing: "lamp", NowSec: int64(i + 1),
+			Patch: shadow.Object{"reported": shadow.Object{"n": i}},
+		})}
+	}
+	if err := s.ApplyShadowBatch(2, ents, func(thing string) bool { return thing == "lamp" }); err != nil {
+		t.Fatal(err)
+	}
+	for i := range ents {
+		if ents[i].Err != nil || ents[i].Result == nil || ents[i].Result.Version != int64(i+1) {
+			t.Fatalf("第%d条结果 = %#v，批内顺序或逐条结果丢失", i, ents[i])
+		}
+	}
+	doc, ok := s.Get("lamp", "")
+	if !ok || doc.Version != n {
+		t.Fatalf("extended batch document = %#v, %v", doc, ok)
+	}
+	if got := s.ShadowAppliedIndex(2); got != 42 {
+		t.Fatalf("applied index = %d, want 42", got)
+	}
+}
+
 func TestShadowShardSnapshotRestoreIsIsolated(t *testing.T) {
 	src := NewShadowStore(NewMemKV())
 	for _, thing := range []string{"owned-a", "other", "owned-b"} {
