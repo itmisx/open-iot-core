@@ -19,6 +19,38 @@ import (
 	"github.com/itmisx/open-iot-core/internal/store"
 )
 
+func TestSessionShardMetricsExposeTopologyAndSafeReroutes(t *testing.T) {
+	r := newTestRig(t, func(cfg *config.Config) {
+		clusterConfig(t, cfg, "n1")
+		cfg.Cluster.Replication.SessionShards = 1
+	})
+	r.start()
+
+	if r.s.shards == nil || !r.s.shards.Ready() {
+		t.Fatal("单节点会话分片没有就绪")
+	}
+	var buf bytes.Buffer
+	enc := metricspkg.NewEncoder(&buf)
+	(&adminServer{s: r.s}).collectSessionShards(enc, metricspkg.Label{
+		Name: "node", Value: string(r.s.mf.NodeID),
+	})
+	if err := enc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	text := buf.String()
+	for _, fragment := range []string{
+		"openiot_session_shard_ready{node=\"" + string(r.s.mf.NodeID) + "\",shard=\"16\"} 1",
+		"openiot_session_shard_is_leader{node=\"" + string(r.s.mf.NodeID) + "\",shard=\"16\"} 1",
+		"openiot_session_shard_applied_index{node=\"" + string(r.s.mf.NodeID) + "\",shard=\"16\"}",
+		"openiot_session_proposal_safe_reroutes_total{node=\"" + string(r.s.mf.NodeID) + "\",source=\"local\"} 0",
+		"openiot_session_proposal_safe_reroutes_total{node=\"" + string(r.s.mf.NodeID) + "\",source=\"remote\"} 0",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("会话指标缺少%q:\n%s", fragment, text)
+		}
+	}
+}
+
 func TestShadowShardMetricsExposePersistedAppliedIndex(t *testing.T) {
 	r := newTestRig(t, func(cfg *config.Config) {
 		clusterConfig(t, cfg, "n1")

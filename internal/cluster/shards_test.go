@@ -428,14 +428,101 @@ func TestShardProposalRoutesDirectlyToLeader(t *testing.T) {
 		t.Fatalf("本地 leader 提案却连了 follower：入站 %d -> %d", before, got)
 	}
 
+	// leader 合批队列取请求时若任期已经切走，它尚未调用 Dragonboat，
+	// 必须返回“确定未发送”。上层只有凭这个错误才可安全等新 leader
+	// 后重路由；若压成普通 NotLeader，就只能把一整批 CONNECT 拒掉。
+	if _, _, err := shards[followerID].syncProposeIfLeader(shardSessionBase,
+		[]byte("known-unsent")); !errors.Is(err, ErrRequestUnsent) {
+		t.Fatalf("follower提交前复查返回 %v，期望 ErrRequestUnsent", err)
+	}
+
 	// 故意把请求送给 follower；接收端必须就地拒绝，不能
 	// 又转回 leader 形成第二跳。
 	leaderAccepted := groups[leaderID].ownAccepted.Load()
-	if _, err := groups[leaderID].forwardShard(followerID, shardSessionBase, []byte("wrong-target")); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("非 leader 接收端返回 %v，期望 ErrNotLeader", err)
+	// 接收端的入口复查同样发生在 SyncPropose 之前，所以它回的也必须是
+	// “确定未发送”——这是换届期最常见的一种，压成 ErrNotLeader 就与
+	// “提交了但应答丢了”混在一起，发起方只能整批拒掉。
+	if _, err := groups[leaderID].forwardShard(followerID, shardSessionBase, []byte("wrong-target")); !errors.Is(err, ErrRequestUnsent) {
+		t.Fatalf("非 leader 接收端返回 %v，期望 ErrRequestUnsent", err)
 	}
 	if got := groups[leaderID].ownAccepted.Load(); got != leaderAccepted {
 		t.Fatalf("非 leader 把提案又转回 leader：入站 %d -> %d", leaderAccepted, got)
+	}
+}
+
+// TestShardStatsExposeSafeReroutes 只验读数搬运，不验触发路径；
+// 触发侧的判据在 TestSafeRerouteAcceptsReelectedSelfReplica。
+func TestShardStatsExposeSafeReroutes(t *testing.T) {
+	var g ShardGroup
+	g.stats.safeRerouteLocal.Add(2)
+	g.stats.safeRerouteRemote.Add(3)
+	st := g.Stats()
+	if st.SafeRerouteLocal != 2 || st.SafeRerouteRemote != 3 {
+		t.Fatalf("安全重路由统计 = local:%d remote:%d，期望 2/3",
+			st.SafeRerouteLocal, st.SafeRerouteRemote)
+	}
+}
+
+// TestSafeRerouteAcceptsReelectedSelfReplica 钉 CLU-191 等待侧的两条判据：
+//
+//   - 一条“可证明未发送”的命令重路由后必须**恰好提交一次**；
+//   - **换届的结果可能是本副本再次当选**，这时必须立刻收下。提交前复查
+//     失败最常见的形态是“此刻无 leader”而不是“已经换人”，只认“leader
+//     换人”就会在这一支上等一个不会发生的事件，挂满 applyTimeout
+//     （生产默认 10 秒）才失败——比不重路由的立刻失败更糟，而这条
+//     CONNECT 本来是可以成功的。
+//
+// 这个形状三进程验收与单机都碰不到：它要求换届恰好落在合批入队与出队
+// 之间，所以判据只能写在这一层。
+func TestSafeRerouteAcceptsReelectedSelfReplica(t *testing.T) {
+	groups, addrs := newTLSCluster(t, []NodeID{"a"})
+	_ = waitLeader(t, []*TLSGroup{groups["a"]}, 10*time.Second)
+
+	fsm := newShardFSM()
+	sg, err := groups["a"].StartSessionShards(ShardOptions{
+		Count: 1, Replicas: replicasOf(addrs), Peers: addrs, Bootstrap: true,
+		Apply: fsm.apply, AppliedIndex: fsm.appliedIndex,
+		SnapshotTo:  func(uint64, io.Writer) error { return nil },
+		RestoreFrom: func(uint64, io.Reader) error { return nil },
+		// 取小值：判据之一是“没有白等”，而默认的 10 秒会让这条用例
+		// 在回归时慢到被当成卡死。
+		ApplyTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("起分片失败: %v", err)
+	}
+	t.Cleanup(func() { _ = sg.Close() })
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !sg.Ready() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sg.Ready() {
+		t.Fatal("10 秒内会话分片没有选出 leader")
+	}
+
+	// oldLeader 取本副本号，模拟“入队时是 leader、出队前复查失败、
+	// 随后又是自己当选”。
+	start := time.Now()
+	if _, err := sg.proposeAfterLeaderChange(shardSessionBase, sg.replica,
+		[]byte("reelected-self")); err != nil {
+		t.Fatalf("本副本再次当选后重路由: %v", err)
+	}
+	if waited := time.Since(start); waited > sg.applyTO/2 {
+		t.Fatalf("等了 %v 才提交；对“本副本再次当选”必须立刻收下，"+
+			"否则一条可证明未发送的 CONNECT 会白挂满 applyTimeout", waited)
+	}
+	if n := fsm.count(shardSessionBase); n != 1 {
+		t.Fatalf("提交条数 = %d，期望恰好 1；重路由只许补发未发送的那一条", n)
+	}
+
+	// 确定未发送的错误仍必须严格区分于歧义错误：提交前复查给出的是
+	// ErrRequestUnsent，调用方据此才敢重路由。
+	if _, _, err := sg.syncProposeIfLeader(shardSessionBase+1,
+		[]byte("not-a-local-shard")); !errors.Is(err, ErrRequestUnsent) {
+		t.Fatalf("非本地分片的提交前复查返回 %v，期望 ErrRequestUnsent", err)
+	}
+	if n := fsm.count(shardSessionBase); n != 1 {
+		t.Fatalf("复查失败后仍提交了日志：条数 = %d", n)
 	}
 }
 
@@ -848,5 +935,41 @@ func TestClaimedSessionCacheIsEpochScopedAndOneShot(t *testing.T) {
 	stats := s.Stats()
 	if stats.SessionReadLogical != 2 || stats.SessionReadClaimed != 2 || stats.SessionReadBatches != 0 {
 		t.Fatalf("Claim 预读指标 = %+v", stats)
+	}
+}
+
+// TestSliceResultBitsCoversBeyond64 钉 CLU-193 的切位逻辑。
+//
+// 两条判据：位图非空时第 64 位之后仍切得出来（旧实现是一个 uint64，
+// 那些位根本不存在），以及位图为空时退回状态机那个 uint64——不填
+// ResultBits 的状态机（元数据组、影子）行为必须不变。
+func TestSliceResultBitsCoversBeyond64(t *testing.T) {
+	bits := make([]byte, 16) // 128 位
+	for _, at := range []uint{0, 63, 64, 70, 127} {
+		bits[at/8] |= 1 << (at % 8)
+	}
+	if got := sliceResultBits(0, bits, 64, 8); got != 0b0100_0001 {
+		t.Fatalf("第 64 位起 8 位 = %08b，期望 01000001", got)
+	}
+	if got := sliceResultBits(0, bits, 120, 8); got != 0b1000_0000 {
+		t.Fatalf("第 120 位起 8 位 = %08b，期望 10000000", got)
+	}
+	if got := sliceResultBits(0, bits, 1, 8); got != 0 {
+		t.Fatalf("第 1 位起 8 位 = %08b，期望全 0", got)
+	}
+	// 位图越界时按 0 读，不得 panic：状态机回少了位的那条路径由调用方
+	// 单独报错，切位本身不能先崩。
+	if got := sliceResultBits(0, bits, 1000, 8); got != 0 {
+		t.Fatalf("越界读 = %d，期望 0", got)
+	}
+	// 位图为空：退回 uint64。
+	if got := sliceResultBits(0b1011, nil, 1, 3); got != 0b101 {
+		t.Fatalf("回退到 uint64 的第 1 位起 3 位 = %03b，期望 101", got)
+	}
+	if got := sliceResultBits(42, nil, 0, 64); got != 42 {
+		t.Fatalf("整宽回退 = %d，期望 42", got)
+	}
+	if !widthsFitUint64([]uint8{16, 16, 64}) || widthsFitUint64([]uint8{65}) {
+		t.Fatal("单请求位宽判定错误：每个请求自己那一段必须装得进 uint64")
 	}
 }

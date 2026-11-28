@@ -548,7 +548,12 @@ func (s *Server) Prepare(ctx context.Context) error {
 	// 而为它退出进程会把一次瞬态变成 CrashLoopBackOff。
 	expired, err := s.sessions.Expire(ctx, s.now())
 	if err != nil {
-		if !errors.Is(err, cluster.ErrNotLeader) {
+		// ErrRequestUnsent 与 ErrNotLeader 是同一件事的两种说法：分片
+		// 此刻没有可提交的 leader，而这条命令确定没有进日志（CLU-191）。
+		// 少列一个就等于把一次换届瞬态变成启动失败——而退出会让收敛更难，
+		// 不是更容易（CLU-118）。
+		if !errors.Is(err, cluster.ErrNotLeader) &&
+			!errors.Is(err, cluster.ErrRequestUnsent) {
 			return err
 		}
 		s.log.Warn("启动期的会话过期清理被推迟",

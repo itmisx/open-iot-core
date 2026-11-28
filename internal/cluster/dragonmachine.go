@@ -32,6 +32,14 @@ type ShardEntry struct {
 	Index  uint64
 	Data   []byte
 	Result uint64
+	// ResultBits 是**按条**的判定位图，一位一条子命令，用于一条日志里
+	// 装了超过 64 条命令的合并提案（CLU-193）。Result 那个 uint64 装不下
+	// 64 位以上，而合批宽度正是这一栏吞吐的主要杠杆。
+	//
+	// 它只在 leader 自己的进程里被读：提案方按 widths 把它切成每个请求
+	// 自己那一段（一个 Access 批最多 16 条），跨节点回传的仍然是切好的
+	// uint64，所以线上协议不受影响。
+	ResultBits []byte
 }
 
 type metaMachine struct {
@@ -99,7 +107,9 @@ func (m *metaMachine) Update(ents []sm.Entry) ([]sm.Entry, error) {
 			return nil, err
 		}
 		for i := range ents {
-			ents[i].Result = sm.Result{Value: batch[i].Result}
+			ents[i].Result = sm.Result{
+				Value: batch[i].Result, Data: batch[i].ResultBits,
+			}
 		}
 		return ents, nil
 	}

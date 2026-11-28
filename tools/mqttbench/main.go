@@ -240,6 +240,7 @@ func main() {
 		QoS:               int(r.qos),
 		Payload:           r.payload,
 		Nodes:             len(r.pubAddrs),
+		Concurrency:       *conc,
 		ClientOffset:      *clientOffset,
 		ShadowResponseQoS: *shadowResponseQoS,
 	}
@@ -284,12 +285,17 @@ func main() {
 // result 是一次场景的结果。字段名直接进 JSON，docs/baseline 下的原始数据
 // 就是这些行的拼接——报告里的每个数字都能在原始数据里找到出处。
 type result struct {
-	Scenario     string `json:"scenario"`
-	Nodes        int    `json:"nodes"`
-	Clients      int    `json:"clients"`
-	ClientOffset int    `json:"clientOffset"`
-	QoS          int    `json:"qos"`
-	Payload      int    `json:"payloadBytes"`
+	Scenario string `json:"scenario"`
+	Nodes    int    `json:"nodes"`
+	Clients  int    `json:"clients"`
+	// Concurrency 必须入库：同一个 scenario 标签下的两档并发量到的是
+	// 两件事（持久建连并发 1,600 是安全档、2,048 是过载边缘），而阶梯
+	// 的档位只写在正文里时，原始数据事后就分不出哪一行是哪一档——
+	// TST-221 栽过同一个跟头（没记那一列，于是“当时有没有被断开”不可考）。
+	Concurrency  int `json:"concurrency"`
+	ClientOffset int `json:"clientOffset"`
+	QoS          int `json:"qos"`
+	Payload      int `json:"payloadBytes"`
 
 	ConnectPerSec                float64 `json:"connectPerSec,omitempty"`
 	ConnectP50Ms                 float64 `json:"connectP50Ms,omitempty"`

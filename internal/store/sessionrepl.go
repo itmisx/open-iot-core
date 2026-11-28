@@ -51,8 +51,9 @@ const (
 )
 
 // MergeSessionProposals 把多个 Access 节点已经形成的会话 batch 在 shard
-// leader 上再次展平。状态机返回的是 stale 位图，所以总逻辑命令数仍限制
-// 为 64；widths 让 cluster 层把合并后的位图切回每个原始请求。
+// leader 上再次展平。总逻辑命令数的上限是 sessionProposalBatchMax；
+// widths 让 cluster 层把状态机回来的按条判定位切回每个原始请求（每个请求
+// 自己那一段不超过 64 条，所以跨节点回传的仍是一个 uint64）。
 //
 // 同一 clientId 可以在同一条日志里出现多次：事务按数组顺序应用，后一个
 // epoch 会围栏前一个，stale 位也仍按原位置返回。禁止重复反而会让旧连接的
@@ -304,21 +305,47 @@ type sessionCmd struct {
 }
 
 const (
-	sessionProposalBatchMax = 64
+	// sessionProposalBatchMax 是一条 Raft 日志里最多装多少条逻辑命令。
+	//
+	// 这一栏的天花板是**物理日志条数**而不是单条日志的大小：同机多进程
+	// 上一条日志至少要 leader 的 WAL、多数派的 WAL 与各副本 apply 侧各
+	// 一次 fsync，而一条会话命令只有几百字节。64 条时实测三节点 4 分片
+	// 4,376 条/秒，12,000 条逻辑命令用掉 204 条物理日志，其中 135 条是被
+	// 这个上限截断的；放到 512 条后同一配置是 10,273 条/秒（3 轮中位数，
+	// 区间 9,963–10,623），物理日志降到 49 至 52 条（CLU-193）。
+	//
+	// 再往上加没有意义：那一轮平均只装到 230 至 245 条，车道已经是
+	// **供给受限**（队列取空）而不是宽度受限。
+	//
+	// 它曾经等于 64 是因为状态机的判定结果是一个 uint64 位图；现在按条的
+	// 位图走 ShardEntry.ResultBits，所以这个数不再受 64 位约束。**每个
+	// 请求自己那一段仍必须不超过 64 条**（跨节点回传的是切好的 uint64），
+	// 而那由 sessionAccessProposalBatchMax 保证。
+	sessionProposalBatchMax = 512
 	// Access 侧用较小块交给 leader，leader 仍会将多块展平到
-	// 64 条。避免 40+30 这类不可拆的 Access 批让前一条 Raft
-	// 日志只装 40 条，又不降低最终的共识合批上限。
+	// sessionProposalBatchMax 条。避免 40+30 这类不可拆的 Access 批让前
+	// 一条 Raft 日志只装 40 条，又不降低最终的共识合批上限。
+	// 它同时是「一个请求自己那一段」的位宽上限，必须不超过 64。
 	sessionAccessProposalBatchMax = 16
-	// 条数上限之外再限编码前大小，避免 64 个拥有大量订阅的
-	// 会话合成一条超过 dragonboat 提案上限的命令。单条超过时仍
-	// 单独提案，让下层给出权威的大小错误。
+	// 条数上限之外再限编码前大小，避免一批拥有大量订阅的会话合成一条
+	// 超过 dragonboat 提案上限的命令。单条超过时仍单独提案，让下层给出
+	// 权威的大小错误。条数上限放宽到 512 之后这一条是实际生效的那个
+	// 约束：订阅多的会话在装满 512 条之前就先撞到 1 MiB。
 	sessionProposalBatchMaxBytes = 1 << 20
 	sessionProposalBatchDelay    = time.Millisecond
 	// 每个 session shard 允许少量提案同时交给 Dragonboat。此前 Access
 	// 合批器必须等一轮 SyncPropose 完整返回才会派下一批，8 个 shard 因而
 	// 最多只有 8 个物理提案在途，重连风暴即使已经合批仍会在用户态排队。
 	// 有界 pipeline 让共识库合并 WAL/传输，同时避免失去多数派时无界堆积。
-	sessionProposalConcurrentMax = 8
+	//
+	// 它同时是 leader 二次合批的**供给**上限：取 8 时 leader 平均只能攒到
+	// 137 条/日志，提到 32 之后是 230 至 245 条，三节点 4 分片从 7,660
+	// 升到 10,273 条/秒（CLU-193）。**不要再往上取**：实测 96 更快
+	// （10,855），但在途乘分片数必须留在对端连接池缓存的连接数
+	// （peerPoolPerNode = 256，按对端摊）之内——8 分片下 96 正好让每个
+	// 对端约 256 条并发转发，超出的部分退回「每条转发一次 TLS 握手」，
+	// 也就是 CLU-120 那个形状。
+	sessionProposalConcurrentMax = 32
 	// pipeline 已有提案在途时，小尾批稍等一会儿，避免把持续到达的请求
 	// 打散成大量单项日志；满批不受这个等待影响。
 	sessionProposalConcurrentMin = 8
@@ -327,6 +354,13 @@ const (
 	sessionProposalRequestCacheMax = 4096
 	sessionProposalSliceCacheMax   = 4096
 )
+
+// SessionProposalBatchMax 导出给装配处（`MergeMaxItems`）。
+//
+// leader 侧实际展平到多少条，必须与状态机侧的校验上限是同一个数：写成两个
+// 字面量时，某一次只调了一边的后果是 leader 提出一条状态机会拒绝的日志，
+// 而那条日志已经被多数派提交了——apply 报错等于节点停下来。
+const SessionProposalBatchMax = sessionProposalBatchMax
 
 func encodeSessionCmd(c *sessionCmd) ([]byte, error) {
 	c.V = sessionCmdVersion
@@ -498,6 +532,10 @@ type SessionEntry struct {
 	Index  uint64
 	Data   []byte
 	Result uint64
+	// ResultBits 是批命令按条的 stale 位图（一位一条），用于一条日志里
+	// 装了超过 64 条命令的合并提案（CLU-193）。Result 那个 uint64 只装
+	// 得下前 64 条，而合批宽度正是这一栏吞吐的主要杠杆。
+	ResultBits []byte
 }
 
 // ApplySessionBatch 在**一个**写事务里应用一批已提交的会话命令（CLU-125）。
@@ -545,9 +583,25 @@ func (s *SessionStore) ApplySessionBatch(shard uint64, ents []SessionEntry,
 		// 结果每次都从头填：sync=false 的事务体可能被重跑（bbolt 的
 		// Batch 语义），累积就会串味。
 		for i := range ents {
-			ents[i].Result = 0
+			ents[i].Result, ents[i].ResultBits = 0, nil
 		}
 		for i := range ents {
+			// 批命令走位图那条路径：一条日志可以装超过 64 条，而提案方
+			// 要的是按条的判定（CLU-193）。
+			if cmds[i].Op == sessionOpBatch {
+				bits, err := s.applyBatchCmdBits(tx, cmds[i], owns)
+				if err != nil {
+					return err
+				}
+				// Result 也要填：一条日志只装了一个 Access 批时，
+				// cluster 层交回的是这个 uint64 而不是位图（那条路径
+				// 还要给 Expire 回条数，所以不能改成按位切）。只填
+				// 位图会让最常见的那条路径上的围栏判定静默变成
+				// “没被拦”，而那是一次覆盖。
+				ents[i].Result = resultBitsToUint64(bits, len(cmds[i].Batch))
+				ents[i].ResultBits = bits
+				continue
+			}
 			res, err := s.applyOneLocked(tx, cmds[i], owns)
 			if err != nil {
 				return err
@@ -594,32 +648,60 @@ func (s *SessionStore) applyOneLocked(tx Tx, cmd *sessionCmd,
 	return res, nil
 }
 
-// applyBatchCmd 在同一个状态机事务里顺序应用子命令。
-// 返回值的第 i 位表示第 i 条被 epoch 围栏拒绝。
-func (s *SessionStore) applyBatchCmd(tx Tx, cmd *sessionCmd,
+// applyBatchCmdBits 在同一个状态机事务里顺序应用子命令。
+// 返回位图的第 i 位表示第 i 条被 epoch 围栏拒绝。
+func (s *SessionStore) applyBatchCmdBits(tx Tx, cmd *sessionCmd,
 	owns func(string) bool,
-) (uint64, error) {
+) ([]byte, error) {
 	if len(cmd.Batch) == 0 || len(cmd.Batch) > sessionProposalBatchMax {
-		return 0, fmt.Errorf("store: 会话批命令条数 %d 超出范围", len(cmd.Batch))
+		return nil, fmt.Errorf("store: 会话批命令条数 %d 超出范围", len(cmd.Batch))
 	}
-	var result uint64
+	bits := make([]byte, (len(cmd.Batch)+7)/8)
 	for i := range cmd.Batch {
 		sub, err := decodeSessionCmd(cmd.Batch[i])
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if sub.Op == sessionOpBatch || sub.Op == sessionOpExpire {
-			return 0, fmt.Errorf("store: 会话批命令不允许子操作 %d", sub.Op)
+			return nil, fmt.Errorf("store: 会话批命令不允许子操作 %d", sub.Op)
 		}
 		v, err := s.applyOneLocked(tx, sub, owns)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if v == sessionResStale {
+			bits[i/8] |= 1 << uint(i%8)
+		}
+	}
+	return bits, nil
+}
+
+// resultBitsToUint64 把前 min(n, 64) 位判定位折进一个 uint64。
+func resultBitsToUint64(bits []byte, n int) uint64 {
+	var result uint64
+	for i := 0; i < n && i < 64; i++ {
+		if i/8 < len(bits) && bits[i/8]&(1<<uint(i%8)) != 0 {
 			result |= uint64(1) << uint(i)
 		}
 	}
-	return result, nil
+	return result
+}
+
+// applyBatchCmd 是只能回一个 uint64 的那条路径（逐条 apply 与用例）。
+//
+// 超过 64 条时**报错而不是截断**：丢掉的那几位会被读成“这条没被围栏
+// 拦”，而那正是契约 01 要拦的覆盖。整批 apply 走 applyBatchCmdBits。
+func (s *SessionStore) applyBatchCmd(tx Tx, cmd *sessionCmd,
+	owns func(string) bool,
+) (uint64, error) {
+	if len(cmd.Batch) > 64 {
+		return 0, fmt.Errorf("store: 逐条 apply 不支持 %d 条的批命令", len(cmd.Batch))
+	}
+	bits, err := s.applyBatchCmdBits(tx, cmd, owns)
+	if err != nil {
+		return 0, err
+	}
+	return resultBitsToUint64(bits, len(cmd.Batch)), nil
 }
 
 // sessionCmdOps 把一条命令翻成一组写入，不自己落盘。

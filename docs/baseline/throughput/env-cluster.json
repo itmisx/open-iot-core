@@ -4,7 +4,7 @@
   "cores": 11,
   "memoryBytes": 38654705664,
   "go": "go version go1.24.4 darwin/arm64",
-  "commit": "fa3888d",
+  "commit": "2564f42",
   "ulimitNofile": "1048576",
-  "loadAvg1m": "3.32"
+  "loadAvg1m": "4.38"
 }

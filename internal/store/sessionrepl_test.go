@@ -1044,3 +1044,106 @@ func TestSessionShardSnapshotPropagatesWriterFailure(t *testing.T) {
 		t.Fatal("snapshot writer failure was silently accepted")
 	}
 }
+
+// TestApplySessionBatchBitsBeyond64 钉 CLU-193 的宽度判据：一条日志里
+// 装超过 64 条命令时，**第 64 条之后的围栏判定不得丢**。
+//
+// 丢位的后果不是报错而是一次静默覆盖：提案方读到"这条没被拦"，于是把
+// 一个已被接管的旧会话的状态当成写成功了，而那正是契约 01 要拦的那件事。
+// 判据取在第 64 位之后（旧的 uint64 位图恰好在这里溢出成 0）。
+func TestApplySessionBatchBitsBeyond64(t *testing.T) {
+	st := NewSessionStore(NewMemKV())
+	const total = 100
+	// 先让每隔一条的那些 clientId 在盘上持有更高的 epoch：它们随后那条
+	// 低 epoch 的写入必须被围栏判成 stale。
+	stale := map[int]bool{}
+	subs := make([]json.RawMessage, 0, total)
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("dev-%03d", i)
+		epoch := cluster.Epoch(1)
+		if i%3 == 0 {
+			stale[i] = true
+			if _, err := st.ApplySessionCmd(1, uint64(i+1),
+				mustEncodeSessionCmd(t, &sessionCmd{
+					Op: sessionOpSave, ClientID: id,
+					State: replState(id, cluster.Epoch(9)),
+				}), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		subs = append(subs, mustEncodeSessionCmd(t, &sessionCmd{
+			Op: sessionOpSave, ClientID: id, State: replState(id, epoch),
+		}))
+	}
+	data := mustEncodeSessionCmd(t, &sessionCmd{Op: sessionOpBatch, Batch: subs})
+	ents := []SessionEntry{{Index: 100, Data: data}}
+	if err := st.ApplySessionBatch(1, ents, nil); err != nil {
+		t.Fatalf("整批 apply: %v", err)
+	}
+	bits := ents[0].ResultBits
+	if want := (total + 7) / 8; len(bits) != want {
+		t.Fatalf("判定位图 %d 字节，期望 %d（一位一条）", len(bits), want)
+	}
+	beyond := 0
+	for i := 0; i < total; i++ {
+		got := bits[i/8]&(1<<uint(i%8)) != 0
+		if got != stale[i] {
+			t.Fatalf("第 %d 条的 stale 位 = %v，期望 %v", i, got, stale[i])
+		}
+		if got && i >= 64 {
+			beyond++
+		}
+	}
+	if beyond == 0 {
+		t.Fatal("用例没有覆盖到第 64 位之后，证明不了宽位图")
+	}
+}
+
+// TestApplySessionBatchFillsBothResultForms 钉 CLU-193 的另一半：批命令必须
+// **同时**填 Result 与 ResultBits。
+//
+// 一条 Raft 日志只装了一个 Access 批时（最常见的那种），cluster 层交回提案方
+// 的是那个 uint64 而不是位图——那条路径还要给 Expire 回条数，所以不能改成
+// 按位切。只填位图的后果是围栏判定在最常见的路径上静默变成“没被拦”，
+// 也就是一次覆盖。
+//
+// 这条用例必须走 ApplySessionBatch：用例里的假提案方走的是逐条的
+// ApplySessionCmd，而生产走整批那条，所以缺口在逐条路径上看不见。
+func TestApplySessionBatchFillsBothResultForms(t *testing.T) {
+	st := NewSessionStore(NewMemKV())
+	// dev-b 先在盘上持有更高的 epoch，它随后那条低 epoch 的写必须被拦。
+	if _, err := st.ApplySessionCmd(1, 1, mustEncodeSessionCmd(t, &sessionCmd{
+		Op: sessionOpSave, ClientID: "dev-b",
+		State: replState("dev-b", cluster.Epoch(9)),
+	}), nil); err != nil {
+		t.Fatal(err)
+	}
+	subs := []json.RawMessage{
+		mustEncodeSessionCmd(t, &sessionCmd{
+			Op: sessionOpSave, ClientID: "dev-a", State: replState("dev-a", 1),
+		}),
+		mustEncodeSessionCmd(t, &sessionCmd{
+			Op: sessionOpSave, ClientID: "dev-b", State: replState("dev-b", 1),
+		}),
+	}
+	ents := []SessionEntry{{Index: 7, Data: mustEncodeSessionCmd(t,
+		&sessionCmd{Op: sessionOpBatch, Batch: subs})}}
+	if err := st.ApplySessionBatch(1, ents, nil); err != nil {
+		t.Fatalf("整批 apply: %v", err)
+	}
+	if ents[0].Result != 0b10 {
+		t.Fatalf("Result = %02b，期望 10（只有第 1 条被围栏拦）", ents[0].Result)
+	}
+	if len(ents[0].ResultBits) != 1 || ents[0].ResultBits[0] != 0b10 {
+		t.Fatalf("ResultBits = %v，期望 [2]", ents[0].ResultBits)
+	}
+}
+
+func mustEncodeSessionCmd(t *testing.T, cmd *sessionCmd) []byte {
+	t.Helper()
+	data, err := encodeSessionCmd(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}

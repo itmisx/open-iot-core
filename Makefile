@@ -186,6 +186,7 @@ bench-e2e:
 bench-verify-test:
 	@bash tests/bench/verify-million-density-test.sh
 	@bash tests/bench/shadow-production-verify-test.sh
+	@bash tests/bench/connect-production-verify-test.sh
 	@bash tests/bench/shadow-failover-verify-test.sh
 	@bash tests/bench/shadow-host-evidence-verify-test.sh
 	@bash tests/bench/shadow-recovery-verify-test.sh

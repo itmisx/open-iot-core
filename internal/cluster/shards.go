@@ -98,15 +98,20 @@ type ShardOptions struct {
 	// 提案再次合并。返回值 widths 描述合并结果位图中每个输入占几位；
 	// consumed 是实际消费的输入前缀。nil 表示关闭 leader 侧二级合批。
 	MergeProposals func(items [][]byte) (merged []byte, widths []uint8, consumed int, err error)
-	// MergeMaxItems 是一次二级合批最多查看的输入数。0保持会话历史值64。
-	// 上限256用于不依赖uint64返回位图的状态机（例如影子）；会话必须保持64。
+	// MergeMaxItems 是一次二级合批最多查看的输入数。0 取默认值 64。
+	//
+	// widths 的总和可以超过 64：按条的判定位走状态机的
+	// ShardEntry.ResultBits（CLU-193）。**单个输入自己那一段仍必须不超过
+	// 64 位**，因为跨节点回传的是切好的 uint64。加宽是这一类状态机吞吐
+	// 的主要杠杆：天花板是物理日志条数也就是 fsync 次数，而不是单条
+	// 日志的大小。
 	MergeMaxItems int
-	// MergeIgnoresResult 表示合并提案的调用方不读取状态机uint64返回值。
-	// 只有这类状态机才允许widths总和超过64；每个请求仍分别等待同一条
-	// Raft日志完成，错误也逐请求返回。
+	// MergeIgnoresResult 表示合并提案的调用方不读取状态机的返回值
+	// （例如影子，它按 pending ID 在本地交付结果）。这类状态机连
+	// ResultBits 都不必填；每个请求仍分别等待同一条 Raft 日志完成，
+	// 错误也逐请求返回。
 	MergeIgnoresResult bool
-
-	ApplyTimeout time.Duration
+	ApplyTimeout       time.Duration
 }
 
 // ShardGroup 是一组会话分片。
@@ -210,7 +215,7 @@ const (
 	leaderProposalMergeDelay      = time.Millisecond
 	leaderProposalRequestCacheMax = 4096
 	leaderProposalMergeDefaultMax = 64
-	leaderProposalMergeHardMax    = 256
+	leaderProposalMergeHardMax    = 1024
 )
 
 // shardStats 是提案侧的观测（OBS-148）。
@@ -227,6 +232,8 @@ type shardStats struct {
 	remote            atomic.Uint64
 	unknown           atomic.Uint64
 	fail              atomic.Uint64
+	safeRerouteLocal  atomic.Uint64
+	safeRerouteRemote atomic.Uint64
 	raft              atomic.Uint64
 	readLogical       atomic.Uint64
 	readBatches       atomic.Uint64
@@ -279,6 +286,8 @@ type ShardStats struct {
 	ProposeRemote            uint64
 	ProposeUnknown           uint64
 	ProposeErrors            uint64
+	SafeRerouteLocal         uint64
+	SafeRerouteRemote        uint64
 	RaftProposals            uint64
 	SessionReadLogical       uint64
 	SessionReadBatches       uint64
@@ -342,6 +351,8 @@ func (s *ShardGroup) Stats() ShardStats {
 		ProposeRemote:            s.stats.remote.Load(),
 		ProposeUnknown:           s.stats.unknown.Load(),
 		ProposeErrors:            s.stats.fail.Load(),
+		SafeRerouteLocal:         s.stats.safeRerouteLocal.Load(),
+		SafeRerouteRemote:        s.stats.safeRerouteRemote.Load(),
 		RaftProposals:            s.stats.raft.Load(),
 		SessionReadLogical:       s.stats.readLogical.Load(),
 		SessionReadBatches:       s.stats.readBatches.Load(),
@@ -863,6 +874,15 @@ func (s *ShardGroup) ProposeShard(shard uint64, data []byte) (uint64, error) {
 	case leader == s.replica:
 		s.stats.local.Add(1)
 		value, err = s.proposeLocalLeader(shard, data)
+		if errors.Is(err, ErrRequestUnsent) {
+			// 入队时本节点还是leader，等leader合批器真正准备提交时可能
+			// 已经完成转移。提交前复查在调用Dragonboat之前再做一次；
+			// 这条错误因此能证明请求尚未发送，可以安全等权威视图稳定后
+			// 重路由。普通ErrNotLeader/超时仍可能已经提交，绝不重试。
+			// 等待侧对“本副本再次当选”另有出口，见 proposeAfterLeaderChange。
+			s.stats.safeRerouteLocal.Add(1)
+			value, err = s.proposeAfterLeaderChange(shard, leader, data)
+		}
 	default:
 		s.stats.remote.Add(1)
 		to := s.replicaNode[leader]
@@ -877,6 +897,7 @@ func (s *ShardGroup) ProposeShard(shard uint64, data []byte) (uint64, error) {
 				// 等满10秒 apply timeout 才释放，造成整条 shard 断流。
 				// 不能在模糊的 ErrNoQuorum 上走这里，否则应答丢失会把
 				// 同一条命令应用两遍。
+				s.stats.safeRerouteRemote.Add(1)
 				value, err = s.proposeAfterLeaderChange(shard, leader, data)
 			}
 		}
@@ -919,6 +940,12 @@ func (s *ShardGroup) proposePlaced(shard uint64, data []byte) (uint64, error) {
 // proposeAfterLeaderChange 等本地 NodeHost 的权威 leader 视图离开 oldLeader，
 // 再把一条“已证明尚未发送”的命令交给新 leader。故障窗口才走这条冷路径，
 // 10ms 轮询不会进入正常写入热路径，也不会为每条成功更新增加 timer。
+//
+// oldLeader 传 0 表示“还没有权威视图”，等到任何一个 leader 出现即可。
+// 传本副本号则另有一条出口：**换届的结果完全可能是本副本再次当选**
+// （复查失败最常见的形态是“此刻无 leader”，而不是“已经换人”）。
+// 只认“离开 oldLeader”会在那一支上等一个不会发生的变化，白白挂满
+// applyTimeout（默认 10 秒）才失败——比不重路由的立刻失败更糟。
 func (s *ShardGroup) proposeAfterLeaderChange(shard, oldLeader uint64, data []byte) (uint64, error) {
 	deadline := time.NewTimer(s.applyTO)
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -926,7 +953,8 @@ func (s *ShardGroup) proposeAfterLeaderChange(shard, oldLeader uint64, data []by
 	defer ticker.Stop()
 	for {
 		leader, _, ready, err := s.nh.GetLeaderID(shard)
-		if err == nil && ready && leader != 0 && leader != oldLeader {
+		if err == nil && ready && leader != 0 &&
+			(leader != oldLeader || leader == s.replica) {
 			s.rememberLeader(shard, leader)
 			if leader == s.replica {
 				return s.proposeLocalLeader(shard, data)
@@ -956,19 +984,59 @@ func (s *ShardGroup) proposeAfterLeaderChange(shard, oldLeader uint64, data []by
 	}
 }
 
+// widthsFitUint64 判断每个请求自己那一段是否装得进 uint64。
+func widthsFitUint64(widths []uint8) bool {
+	for _, width := range widths {
+		if width > 64 {
+			return false
+		}
+	}
+	return true
+}
+
+// sliceResultBits 取判定位里 [offset, offset+width) 这一段，低位对齐返回。
+//
+// bits 非空时以它为准（合并提案的权威位图，不受 64 条限制）；为空时退回
+// 状态机那个 uint64，这样不填 ResultBits 的状态机行为不变。
+func sliceResultBits(value uint64, bits []byte, offset, width uint) uint64 {
+	if width == 0 {
+		return 0
+	}
+	if len(bits) == 0 {
+		if width >= 64 {
+			return value
+		}
+		return (value >> offset) & ((uint64(1) << width) - 1)
+	}
+	var part uint64
+	for i := uint(0); i < width && i < 64; i++ {
+		at := offset + i
+		if int(at/8) >= len(bits) {
+			break
+		}
+		if bits[at/8]&(1<<(at%8)) != 0 {
+			part |= uint64(1) << i
+		}
+	}
+	return part
+}
+
 // syncPropose 在本 NodeHost 上提交并统一 Dragonboat 的就绪/超时错误。
-func (s *ShardGroup) syncPropose(shard uint64, data []byte) (uint64, error) {
+//
+// 第二个返回值是状态机的**按条**判定位图，只有合并提案用得上
+// （CLU-193）；不填它的状态机返回 nil。
+func (s *ShardGroup) syncPropose(shard uint64, data []byte) (uint64, []byte, error) {
 	s.stats.raft.Add(1)
 	ctx, cancel := context.WithTimeout(context.Background(), s.applyTO)
 	defer cancel()
 	res, err := s.nh.SyncPropose(ctx, s.nh.GetNoOPSession(shard), data)
 	if errors.Is(err, dragonboat.ErrShardNotReady) || errors.Is(err, dragonboat.ErrTimeout) {
-		return 0, ErrNotLeader
+		return 0, nil, ErrNotLeader
 	}
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return res.Value, nil
+	return res.Value, res.Data, nil
 }
 
 // proposeLocalLeader 是跨节点路由的接收端。它不再路由，且只在
@@ -976,10 +1044,15 @@ func (s *ShardGroup) syncPropose(shard uint64, data []byte) (uint64, error) {
 func (s *ShardGroup) proposeLocalLeader(shard uint64, data []byte) (uint64, error) {
 	leader, _, ok, err := s.nh.GetLeaderID(shard)
 	if err != nil || !ok || leader != s.replica {
-		return 0, ErrNotLeader
+		// 与合批出队时的复查同一个判据：还没进 SyncPropose，这条命令
+		// 可以严格证明没有被任何日志接受。转发到达时 leader 已经换人
+		// 是换届期最常见的一种，压成 ErrNotLeader 会和“提交了但应答
+		// 丢了”混在一起，于是发起方只能整批拒掉 CONNECT。
+		return 0, ErrRequestUnsent
 	}
 	if s.merge == nil {
-		return s.syncPropose(shard, data)
+		value, _, err := s.syncPropose(shard, data)
+		return value, err
 	}
 	s.mergeMu.Lock()
 	if s.mergeStop {
@@ -1073,8 +1146,11 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 		if logical == 0 {
 			logical = 1
 		}
-		if !s.mergeNoValue && logical > 64 {
-			err := errors.New("cluster: 需要返回位图的合并提案超过64条")
+		// 单个请求自己那一段仍必须装得进 uint64：跨节点回传的就是这个
+		// 值（一个 Access 批最多 16 条，所以正常不会触发）。整条日志的
+		// 总位数可以超过 64——那一段由状态机的 ResultBits 带回。
+		if !s.mergeNoValue && !widthsFitUint64(widths) {
+			err := errors.New("cluster: 单个合并请求的判定位超过64条")
 			for _, req := range batch {
 				req.done <- leaderProposalResult{err: err}
 			}
@@ -1094,12 +1170,12 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 			s.stats.mergeBlocked.Add(1)
 		}
 		// 单项不改写，保留状态机完整的uint64返回值；多项会话提案按
-		// widths拆位图。影子通过pending ID交付结果，不读这个位图，因而可
-		// 安全超过64条；显式配置mergeNoValue后统一回0。
+		// widths拆判定位。影子通过pending ID交付结果，不读这些位，
+		// 显式配置mergeNoValue后统一回0。
 		if consumed == 1 {
 			inFlight := s.stats.mergeInFlight.Add(1)
 			raiseAtomicPeak(&s.stats.mergePeakInFlight, inFlight)
-			value, err := s.syncProposeIfLeader(shard, batch[0].data)
+			value, _, err := s.syncProposeIfLeader(shard, batch[0].data)
 			s.stats.mergeInFlight.Add(-1)
 			batch[0].done <- leaderProposalResult{value: value, err: err}
 			clear(items)
@@ -1108,7 +1184,7 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 		}
 		inFlight := s.stats.mergeInFlight.Add(1)
 		raiseAtomicPeak(&s.stats.mergePeakInFlight, inFlight)
-		value, err := s.syncProposeIfLeader(shard, merged)
+		value, bits, err := s.syncProposeIfLeader(shard, merged)
 		s.stats.mergeInFlight.Add(-1)
 		if s.mergeNoValue {
 			for _, req := range batch {
@@ -1118,15 +1194,17 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 			clear(batch)
 			continue
 		}
+		// 超过 64 位的那一段只能来自 ResultBits。拿不到就**报错**而不是
+		// 当作“都没被围栏拦”：那样会把一次围栏静默变成一次覆盖，而
+		// 覆盖是契约 01 要拦的那件事（CLU-193）。
+		if logical > 64 && err == nil && uint64(len(bits))*8 < logical {
+			err = fmt.Errorf("cluster: 合并提案 %d 条但状态机只回了 %d 字节判定位",
+				logical, len(bits))
+		}
 		offset := uint(0)
 		for i, req := range batch {
 			width := uint(widths[i])
-			var part uint64
-			if width == 64 {
-				part = value
-			} else if width > 0 {
-				part = (value >> offset) & ((uint64(1) << width) - 1)
-			}
+			part := sliceResultBits(value, bits, offset, width)
 			req.done <- leaderProposalResult{value: part, err: err}
 			offset += width
 		}
@@ -1135,10 +1213,13 @@ func (s *ShardGroup) runLeaderProposalLane(shard uint64, lane *leaderProposalLan
 	}
 }
 
-func (s *ShardGroup) syncProposeIfLeader(shard uint64, data []byte) (uint64, error) {
+func (s *ShardGroup) syncProposeIfLeader(shard uint64, data []byte) (uint64, []byte, error) {
 	leader, _, ok, err := s.nh.GetLeaderID(shard)
 	if err != nil || !ok || leader != s.replica {
-		return 0, ErrNotLeader
+		// 尚未进入SyncPropose，调用方可明确知道没有任何日志被接受。
+		// 与SyncPropose返回的超时/NotLeader分开，否则上层要么丢掉一条
+		// 本可安全重路由的CONNECT，要么冒险重放一条可能已提交的写。
+		return 0, nil, ErrRequestUnsent
 	}
 	return s.syncPropose(shard, data)
 }

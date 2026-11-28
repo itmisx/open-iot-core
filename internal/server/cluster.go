@@ -708,6 +708,7 @@ func (s *Server) startSessionShards(replicas map[cluster.NodeID]uint64) error {
 			}
 			for i := range ents {
 				ents[i].Result = batch[i].Result
+				ents[i].ResultBits = batch[i].ResultBits
 			}
 			return nil
 		},
@@ -722,6 +723,15 @@ func (s *Server) startSessionShards(replicas map[cluster.NodeID]uint64) error {
 			return local.ReadReplicaSnapshot(clientID)
 		},
 		MergeProposals: store.MergeSessionProposals,
+		// leader 二次合批的宽度上限（CLU-193）。
+		//
+		// 这一栏的天花板是**物理日志条数**，不是单条日志的大小：同机多
+		// 进程上一条日志至少要 leader 的 WAL、多数派的 WAL 与各副本
+		// apply 侧各一次 fsync，而一条命令只有几百字节。64 条时实测三
+		// 节点 4 分片 4,376 条/秒、12,000 条逻辑命令用掉 204 条物理日志
+		// 且其中 135 条是被上限截断的；放到 512 条后同一配置是 10,273
+		// 条/秒（3 轮中位数），物理日志降到 49 至 52 条。
+		MergeMaxItems: store.SessionProposalBatchMax,
 		// ApplyTimeout 留 0 取分片层的默认值（10 秒），与元数据组一致：
 		// 两者都没有单独的配置项，超时只在"分片还没选出 leader"时触发。
 	})

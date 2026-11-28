@@ -238,21 +238,29 @@ path. The derivation is in `docs/prd/02-architecture.md`.
 
 Produced by a single command on one **Apple M3 Pro (11 cores / 36 GiB / macOS 26.3 /
 go1.24.4)**; the script, the per-run raw data and the environment record are all in the
-repository (2026-11-22):
+repository (re-measured 2026-11-28). The message-plane rows, non-persistent connects
+and memory per connection come from one command:
 
 ```bash
 RESULTS=docs/baseline/throughput make bench-e2e
 ```
 
+**The persistent-connect and shadow rows go through consensus and need enough
+concurrency to be measured at all**, so they come from two attribution scripts driven
+along a concurrency ladder (`tests/bench/connect-stage-ab.sh`,
+`tests/bench/shadow-attribution.sh`; three runs each, median, a fresh cluster per
+invocation). The top rungs of the zero-loss ceilings also need rungs beyond the default
+ladder — every rung names its command and raw data on the results page.
+
 | Scenario | Single node (whole machine) | Three-node cluster (one machine, **total**) |
 | --- | --- | --- |
-| **One-to-one QoS 0, zero-loss ceiling** | **150,000 msg/s**, p50 0.37 ms, p99 1.30 ms | same node **150,000**, p50 0.21 ms, p99 1.30 ms<br>cross-node **120,000**, p50 0.76 ms, p99 2.12 ms |
-| **One-to-one QoS 1** (16 in flight) | 100k offered → **99,968 msg/s**, zero loss, p50 15.68 ms | cross-node, 40k offered → **40,000**, zero loss, p50 0.51 ms |
-| **Fan-out** (1 → 1000 subscribers × 100 msg/s) | **99,998 msg/s**, p50 2.02 ms, p99 6.84 ms | cross-node **99,997**, p50 2.46 ms, p99 7.18 ms |
-| **Connects, non-persistent session** (concurrency 256) | **33,321 conn/s**, 12,000 held, p50 5.11 ms | **23,540 conn/s**, 6,000 held, p50 10.25 ms |
-| **Connects, persistent session** | same as above (standalone skips consensus) | **3,227 conn/s** (concurrency 2048, 6,000 held), p50 497 ms, p99 991 ms |
-| **Memory per connection** | **2,306 bytes** (heap growth ÷ connections, at 12,000 held) | — |
-| **Shadow updates** (through the replicated log) | **14,314 updates/s** (concurrency 800), p50 53.1 ms, p99 95.4 ms | **15,282 updates/s** (concurrency 3200, 4 shards), p50 198.3 ms, p99 293.0 ms |
+| **One-to-one QoS 0, zero-loss ceiling** | **225,005 msg/s**, p50 1.30 ms, p99 6.84 ms | same node **150,004** (lower bound), p50 0.14 ms, p99 1.30 ms<br>cross-node **130,002** (lower bound), p50 0.80 ms, p99 2.46 ms |
+| **One-to-one QoS 1** (16 in flight) | 100k offered → **99,997 msg/s**, zero loss, p50 0.38 ms, p99 15.68 ms | cross-node, 40k offered → **40,000**, zero loss, p50 0.51 ms |
+| **Fan-out** (1 → 1000 subscribers × 100 msg/s) | **100,007 msg/s**, p50 1.92 ms, p99 6.84 ms | cross-node **100,000**, p50 2.46 ms, p99 7.18 ms |
+| **Connects, non-persistent session** (concurrency 256) | **24,911 conn/s**, 12,000 held, p50 7.0 ms | **23,185 conn/s**, 6,000 held, p50 10.4 ms |
+| **Connects, persistent session** | same as above (standalone skips consensus) | **10,461 conn/s** (concurrency 2048, 6,000 held, 4 shards), p50 153–159 ms, p99 255–309 ms |
+| **Memory per connection** | **2,315 bytes** (heap growth ÷ connections, at 12,000 held) | — |
+| **Shadow updates** (through the replicated log) | **13,392 updates/s** (concurrency 800), p50 55.8 ms, p99 100.2 ms | **16,652 updates/s** (concurrency 3200, 4 shards), p50 179.9 ms, p99 265.7 ms |
 
 **Four preconditions**: the load generator and the server share one machine; traffic goes
 to the plaintext endpoint (no TLS handshake); authentication is `insecure-none` while
@@ -263,17 +271,28 @@ Reading the table:
 
 - **A zero-loss ceiling is measured with a rate ladder** — pressure is raised rung by rung
   until delivery stops keeping up, so it is a ceiling rather than "whatever we offered".
-  The cross-node 120k is a **lower bound**: no loss had appeared yet at that rung.
-- **The cluster column is a three-node total**; don't divide it by the single-node column.
-  Same-node and single-node are both 150k, which means this row is capped by **the
-  machine**, not by the node.
-- **The connect rows are medians of 3 runs**: single-node range 21,956–33,738, cluster
-  non-persistent 22,828–24,249, cluster persistent 2,976–3,270. The first two have a wide
-  run-to-run spread, so a single run is not comparable.
+  Both cluster figures are **lower bounds**: every higher rung had subscribers
+  disconnected (the broker drops slow subscribers by design when the outbound queue
+  fills), and a rung with errors measures how fast subscribers die, not throughput, so it
+  is not published.
+- **The cluster column is a three-node total**; don't divide it by the single-node column,
+  and don't subtract 150k from 225k to get "the cost of clustering": same-node traffic
+  takes the same path as single-node (replication is not on the message hot path), and it
+  stopped at 150k only because that is as far as this run pushed it. This row is capped by
+  **the machine**, not by the node.
+- **The connect rows are medians of 3 runs**: single-node range 24,013–35,913, cluster
+  non-persistent 21,951–23,202, cluster persistent 10,380–10,619. The first two have a wide
+  run-to-run spread, so a single run is not comparable — this round's single-node median is
+  below the previous round's 33,321 while the two ranges overlap heavily, so it is not a
+  change.
+- **These numbers are extremely sensitive to whether the machine is idle.** With the same
+  code at `loadAvg1m` 4.04, even the 100k base rung lost 9% and connects fell to 22,116/s;
+  this round was measured at 1.65. When two rounds disagree, the first field to check is
+  `loadAvg1m` in `env.json`, not the code.
 - **The two rows that go through consensus need enough concurrency to be measured at all.**
   Both persistent connects and shadow updates rise with concurrency: persistent connects
-  reach only ~1,156/s at concurrency 256, 1,922 at 512, and 3,227 at 2048 — **a figure
-  taken at low concurrency is capped by the load generator, not by the server**. The
+  reach only ~1,156/s at concurrency 256, 1,922 at 512, and above 10,000/s at 2048 — **a
+  figure taken at low concurrency is capped by the load generator, not by the server**. The
   concurrency used is stated in parentheses for both rows.
 - **The shadow row is higher on three nodes than on one**, so don't read it as "a
   cluster is always slower". It also needs enough concurrency: a single node tops out
@@ -281,7 +300,8 @@ Reading the table:
   with 4 shards top out at concurrency 3200 (6400 is lower). Cluster deployments must
   enable `shadow_shards` — the compose and k8s manifests under `deploy/cluster` already
   set 4. Without it, shadow writes go through the single metadata log, whose high point
-  on this machine is 337 updates/s. Control-plane writes (shadow, thing creation,
+  on this machine is 337 updates/s (measured 2026-11-23; that rung was not re-measured
+  this round). Control-plane writes (shadow, thing creation,
   certificate issuance) go through the replicated log; the device data plane does not.
 
 Every ladder rung, the raw JSONL and the measurement protocol are in

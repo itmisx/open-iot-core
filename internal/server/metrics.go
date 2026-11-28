@@ -484,6 +484,26 @@ func (a *adminServer) collectSessionShards(e *metrics.Encoder, node metrics.Labe
 	e.Help(metricPrefix+"session_shard_count", "会话分片数（真实 raft 日志条数）",
 		metrics.TypeGauge)
 	e.GaugeInt(metricPrefix+"session_shard_count", int64(a.s.shards.ShardCount()), node)
+	e.Help(metricPrefix+"session_shard_ready",
+		"本节点承载的会话分片是否已经识别 leader", metrics.TypeGauge)
+	e.Help(metricPrefix+"session_shard_is_leader",
+		"本节点是否为该会话分片的当前 leader", metrics.TypeGauge)
+	e.Help(metricPrefix+"session_shard_applied_index",
+		"本节点会话分片已持久化应用的 Raft 日志序号", metrics.TypeGauge)
+	for _, lead := range a.s.shards.LocalLeadership() {
+		shard := metrics.Label{Name: "shard", Value: strconv.FormatUint(lead.Shard, 10)}
+		ready, isLeader := int64(0), int64(0)
+		if lead.Ready {
+			ready = 1
+		}
+		if lead.IsLeader {
+			isLeader = 1
+		}
+		e.GaugeInt(metricPrefix+"session_shard_ready", ready, node, shard)
+		e.GaugeInt(metricPrefix+"session_shard_is_leader", isLeader, node, shard)
+		e.Gauge(metricPrefix+"session_shard_applied_index", float64(lead.AppliedIndex),
+			node, shard)
+	}
 
 	// 按 leader 位置分类的提案数。
 	//
@@ -504,6 +524,15 @@ func (a *adminServer) collectSessionShards(e *metrics.Encoder, node metrics.Labe
 	e.Help(metricPrefix+"session_proposal_errors_total",
 		"会话提案失败数（没有 leader、失去多数派或超时）", metrics.TypeCounter)
 	e.CounterUint(metricPrefix+"session_proposal_errors_total", st.ProposeErrors, node)
+	e.Help(metricPrefix+"session_proposal_safe_reroutes_total",
+		"leader 切换时可证明尚未发送并安全重路由的会话提案数", metrics.TypeCounter)
+	for _, m := range []struct {
+		source string
+		v      uint64
+	}{{"local", st.SafeRerouteLocal}, {"remote", st.SafeRerouteRemote}} {
+		e.CounterUint(metricPrefix+"session_proposal_safe_reroutes_total", m.v, node,
+			metrics.Label{Name: "source", Value: m.source})
+	}
 	e.Help(metricPrefix+"session_raft_proposals_total",
 		"实际提交给 Raft 的会话日志条数（二级合批后的物理提案数）", metrics.TypeCounter)
 	e.CounterUint(metricPrefix+"session_raft_proposals_total", st.RaftProposals, node)
