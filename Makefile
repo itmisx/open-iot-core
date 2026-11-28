@@ -119,7 +119,7 @@ cross:
 		echo "cross $$t: 通过"; \
 	done
 
-# TST-012：每次运行短时 fuzz；夜间长时 fuzz 见 fuzz-long
+# TST-012：每次运行短时 fuzz；长时 fuzz 见 fuzz-long（按需手动，不在 CI 里，TST-239）
 .PHONY: fuzz-short
 fuzz-short:
 	@$(GO) test $(PACKET_PKG) -run=XXX -fuzz=FuzzDecode -fuzztime=10s
@@ -138,6 +138,10 @@ fuzz-short:
 	@$(GO) test $(SHADOW_PKG) -run=XXX -fuzz=FuzzParseRequestNeverPanics -fuzztime=5s
 	@echo "fuzz-short: 通过"
 
+# fuzz-long 不在任何流水线里（TST-239）：它是 11 个目标 × FUZZTIME 串行，
+# FUZZTIME=5m 约 55 分钟。改动 internal/mqtt、internal/authz、internal/shadow
+# 之后手动跑一次；抓到的输入手工入库到对应包的 testdata/fuzz/，入库之后它就
+# 进了 fuzz-short 的重放集。
 .PHONY: fuzz-long
 fuzz-long:
 	@$(GO) test $(PACKET_PKG) -run=XXX -fuzz=FuzzDecode -fuzztime=$(FUZZTIME)

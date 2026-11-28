@@ -63,31 +63,19 @@ jobs:
       - name: 随机种子模拟
         run: make sim SIM_SEEDS=200 SIM_OPS=5000
 
-  # 夜间长时 fuzz：失败语料会作为构件保留，便于入库。
+  # 长时 fuzz 不在 CI 里（TST-239，2026-11-28 取代 TST-128）。
   #
-  # **只在定时任务里跑**（TST-128）。它原先在推 main 时也触发，而它是 11 个
-  # fuzz 目标 × FUZZTIME **串行**：FUZZTIME=5m 就是约 55 分钟，于是每次推 main
-  # 的 CI 都挂着一小时、占着一个 runner。门禁本身只要 5 分钟（gate 是另一个
-  # job，不被它挡），所以那一小时买到的不是更快的反馈，而是一条长期"运行中"
-  # 的记录——真要看 fuzz 结果的人看的是夜间那一轮。
-  fuzz-nightly:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          cache: true
-      - name: 长时 fuzz
-        run: make fuzz-long FUZZTIME=5m
-      - name: 保留失败语料
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-corpus
-          path: |
-            internal/mqtt/packet/testdata/fuzz/
-            internal/mqtt/topic/testdata/fuzz/
-            internal/authz/testdata/fuzz/
-            internal/shadow/testdata/fuzz/
+  # 它曾经是一个定时任务：11 个目标 × FUZZTIME **串行**，FUZZTIME=5m 就是约
+  # 55 分钟。去掉它的理由不是"fuzz 没用"，而是**那样跑它买不到东西**：
+  #
+  #   - fuzz 是搜索而不是检查，它的收益来自搜索时间累积；而 Go 的工作语料在
+  #     `$GOCACHE/fuzz` 里，CI 这边 `actions/setup-go` 的缓存按 go.sum 哈希命中、
+  #     命中就不回写，于是每晚都从仓库里那几份种子重新开始搜。代码没变、起点
+  #     没变，只有随机数变——一小时大半在重复摇同一把骰子。
+  #   - 挡合并与挡发布的是 gate（约 5 分钟），它本来就跑 `make fuzz-short`：
+  #     14 个目标、各 5–10 秒，而且**永久重放已入库的崩溃语料**，所以已知的坑
+  #     回不来。
+  #
+  # 要深搜时手动跑 `make fuzz-long FUZZTIME=5m`（解析器那几个包改动之后值得
+  # 跑一次）。新抓到的输入按 TST-239 手工入库到对应包的 `testdata/fuzz/`，
+  # 入库之后它就进了门禁的重放集。
