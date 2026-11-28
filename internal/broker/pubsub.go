@@ -59,13 +59,29 @@ func (c *conn) handleSubscribe(sp *packet.Subscribe) error {
 		}
 		granted = append(granted, sub)
 	}
+	// 装路由表必须在 SUBACK **之前**，而 retained 必须在它之后。
+	//
+	// 这两件事以前都排在 SUBACK 后面，而那是一处静默丢消息：`c.send` 只是
+	// 入队，真正的写出在写出池的工作协程上（writer.go），于是客户端可以先
+	// 看到 SUBACK，此刻 `recordSubscription` 还没跑、路由表里没有这条订阅。
+	// 窗口期内进来的发布按「没有匹配的订阅者」丢掉——不报错、不重投，发布
+	// 方与订阅方都观察不到。开发机上这个窗口是微秒级，CI 的 4 核共享 runner
+	// 加 `-race` 上不是：2026-11-27 与 11-28 的门禁分别红在
+	// TestOfflineQueueIsNotRedelivered 与 TestQoS0DoesNotTakeInflightQuota，
+	// 两条都是「期望收到 PUBLISH，读取失败: i/o timeout」。
+	//
+	// MQTT 的要求也是这个方向：SUBACK 一旦发出，匹配该过滤器的消息就必须
+	// 投递给这个订阅者。所以顺序是「先让订阅生效，再宣布它生效」。
+	//
+	// retained 仍在 SUBACK 之后下发（客户端须先知道订阅已被接受），而它与
+	// SUBACK 走同一条连接队列，所以线上顺序由入队顺序保证。
+	for _, sub := range granted {
+		c.recordSubscription(sub)
+	}
 	if err := c.send(ack); err != nil {
 		return err
 	}
-
-	// 先回 SUBACK 再下发 retained：客户端须先知道订阅已被接受。
 	for _, sub := range granted {
-		c.recordSubscription(sub)
 		c.sendRetained(sub)
 		c.emitSub(sub.Filter, sub.QoS, false, reason.Code(sub.QoS))
 	}

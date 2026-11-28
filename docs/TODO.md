@@ -2876,3 +2876,32 @@ QoS 1 压 10 万零丢弃（p50 14.9 ms）、扇出 10 万条/秒、建连 7840 
 	  谁后，以及两者是否都走连接自己的读协程（契约 ARCH-073 至 ARCH-075）。
 	  它不在 `make gate` 里（`make sim` 是 nightly 任务），所以不阻塞发布，
 	  但比发布重要。
+
+- [x] **接上一条的更正：2 秒墙只是一半，另一半是 CPU 饿死；而第三件事仍未归因（2026-11-28）。**
+	  上一条把门禁的红全归给「2 秒耐心值太紧」，那个判断不完整。放宽到 30 秒之后
+	  CI 又红了一次，这次是 `TestQoS0DoesNotTakeInflightQuota` **整整等了 30 秒**
+	  ——一条进程内 QoS0 投递等 30 秒不是「机器慢」，所以 2 秒那堵墙曾把别的东西
+	  挡在视线外。按证据分成三件：
+	  - **CPU 饿死（已修，有 A/B）。** 关键事实是 `make test-race` 在 CI 上
+	    **并行跑多个包的测试二进制**（`go test` 的 `-p` 默认等于核数），于是 4 核
+	    runner 上 broker 的用例在和 cluster/server/store 抢核。
+	    `TestShutdownDuringDeliveryDoesNotPanic` 的发布协程不带任何节流地死命发，
+	    饿死的恰好是它要等的订阅者。本机用 `GOMAXPROCS=2` 加四个忙循环复现：
+	    节流前 12 轮全红、节流后（每条之间 100µs）8 轮全绿，判据不变（Close 仍
+	    落在投递中间）。
+	  - **订阅生效晚于 SUBACK（已修，但不能证明是本次 CI 的成因）。**
+	    `handleSubscribe` 原先先 `c.send(ack)` 再装路由表，而 `send` 只是入队
+	    ——客户端可以先看到 SUBACK 而路由表里还没有这条订阅，窗口期内的发布按
+	    「无匹配订阅者」静默丢掉。这是代码读出来的真窗口，MQTT 语义也要求反过来
+	    （MQTT-134，已改成先装表再回 SUBACK，retained 仍在 SUBACK 之后）。
+	    **但 A/B 不支持把 CI 那次失败归给它**：退回旧顺序后，那四条投递用例加
+	    新增的 `TestSubackImpliesRouteInstalled` 在同样苛刻条件下 10 轮全绿
+	    ——要命中那个窗口，订阅者的读协程得在整个 CONNECT 往返期间都被挂起。
+	    所以这一条按「符合语义的修正」记，不按「已归因」记。
+	  - **`TestQoS0DoesNotTakeInflightQuota` 等 30 秒那次仍未归因。** 本机在
+	    race、少核、CPU 竞争下十轮以上复现不了；写出池的 `enqueue`/`wake` 配对
+	    读下来没有丢唤醒的缝。于是这一轮不再猜，而是让下一次失败自己说话：
+	    `rig.diag()` 在等待失败时打印在线连接、写出池的 flushed/writeErrs/
+	    timeouts/队列长度/工作协程数，`expect` 的失败路径带上它。四种可能
+	    （没发到 broker、没进路由表、进了队列没写出、连接已被驱逐）从此一眼能分。
+	    这条照 TST-234 办：查不出原因的红会被当成抖动重跑掉——这一次正是那样。

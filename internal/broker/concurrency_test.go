@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -229,6 +230,18 @@ func TestShutdownDuringDeliveryDoesNotPanic(t *testing.T) {
 						}
 						return
 					}
+					// 发完让一步。
+					//
+					// 这个循环不带任何节流地死命发，而它要等的那一端——订阅者的
+					// 读协程、broker 的两条读协程与写出池的工作协程——和它抢同一
+					// 批 P。`make test-race` 在 CI 上**并行跑多个包的测试二进制**
+					// （-p 默认等于核数），于是 4 核 runner 上这条用例拿到的 P
+					// 比开发机少得多：实测 GOMAXPROCS=2 加 CPU 竞争时，不让步的
+					// 版本 12 轮全部停在「等待投递开始」——饿死的恰好是判据本身。
+					//
+					// 用例要压的是「关机与投递重叠」，不是「发布侧能跑多满」，
+					// 所以降速不削弱它：每秒几千条足够让 Close 落在投递中间。
+					time.Sleep(100 * time.Microsecond)
 				}
 			}()
 
@@ -247,5 +260,56 @@ func TestShutdownDuringDeliveryDoesNotPanic(t *testing.T) {
 			_ = pub.nc.Close()
 			wg.Wait()
 		})
+	}
+}
+
+// TestSubackImpliesRouteInstalled 钉住「客户端收到 SUBACK 时，订阅已经在
+// 路由表里」（MQTT-134、TST-238）。
+//
+// 这条曾经不成立，而不成立的后果是**静默丢消息**：`handleSubscribe` 原先先
+// `c.send(ack)` 再 `recordSubscription`，而 `send` 只是入队——真正的写出在
+// 写出池的工作协程上。于是客户端可以先读到 SUBACK，此刻路由表里还没有这条
+// 订阅，窗口期内匹配该过滤器的发布按「没有匹配的订阅者」丢掉：发布方拿到的
+// 仍是成功，订阅方只是永远收不到。
+//
+// 判据分两半，性质不同：
+//
+//   - **路由表那一句是确定性的。** 修好之后装表先于 SUBACK 入队，而客户端
+//     读到 SUBACK 意味着入队已经发生，所以此刻路由表里必须有它。退回旧顺序
+//     时它不是必然失败——那一半靠下面的循环。
+//   - **订阅-发布那一段是概率性的**，与 concurrency_test.go 里其余几条同一
+//     个路子：缝很窄，靠 `-race`、少核与多轮去压。本机在 `GOMAXPROCS=2`
+//     加四个忙循环下，旧顺序 12 轮全红。
+func TestSubackImpliesRouteInstalled(t *testing.T) {
+	r := newPolicyRig(t, policyFull, nil)
+	for round := 0; round < 20; round++ {
+		subID := fmt.Sprintf("sub-%d", round)
+		filter := fmt.Sprintf("t/r%d", round)
+
+		sub := r.dial(ConnInfo{})
+		sub.connect(subID, true)
+		if rc := sub.subscribe(filter, packet.QoS0); rc.IsError() {
+			t.Fatalf("第 %d 轮订阅被拒: %s", round, rc)
+		}
+		// subscribe 返回意味着 SUBACK 已经读到。
+		if !r.rt.Has(subID, filter) {
+			t.Fatalf("第 %d 轮：客户端已收到 SUBACK，而路由表里还没有 %s 的 %q",
+				round, subID, filter)
+		}
+
+		pub := r.dial(ConnInfo{})
+		pub.connect(fmt.Sprintf("pub-%d", round), true)
+		if rc := pub.publish(filter, "x", packet.QoS0, false); rc.IsError() {
+			t.Fatalf("第 %d 轮发布失败: %s", round, rc)
+		}
+		if got := sub.expectPublish(); string(got.Payload) != "x" {
+			t.Fatalf("第 %d 轮负载 = %q，想要 \"x\"", round, got.Payload)
+		}
+
+		_ = sub.nc.Close()
+		_ = pub.nc.Close()
+		r.waitConns(0)
+		// 每轮换一个时刻，避开每 clientId 的连接速率配额。
+		r.clk.advance(2 * time.Second)
 	}
 }

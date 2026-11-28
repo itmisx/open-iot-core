@@ -63,9 +63,15 @@ jobs:
       - name: 随机种子模拟
         run: make sim SIM_SEEDS=200 SIM_OPS=5000
 
-  # 夜间长时 fuzz：失败语料会作为构件保留，便于入库
+  # 夜间长时 fuzz：失败语料会作为构件保留，便于入库。
+  #
+  # **只在定时任务里跑**（TST-128）。它原先在推 main 时也触发，而它是 11 个
+  # fuzz 目标 × FUZZTIME **串行**：FUZZTIME=5m 就是约 55 分钟，于是每次推 main
+  # 的 CI 都挂着一小时、占着一个 runner。门禁本身只要 5 分钟（gate 是另一个
+  # job，不被它挡），所以那一小时买到的不是更快的反馈，而是一条长期"运行中"
+  # 的记录——真要看 fuzz 结果的人看的是夜间那一轮。
   fuzz-nightly:
-    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

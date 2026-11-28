@@ -225,3 +225,9 @@ MQTT-105 至 MQTT-107 是同一个缺陷的三个面：同一份逻辑状态（�
 | MQTT-132 | TLS/SigV4 认证输入（证书指纹、Subject/Issuer DN、序列号与 AccessKeyID）只活到 Authenticator 返回；为避免重连风暴每次单独分配，允许从 `sync.Pool` 取得短命容器，但归还前必须完整清零，且 CONNECT 之前早退的 cleanup 也必须归还。不得为省分配把这些字段重新内联进长连接。 | v0.2 |
 | MQTT-130 | 默认 192 B 读缓冲须内联在连接对象，大报文按需扩容，不得让每条空闲连接单独保留一个小堆对象。TCP 内核 keepalive 默认 5 分钟且可配；不得使用 Go 15 秒的接收连接默认值去周期扫百万空闲连接。 | v0.2 |
 | MQTT-131 | 每个 TLS/WSS listener 须在 Accept 与 TLS 握手之间设并发硬上限，默认 `GOMAXPROCS×64`、下限 256、上限 4096，可由 `broker.tls_handshake_concurrency` 覆盖。饱和时须停止把新套接字交给 TLS，让 listen backlog 做短时背压，不得无界创建握手 goroutine。该上限不得影响已完成握手的百万长连接；StopAccepting 必须唤醒正在等 gate 的已 Accept 连接，且不得在 Wait 开始后再向 WaitGroup Add。 | v0.2 |
+
+## SUBACK 与订阅生效的顺序（实现期补充，2026-11-28）
+
+| ID | 需求 | 状态 |
+| --- | --- | --- |
+| MQTT-134 | 订阅须在 **SUBACK 入队之前**装进路由表与会话；retained 仍在 SUBACK 之后下发。不得按「先回 SUBACK、再装路由表」的顺序办：`conn.send` 只是把报文放进连接的出站队列，真正的写出在写出池的工作协程上，于是客户端可以先收到 SUBACK 而路由表里还没有这条订阅——窗口期内匹配该过滤器的发布按「没有匹配的订阅者」丢掉，**发布方与订阅方都观察不到**，既不报错也不重投。MQTT 的语义要求反过来：SUBACK 一旦发出，匹配的消息就必须投给这个订阅者，所以顺序是「先让订阅生效，再宣布它生效」。由来：这个窗口在开发机上是微秒级，几乎不显形；而 CI 的 4 核共享 runner 加 `-race` 把它放大到稳定可见——2026-11-27 与 11-28 的门禁分别红在 `TestOfflineQueueIsNotRedelivered` 与 `TestQoS0DoesNotTakeInflightQuota`，两条都报「期望收到 PUBLISH，读取失败: i/o timeout」，而它们等的那条消息在发布的那一刻确实无人订阅。判据见 TST-238。 | v0.1 |

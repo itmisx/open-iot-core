@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -160,6 +161,32 @@ type rig struct {
 func (r *rig) advance(d time.Duration) {
 	r.clk.advance(d)
 	r.timers.fire()
+}
+
+// diag 把服务端侧的状态拼成一行，供等待超时的那几处打印。
+//
+// 为什么要有它：2026-11-27 与 11-28 的门禁三次红在「期望收到 PUBLISH，读取
+// 失败: i/o timeout」，而本机（含 -race、少核、CPU 竞争、10 轮以上）复现不了。
+// 那句话只说明「客户端没读到」，它分不开四种原因完全不同的情况：
+//
+//  1. 发布根本没到 broker（发布侧的写卡在内核缓冲里）；
+//  2. 路由表里没有这条订阅（投递时按「无匹配订阅者」丢掉）；
+//  3. 进了出站队列却没被写出（写出池的唤醒丢了，或工作协程全卡住）；
+//  4. 这条连接已经被驱逐（慢订阅者背压，MQTT-035）。
+//
+// 四种的处置完全不同，而失败现场原先一个字都不说。门禁的可诊断性与它的
+// 严格程度同等重要（TST-234）：查不出原因的红会被当成抖动重跑掉，而这一次
+// 正是那样——先被当成「CI 机器慢」，放宽超时之后才看出 30 秒也等不到。
+func (r *rig) diag() string {
+	ws := r.b.writer.stats()
+	conns, _ := r.b.ListConns(ConnQuery{Limit: 64})
+	ids := make([]string, 0, len(conns))
+	for _, c := range conns {
+		ids = append(ids, c.ClientID)
+	}
+	return fmt.Sprintf(
+		"服务端状态：在线连接 %d %v；写出池 flushed=%d writeErrs=%d timeouts=%d 队列中=%d 工作协程=%d",
+		r.b.Conns(), ids, ws.Flushed, ws.WriteErrs, ws.Timeouts, ws.Pending, ws.Workers)
 }
 
 // waitConns 等到在线连接数降到 n。
@@ -408,7 +435,7 @@ func (r *rig) dial(info ConnInfo) *testClient {
 	if err != nil {
 		r.t.Fatalf("连接失败: %v", err)
 	}
-	c := &testClient{t: r.t, nc: nc, ver: packet.V5}
+	c := &testClient{t: r.t, nc: nc, ver: packet.V5, r: r}
 	r.t.Cleanup(func() { _ = nc.Close() })
 	return c
 }
@@ -437,7 +464,7 @@ func (r *rig) dialCtx(ctx context.Context, info ConnInfo) (*testClient, <-chan s
 	if err != nil {
 		r.t.Fatalf("连接失败: %v", err)
 	}
-	c := &testClient{t: r.t, nc: nc, ver: packet.V5}
+	c := &testClient{t: r.t, nc: nc, ver: packet.V5, r: r}
 	r.t.Cleanup(func() { _ = nc.Close() })
 	return c, done
 }
@@ -451,6 +478,10 @@ type testClient struct {
 	rlen int
 	ebuf []byte
 	pid  uint16
+	// r 是这条客户端所属的装置，仅用于等待失败时打印服务端状态。
+	// 别的测试文件里有几处自建 testClient（mtls、proxyv2、handoff），
+	// 它们没有 rig，所以这一项可以为 nil。
+	r *rig
 }
 
 func (c *testClient) nextPID() uint16 {
@@ -543,12 +574,22 @@ func (c *testClient) expect(want packet.Type) packet.Packet {
 	c.t.Helper()
 	p, err := c.recv()
 	if err != nil {
-		c.t.Fatalf("期望收到 %s，读取失败: %v", want, err)
+		// 带上服务端侧状态：光凭「读取失败」分不出是没发、没路由、没写出
+		// 还是被驱逐（见 rig.diag）。
+		c.t.Fatalf("期望收到 %s，读取失败: %v%s", want, err, c.diagSuffix())
 	}
 	if p.Type() != want {
 		c.t.Fatalf("收到 %s，期望 %s", p.Type(), want)
 	}
 	return p
+}
+
+// diagSuffix 在有装置时附上服务端状态，没有时返回空串。
+func (c *testClient) diagSuffix() string {
+	if c.r == nil {
+		return ""
+	}
+	return "\n      " + c.r.diag()
 }
 
 // expectNothing 断言在给定时间内没有报文到达。
