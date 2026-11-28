@@ -5,6 +5,14 @@ import (
 	"time"
 )
 
+// testPatience 是测试等**真实时钟**的上限：死锁探测器，不是性能断言。
+//
+// 原先这里等 2 秒，而 `make cover-check` 把整包带覆盖率插桩再跑一遍、CI 又是
+// 4 核共享 runner，于是「等两条变更到达」会在实现完全正常时超时（2026-11-28
+// 的门禁就红在这一条）。等不到说明通道真的没发出来，等得到就只是慢——
+// 中间没有需要被这个值拦住的情形。
+const testPatience = 30 * time.Second
+
 // RequiresDisconnect 的真值表。
 //
 // 这个判定决定一次元数据变更会不会把设备踢下线，两个方向都错不起：
@@ -92,7 +100,7 @@ func TestPutCertReturnsPrevThing(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case ch = <-changes:
-		case <-time.After(2 * time.Second):
+		case <-time.After(testPatience):
 			t.Fatalf("只收到 %d 条变更，期望 2 条", i)
 		}
 	}

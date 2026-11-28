@@ -139,7 +139,7 @@ func TestAppendAuditIsOneJSONLine(t *testing.T) {
 
 func waitAudit(t *testing.T, path, needle string) string {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testPatience)
 	var last string
 	for time.Now().Before(deadline) {
 		b, err := os.ReadFile(path)

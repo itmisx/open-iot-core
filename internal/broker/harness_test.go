@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,32 @@ import (
 	"github.com/itmisx/open-iot-core/internal/router"
 	"github.com/itmisx/open-iot-core/internal/session"
 )
+
+// testPatience 是测试等**真实时钟**的上限。它是死锁探测器，不是性能断言。
+//
+// 为什么要有这个名字：全仓库的测试等待原先一律写 2 秒，而那个值在开发机上
+// 够、在 CI 上不够——runner 是 4 核共享机，门禁又连着跑 `-race` 与覆盖率两
+// 种插桩，于是「等投递开始」「等连接数降到 0」「等 PUBLISH 到达」这类等待会
+// 在管道完全正常的情况下超时。2026-11-23 至 11-28 的五次门禁失败全是这个
+// 形状（失败时长清一色 2.00 秒），而每次红的用例还不一样；更难受的是
+// `release.yml` 的 image 任务 `needs: gate`，于是一个打好的 tag 不产出镜像。
+//
+// 放宽它不削弱任何判据：这些等待要么等到、要么说明真的卡住了，中间不存在
+// 「慢一点但仍然正确」需要被拦住的情形——用例真正的断言都在等到之后。反过来
+// 调小它只会把「机器忙」报成「实现错」。
+//
+// 注入时钟的推进（`r.clk.advance`）与这个值无关，不要混起来改：那是逻辑时间，
+// 用例靠它跨过配额窗口与定时器，改了会改变被测行为。
+//
+// 本机想要快速失败可以设 OPENIOT_TEST_PATIENCE（例如 `2s`）。
+var testPatience = func() time.Duration { // contract:allow-time-now 测试超时
+	if v := os.Getenv("OPENIOT_TEST_PATIENCE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 30 * time.Second
+}()
 
 // testClock 是可推进的注入时钟（契约 08）。
 type testClock struct {
@@ -142,7 +169,7 @@ func (r *rig) advance(d time.Duration) {
 // 之后的时刻为起点登记，后面怎么推都差着那一段——这个坑踩过一次。
 func (r *rig) waitConns(n int64) {
 	r.t.Helper()
-	deadline := time.Now().Add(2 * time.Second) // contract:allow-time-now 测试超时
+	deadline := time.Now().Add(testPatience) // contract:allow-time-now 测试超时
 	for time.Now().Before(deadline) {
 		if r.b.Conns() == n {
 			return
@@ -441,7 +468,7 @@ func (c *testClient) send(p packet.Packet) {
 		c.t.Fatalf("编码 %s 失败: %v", p.Type(), err)
 	}
 	c.ebuf = buf
-	if err := c.nc.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := c.nc.SetWriteDeadline(time.Now().Add(testPatience)); err != nil {
 		c.t.Fatal(err)
 	}
 	if _, err := c.nc.Write(buf); err != nil {
@@ -459,7 +486,7 @@ func (c *testClient) trySend(p packet.Packet) error {
 		return err
 	}
 	c.ebuf = buf
-	if err := c.nc.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := c.nc.SetWriteDeadline(time.Now().Add(testPatience)); err != nil {
 		return err
 	}
 	_, err = c.nc.Write(buf)
@@ -497,7 +524,7 @@ func (c *testClient) recv() (packet.Packet, error) {
 				return nil, err
 			}
 		}
-		if err := c.nc.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		if err := c.nc.SetReadDeadline(time.Now().Add(testPatience)); err != nil {
 			return nil, err
 		}
 		n, err := c.nc.Read(c.buf[c.rlen:])

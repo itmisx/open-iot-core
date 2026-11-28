@@ -28,6 +28,13 @@ import (
 	"github.com/itmisx/open-iot-core/internal/shadow"
 )
 
+// testPatience 是测试等**真实时钟**的上限：死锁探测器，不是性能断言。
+//
+// 与 internal/broker 的同名值同一个理由：原先一律等 2 秒，而 CI 是 4 核共享
+// runner、门禁又连着跑 `-race` 与覆盖率两种插桩，这类等待会在实现正常时超时。
+// 等不到说明真的没发生，等得到就只是慢——中间没有需要被这个值拦住的情形。
+const testPatience = 30 * time.Second
+
 // devicePolicy 是测试用的设备域策略。
 const devicePolicy = `{
   "Statement": [
@@ -1264,7 +1271,7 @@ func TestShadowNotDeliveredWithoutReceivePermission(t *testing.T) {
 		t.Fatal(rc)
 	}
 	// 影子确实被更新了（Publish 被放行）
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testPatience)
 	updated := false
 	for time.Now().Before(deadline) {
 		if _, ok := r.s.shadows.Get("dev-nr2", ""); ok {
@@ -1334,7 +1341,7 @@ func collectByTopic(t *testing.T, c *mqttClient, n int) map[string][]byte {
 	out := make(map[string][]byte, n)
 	deadline := time.Now().Add(5 * time.Second)
 	for len(out) < n && time.Now().Before(deadline) {
-		_ = c.nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = c.nc.SetReadDeadline(time.Now().Add(testPatience))
 		p, err := c.recv()
 		if err != nil {
 			break

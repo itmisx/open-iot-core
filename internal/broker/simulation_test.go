@@ -278,7 +278,7 @@ func (s *sim) opConnect() {
 		s.logf("connect %s clean=%v -> Success", name, clean)
 		// 接管：旧连接必须被服务端关掉，绝不双活（TST-050、TST-043）。
 		if prev != nil {
-			if rc := s.closedWithin(prev, 2*time.Second); rc == nil {
+			if rc := s.closedWithin(prev, testPatience); rc == nil {
 				s.t.Errorf("%s 被接管后旧连接仍然活着（TST-050）", name)
 			}
 		}
@@ -348,7 +348,7 @@ func (s *sim) opDisconnectClean() {
 // 不等的话，下一步的不变量断言会撞上一个"正在清理中"的中间态，
 // 得到的是一个与被测行为无关的假阳性。
 func (s *sim) waitConnsSettle() {
-	deadline := time.Now().Add(2 * time.Second) // contract:allow-time-now 测试超时
+	deadline := time.Now().Add(testPatience) // contract:allow-time-now 测试超时
 	for time.Now().Before(deadline) {
 		if int64(len(s.live)) == s.r.b.Conns() {
 			return
@@ -495,7 +495,7 @@ func (s *sim) opRevokeOrActivate() {
 	s.revoked[name] = true
 	s.logf("吊销证书 %s", name)
 	if c := s.live[name]; c != nil {
-		if rc := s.closedWithin(c, 2*time.Second); rc == nil {
+		if rc := s.closedWithin(c, testPatience); rc == nil {
 			s.t.Errorf("证书吊销后 %s 的连接仍然活着（PKI-030）", name)
 		}
 		delete(s.live, name)
@@ -512,7 +512,7 @@ func (s *sim) opKick() {
 		return
 	}
 	s.logf("踢出 %s", name)
-	if rc := s.closedWithin(c, 2*time.Second); rc == nil {
+	if rc := s.closedWithin(c, testPatience); rc == nil {
 		s.t.Errorf("踢出之后 %s 的连接仍然活着", name)
 	}
 	delete(s.live, name)
@@ -751,7 +751,7 @@ func (s *sim) checkInvariants(step int) {
 func (s *sim) checkSubscriptionAccounting(step int) {
 	var cur int64
 	var subs int
-	deadline := time.Now().Add(2 * time.Second) // contract:allow-time-now 测试超时
+	deadline := time.Now().Add(testPatience) // contract:allow-time-now 测试超时
 	for time.Now().Before(deadline) {
 		cur = s.r.lim.Current(quota.Subscriptions, "")
 		subs = s.r.rt.Stats().Subscriptions

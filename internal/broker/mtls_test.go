@@ -272,7 +272,7 @@ func TestMTLSConnInfoComesFromHandshake(t *testing.T) {
 		t.Fatalf("连接被拒: %s", ack.Code)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testPatience)
 	for time.Now().Before(deadline) {
 		for _, e := range getEvents() {
 			if e.ClientID != "dev-info" || e.Conn.ReasonCode != reason.Success {
@@ -641,7 +641,7 @@ func TestMTLSRequireSNI(t *testing.T) {
 	if err == nil {
 		defer func() { _ = nc.Close() }()
 		// 握手本身可能成功，但服务端会立刻关闭连接
-		_ = nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = nc.SetReadDeadline(time.Now().Add(testPatience))
 		var buf [16]byte
 		if _, err := nc.Read(buf[:]); err == nil {
 			t.Error("缺少 SNI 的连接应被关闭")

@@ -113,7 +113,7 @@ func TestConsoleMQTTRejectsMissingToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(testPatience))
 	br := bufio.NewReader(conn)
 	line, err := br.ReadString('\n')
 	if err != nil {
@@ -179,7 +179,7 @@ func (d *consoleDial) sendJSON(t *testing.T, v any) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = d.c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = d.c.SetWriteDeadline(time.Now().Add(testPatience))
 	if _, err := d.c.Write(maskClientFrame(0x1, raw)); err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func (d *consoleDial) sendJSON(t *testing.T, v any) {
 
 func (d *consoleDial) readJSON(t *testing.T) map[string]any {
 	t.Helper()
-	_ = d.c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = d.c.SetReadDeadline(time.Now().Add(testPatience))
 	payload := readServerFrame(t, d.r)
 	var m map[string]any
 	if err := json.Unmarshal(payload, &m); err != nil {

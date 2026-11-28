@@ -2824,3 +2824,55 @@ QoS 1 压 10 万零丢弃（p50 14.9 ms）、扇出 10 万条/秒、建连 7840 
 	  `cluster-local-ladder-ext.jsonl`、`connect-persistent-rerun.jsonl`、
 	  `shadow-rerun-n1.jsonl`、`shadow-rerun-n3-sh4.jsonl`，环境记录
 	  `env.json`（单节点，loadAvg 1.65）与 `env-cluster.json`（集群，4.38）
+
+- [x] **门禁在 CI 上的不稳定：2 秒耐心值与两处真实时序假设（2026-11-28）。**
+	  症状是「打了 tag 却没有镜像」：`release.yml` 的 `image` 与 `binaries` 都
+	  `needs: gate`，而 v0.0.1 那一轮 gate 在 `test-race` 失败，两个任务 skipped
+	  ——没推 ghcr，也没建 Release。往前翻，门禁已经红了六天，而**每次红的用例
+	  都不一样**：
+	  - 11-23 `TestShutdownDuringDeliveryDoesNotPanic`、`TestTakeoverKeepsLiveSubscriptionState`
+	  - 11-26、11-28(tag) `TestShutdownDuringDeliveryDoesNotPanic`（tag 那轮 6 轮里红 4 轮）
+	  - 11-27 `TestOfflineQueueIsNotRedelivered`（`i/o timeout`）、`TestTLSQuorumSnapshotAndDrain`
+	  - 11-28 nightly `TestShutdownDuringDeliveryDoesNotPanic`、`TestApplyBatchMergesConcurrentWrites`
+
+	  失败时长清一色 2.00/2.01 秒——全部撞在同一个值上：**全仓库的测试等待都写
+	  死 2 秒**（harness 的读写 deadline、`expectClosed`、各处轮询上限）。这个值
+	  在开发机上够，在 CI 上不够：runner 是 4 核共享机，门禁又连着跑 `-race` 与
+	  覆盖率两种插桩（`cover-check` 紧跟 `test-race`，资源还没回落——Makefile 里
+	  那段注释早就写了这一点）。**本机复现不了**：单独跑、`GOMAXPROCS=4` 加
+	  `-race` 连跑五次、带覆盖率插桩跑，全绿。
+
+	  改法：`internal/broker/harness_test.go` 立一个 `testPatience`（默认 30 秒，
+	  `OPENIOT_TEST_PATIENCE` 可覆盖），broker 侧 29 处真实时钟等待改走它，
+	  `internal/meta`、`internal/server`、`internal/trace` 同形状的 8 处一并改。
+	  **注入时钟的 `clk.advance(2s)` 一处没动**——那是逻辑时间，用例靠它跨配额
+	  窗口与定时器，混起来改会改变被测行为。放宽耐心值不削弱判据：这些等待要么
+	  等到、要么说明真卡住，中间没有「慢一点但仍然正确」需要被拦住的情形。
+
+	  顺带修掉两处真实的时序假设，它们才是「为什么偏偏是这几条」的答案：
+	  - **`TestTLSQuorumSnapshotAndDrain` 赌了一个收敛窗口。** `waitLeader` 只
+	    保证「有某个节点自认为 leader」，而跟随者转发还要等**它自己**知道
+	    leader 是谁；窗口期内 dragonboat 回 `ErrShardNotReady`，`Propose` 按
+	    `ErrNotLeader` 回报（`dragongroup.go`），于是报「跟随者提交失败（应转发
+	    给 leader）」，看上去像转发没接上。改为按窗口重试，到期仍失败才算缺陷
+	    （TST-122 的判据）。
+	  - **`TestShutdownDuringDeliveryDoesNotPanic` 的发布协程一死就没人知道。**
+	    它遇到任何写失败都静默 `return`，于是流量停了，而测试只会等到
+	    「等待投递开始超时」——指向投递路径，而真因可能是第一次写就失败。现在
+	    投递开始之前的写错误单独回传并报出来。
+
+	  `make gate` 本机全绿。**真判据是 CI 自己**：这几条在本机从来不红，所以
+	  「修好了」只能由 CI 连续绿几轮来证明。
+
+- [ ] **nightly 模拟报「CONNACK 不是第一个报文」，待查（2026-11-28）。**
+	  `simulation-nightly` 在两个不同种子上报
+	  `connect dev-N 收到 PUBLISH，期望 CONNACK`：`opConnect` 新 dial 一条连接、
+	  发 CONNECT、读第一个报文，而读到的是 PUBLISH。MQTT 要求 CONNACK 必须是
+	  服务端发出的第一个报文，所以如果成立这是真缺陷。
+	  **两个给定种子在本机重放不了**（6 轮 × 4 种子、`-race`、`GOMAXPROCS=4`
+	  全绿），说明它依赖真实时序而不是种子——怀疑是持久会话重连时队列补发的
+	  报文与 CONNACK 落进写出池的同一次批量写而顺序反了（写出池会把多条消息
+	  合进一次 TCP 写）。查的方向：CONNACK 的入队点与 `resume` 补发的入队点谁先
+	  谁后，以及两者是否都走连接自己的读协程（契约 ARCH-073 至 ARCH-075）。
+	  它不在 `make gate` 里（`make sim` 是 nightly 任务），所以不阻塞发布，
+	  但比发布重要。

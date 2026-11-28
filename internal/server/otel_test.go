@@ -48,7 +48,7 @@ func TestOTelExportFromAdmin(t *testing.T) {
 		t.Fatalf("healthz = %d", resp.StatusCode)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testPatience)
 	var all string
 	for time.Now().Before(deadline) {
 		mu.Lock()

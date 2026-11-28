@@ -258,7 +258,7 @@ func TestSessionTakeoverFencesOldConnection(t *testing.T) {
 	}
 
 	// 旧连接必须被断开，且原因码是「会话被接管」
-	if rc := first.expectClosed(2 * time.Second); rc != reason.SessionTakenOver {
+	if rc := first.expectClosed(testPatience); rc != reason.SessionTakenOver {
 		t.Errorf("旧连接的断开原因码 = %s，期望 Session taken over", rc)
 	}
 	// 新连接仍可用
@@ -298,7 +298,7 @@ func TestRevocationDisconnectsImmediately(t *testing.T) {
 	r.revoke(certA, "dev-1", ps, "密钥泄露")
 
 	// dev-1 必须被断开，原因码为未授权
-	if rc := a.expectClosed(2 * time.Second); rc != reason.NotAuthorized {
+	if rc := a.expectClosed(testPatience); rc != reason.NotAuthorized {
 		t.Errorf("被吊销连接的原因码 = %s，期望 Not authorized", rc)
 	}
 	// dev-2 不受影响——吊销只影响在用该证书的连接
@@ -607,7 +607,7 @@ func TestKickClient(t *testing.T) {
 	if !r.b.KickClient("dev-1", reason.AdministrativeAction) {
 		t.Fatal("踢出应成功")
 	}
-	if rc := c.expectClosed(2 * time.Second); rc != reason.AdministrativeAction {
+	if rc := c.expectClosed(testPatience); rc != reason.AdministrativeAction {
 		t.Errorf("断开原因码 = %s", rc)
 	}
 	if r.b.KickClient("nope", reason.AdministrativeAction) {
@@ -620,7 +620,7 @@ func TestFirstPacketMustBeConnect(t *testing.T) {
 	r := newPolicyRig(t, policyFull, nil)
 	c := r.dial(ConnInfo{})
 	c.send(&packet.Pingreq{})
-	c.expectClosed(2 * time.Second)
+	c.expectClosed(testPatience)
 }
 
 // TestSecondConnectIsProtocolError 验证一个连接上只能有一个 CONNECT。
@@ -629,7 +629,7 @@ func TestSecondConnectIsProtocolError(t *testing.T) {
 	c := r.dial(ConnInfo{})
 	c.connect("dev-1", true)
 	c.send(&packet.Connect{Version: packet.V5, ClientID: []byte("dev-1"), CleanStart: true})
-	if rc := c.expectClosed(2 * time.Second); rc != reason.ProtocolError {
+	if rc := c.expectClosed(testPatience); rc != reason.ProtocolError {
 		t.Errorf("断开原因码 = %s，期望 Protocol Error", rc)
 	}
 }
@@ -1223,7 +1223,7 @@ func TestTakeoverKeepsLiveSubscriptionState(t *testing.T) {
 		if ack := second.connect("keep-sub", false); !ack.SessionPresent {
 			t.Error("接管活会话应报告会话已存在")
 		}
-		first.expectClosed(2 * time.Second)
+		first.expectClosed(testPatience)
 
 		// 重订同一条过滤器不该再占一份额度——会话必须知道自己已经持有它。
 		// 回退过的会话会以为这是条新订阅，于是额度加一而路由表就地替换，
@@ -1259,7 +1259,7 @@ func TestTakeoverKeepsLiveSubscriptionState(t *testing.T) {
 		r.clk.advance(2 * time.Second)
 		third := r.dial(ConnInfo{})
 		third.connect("drop-sub", false)
-		second.expectClosed(2 * time.Second)
+		second.expectClosed(testPatience)
 
 		// 设备明明退订了。接管之后又收到，就是订阅状态被回退——
 		// 这是记账分叉背后真正的问题。
@@ -1430,7 +1430,7 @@ func TestPipelinedPacketsAreNotCorrupted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.nc.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := c.nc.SetWriteDeadline(time.Now().Add(testPatience)); err != nil {
 		t.Fatal(err)
 	}
 	// 一次写出，使两个报文尽可能落在服务端的同一次读取里。

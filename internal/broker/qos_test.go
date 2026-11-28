@@ -288,7 +288,7 @@ func TestTakeoverAdoptsLiveInflight(t *testing.T) {
 			got.PacketID, got.Dup, got.Payload, sent.PacketID)
 	}
 	assertInflight(t, r, "sub", 1)
-	first.expectClosed(2 * time.Second)
+	first.expectClosed(testPatience)
 }
 
 // TestOutboundWindowQueuesInsteadOfDropping 验证窗口满时先排队，确认后再发出。

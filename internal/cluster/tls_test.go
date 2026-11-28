@@ -119,8 +119,26 @@ func TestTLSQuorumSnapshotAndDrain(t *testing.T) {
 			break
 		}
 	}
-	if err := follower.Propose([]byte("one")); err != nil {
-		t.Fatalf("跟随者提交失败（应转发给 leader）: %v", err)
+	// 转发要等**这个跟随者**也知道 leader 是谁，而 waitLeader 只保证
+	// 「有某个节点自认为 leader」。两件事之间有一个收敛窗口：follower 这边
+	// dragonboat 还会回 ErrShardNotReady，而 Propose 把它按 ErrNotLeader 回报
+	// （dragongroup.go）。开发机上这个窗口是微秒级，CI 的 4 核共享 runner 上
+	// 不是——2026-11-27 的门禁就红在这里，报的是「跟随者提交失败（应转发给
+	// leader）」，看上去像转发没接上。
+	//
+	// 所以按收敛窗口重试，而不是赌第一次就成：窗口到期仍失败才是真缺陷
+	// （TST-122 的判据）。
+	proposeDeadline := time.Now().Add(10 * time.Second)
+	var proposeErr error
+	for {
+		proposeErr = follower.Propose([]byte("one"))
+		if proposeErr == nil {
+			break
+		}
+		if !errors.Is(proposeErr, ErrNotLeader) || !time.Now().Before(proposeDeadline) {
+			t.Fatalf("跟随者提交失败（应转发给 leader）: %v", proposeErr)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	waitApplied(t, fsms, "one", 10*time.Second)
 

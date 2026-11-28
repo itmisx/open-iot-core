@@ -114,7 +114,7 @@ func TestOversizePacketRejected(t *testing.T) {
 	// 构造一个远超上限的 PUBLISH
 	big := strings.Repeat("x", 4096)
 	c.send(&packet.Publish{Topic: []byte("a/b"), Payload: []byte(big)})
-	c.expectClosed(2 * time.Second)
+	c.expectClosed(testPatience)
 }
 
 func TestReadBufferGrowsPastSmallDefault(t *testing.T) {
@@ -152,7 +152,7 @@ func TestOversizePayloadRejectedByQuota(t *testing.T) {
 	c := r.dial(ConnInfo{})
 	c.connect("dev-1", true)
 	c.send(&packet.Publish{Topic: []byte("a/b"), Payload: []byte("0123456789")})
-	if rc := c.expectClosed(2 * time.Second); rc != reason.PacketTooLarge {
+	if rc := c.expectClosed(testPatience); rc != reason.PacketTooLarge {
 		t.Errorf("断开原因码 = %s，期望 Packet too large", rc)
 	}
 }
@@ -166,7 +166,7 @@ func TestMalformedPacketDisconnects(t *testing.T) {
 	if _, err := c.nc.Write([]byte{0x00, 0x00}); err != nil {
 		t.Fatal(err)
 	}
-	c.expectClosed(2 * time.Second)
+	c.expectClosed(testPatience)
 }
 
 // TestInvalidTopicNameDisconnects 验证非法主题名导致断开。
@@ -177,7 +177,7 @@ func TestInvalidTopicNameDisconnects(t *testing.T) {
 	// 主题名超出斜杠配额
 	deep := strings.Repeat("a/", 20) + "b"
 	c.send(&packet.Publish{Topic: []byte(deep), Payload: []byte("x")})
-	if rc := c.expectClosed(2 * time.Second); rc != reason.TopicNameInvalid {
+	if rc := c.expectClosed(testPatience); rc != reason.TopicNameInvalid {
 		t.Errorf("断开原因码 = %s，期望 Topic Name invalid", rc)
 	}
 }
@@ -256,7 +256,7 @@ func TestCloseDisconnectsAll(t *testing.T) {
 		t.Errorf("重复关闭应幂等: %v", err)
 	}
 	for i, c := range cs {
-		if rc := c.expectClosed(2 * time.Second); rc != reason.ServerShuttingDown {
+		if rc := c.expectClosed(testPatience); rc != reason.ServerShuttingDown {
 			t.Errorf("第 %d 个连接的原因码 = %s，期望 Server shutting down", i, rc)
 		}
 	}
@@ -303,7 +303,7 @@ func TestServeContextCancellation(t *testing.T) {
 	c.send(&packet.Pingreq{})
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testPatience):
 		t.Error("上下文取消后 Serve 应返回")
 	}
 }
@@ -361,7 +361,7 @@ func TestConnectionQuotaReleasedOnDisconnect(t *testing.T) {
 		c.expectClosed(time.Second)
 	}
 	// 等待清理完成
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testPatience)
 	for time.Now().Before(deadline) {
 		if r.lim.Current(quota.Connections, "") == 0 {
 			return
@@ -384,7 +384,7 @@ func TestAuthFailureReleasesConnectionQuota(t *testing.T) {
 		}
 		c.expectClosed(time.Second)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testPatience)
 	for time.Now().Before(deadline) {
 		if r.lim.Current(quota.Connections, "") == 0 {
 			return
@@ -411,7 +411,7 @@ func TestAuthPacketRejected(t *testing.T) {
 	c := r.dial(ConnInfo{})
 	c.connect("dev-1", true)
 	c.send(&packet.Auth{Code: reason.ContinueAuthentication})
-	if rc := c.expectClosed(2 * time.Second); rc != reason.BadAuthenticationMethod {
+	if rc := c.expectClosed(testPatience); rc != reason.BadAuthenticationMethod {
 		t.Errorf("断开原因码 = %s，期望 Bad authentication method", rc)
 	}
 }
@@ -423,7 +423,7 @@ func TestServerSideOnlyPacketRejected(t *testing.T) {
 	c.connect("dev-1", true)
 	// CONNACK 是服务端发往客户端的，不应由客户端发来
 	c.send(&packet.Connack{Code: reason.Success})
-	if rc := c.expectClosed(2 * time.Second); rc != reason.ProtocolError {
+	if rc := c.expectClosed(testPatience); rc != reason.ProtocolError {
 		t.Errorf("断开原因码 = %s，期望 Protocol Error", rc)
 	}
 }

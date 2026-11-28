@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// testPatience 是测试等**真实时钟**的上限：死锁探测器，不是性能断言。
+//
+// 与 internal/broker 的同名值同一个理由：原先一律等 2 秒，而 CI 是 4 核共享
+// runner、门禁又连着跑 `-race` 与覆盖率两种插桩，这类等待会在实现正常时超时。
+// 等不到说明真的没发生，等得到就只是慢——中间没有需要被这个值拦住的情形。
+const testPatience = 30 * time.Second
+
 func TestTraceparentRejectsZeroAndBadShape(t *testing.T) {
 	if _, _, ok := parseTraceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01"); ok {
 		t.Fatal("全零 trace id 应被拒绝")
@@ -70,7 +77,7 @@ func TestExportDropsSecrets(t *testing.T) {
 		t.Fatalf("traceresponse = %q", rec.Header().Get("traceresponse"))
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testPatience)
 	var all string
 	for time.Now().Before(deadline) {
 		mu.Lock()

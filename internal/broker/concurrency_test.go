@@ -204,6 +204,12 @@ func TestShutdownDuringDeliveryDoesNotPanic(t *testing.T) {
 				}
 			}()
 			// 发布者一直发到发不动（关机会把连接断掉）。
+			//
+			// **投递开始之前的写失败必须报出来。** 原先这里一律 return，于是
+			// 流量停了而下面的等待只会走到超时——失败现场写着「等待投递开始
+			// 超时」，看上去像投递路径卡住了，而真因可能是第一次写就失败。
+			// 两者的处置完全不同，所以把这一段的错误单独回传。
+			pubErr := make(chan error, 1)
 			go func() {
 				defer wg.Done()
 				for {
@@ -212,6 +218,15 @@ func TestShutdownDuringDeliveryDoesNotPanic(t *testing.T) {
 						Payload: []byte("payload-payload-payload"),
 						QoS:     packet.QoS0,
 					}); err != nil {
+						select {
+						case <-flowing:
+							// 关机之后写不动是这条用例要的结果，不是缺陷。
+						default:
+							select {
+							case pubErr <- err:
+							default:
+							}
+						}
 						return
 					}
 				}
@@ -219,8 +234,10 @@ func TestShutdownDuringDeliveryDoesNotPanic(t *testing.T) {
 
 			select {
 			case <-flowing:
-			case <-time.After(2 * time.Second): // contract:allow-time-now 测试超时
-				t.Fatal("等待投递开始超时")
+			case err := <-pubErr:
+				t.Fatalf("投递还没开始，发布侧就失败了: %v", err)
+			case <-time.After(testPatience): // contract:allow-time-now 测试超时
+				t.Fatalf("等待投递开始超时（耐心值 %s，可用 OPENIOT_TEST_PATIENCE 调整）", testPatience)
 			}
 			// 流量正在跑的时候关机。Close 幂等，装置的 cleanup 再关一次无妨。
 			if err := r.b.Close(); err != nil {

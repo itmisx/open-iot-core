@@ -135,7 +135,7 @@ func dialWSS(t *testing.T, addr string, req wsRequest) (int, map[string]string, 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = nc.Close() })
-	if err := nc.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := nc.SetDeadline(time.Now().Add(testPatience)); err != nil {
 		t.Fatal(err)
 	}
 	host := addr
@@ -567,7 +567,7 @@ func TestWebSocketLifetime(t *testing.T) {
 		t.Fatalf("未到期却收不到自己的消息：%q", got.Payload)
 	}
 	r.advance(30 * time.Minute)
-	if rc := c.expectClosed(2 * time.Second); rc != 0 {
+	if rc := c.expectClosed(testPatience); rc != 0 {
 		t.Fatalf("没有 redirect 目标时不应带原因码，得到 %s", rc)
 	}
 }
