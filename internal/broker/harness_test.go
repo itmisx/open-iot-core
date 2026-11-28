@@ -189,6 +189,33 @@ func (r *rig) diag() string {
 		r.b.Conns(), ids, ws.Flushed, ws.WriteErrs, ws.Timeouts, ws.Pending, ws.Workers)
 }
 
+// waitClientGone 等到 broker 不再把这个 clientId 当成在线连接。
+//
+// 它比 waitConns 精确，而精确在这里是必须的：用例里常有别的连接按设计活着
+// （上一轮的发布者、接管上来的那条），数总数会把它们算进去，于是「等到 0」
+// 根本等不到。要等的是**这一条**的清理走完——清理跑在连接自己的读协程上、
+// 在关套接字之后，而 `lookup(clientId)` 在那之前仍然返回它：投给它的消息
+// 于是既不入离线队列也到不了设备，静默丢掉。
+func (r *rig) waitClientGone(clientID string) {
+	r.t.Helper()
+	deadline := time.Now().Add(testPatience) // contract:allow-time-now 测试超时
+	for time.Now().Before(deadline) {
+		online := false
+		conns, _ := r.b.ListConns(ConnQuery{Limit: 256})
+		for _, c := range conns {
+			if c.ClientID == clientID {
+				online = true
+				break
+			}
+		}
+		if !online {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	r.t.Fatalf("等 %q 从在线连接里消失超时；%s", clientID, r.diag())
+}
+
 // waitConns 等到在线连接数降到 n。
 //
 // 掐断套接字之后必须先等服务端把 EOF 处理完，再推进时钟：连接的清理是
@@ -589,7 +616,11 @@ func (c *testClient) diagSuffix() string {
 	if c.r == nil {
 		return ""
 	}
-	return "\n      " + c.r.diag()
+	// 刻意**不换行**：门禁打印失败详情时按行过滤（Makefile 的 cover-check 只
+	// 留 FAIL 行与带 `_test.go:NN:` 的消息行），而 Fatalf 的续行两者都不是，
+	// 会被整行吃掉。2026-11-28 的门禁就这样丢过一次诊断——用例打了，日志里
+	// 没有。接在同一行上它就被那条消息行一起带出去。
+	return "；" + c.r.diag()
 }
 
 // expectNothing 断言在给定时间内没有报文到达。

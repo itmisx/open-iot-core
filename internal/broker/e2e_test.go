@@ -846,7 +846,14 @@ func TestOfflineQueueDeliversAcrossSessions(t *testing.T) {
 			t.Fatalf("第 %d 轮订阅失败: %s", round, rc)
 		}
 		c.send(&packet.Disconnect{Code: reason.NormalDisconnection})
-		c.expectClosed(time.Second)
+		c.expectClosed(testPatience)
+		// 等服务端把断开处理完：清理跑在连接的读协程上、在关套接字之后。
+		// 没走完时 lookup(clientId) 还返回那条将死的连接，于是下面那条
+		// 发布走的是「投给在线连接」而不是「入离线队列」——消息就此丢掉，
+		// 而现象是重连之后收不到，等满整个耐心值（2026-11-28 门禁实证）。
+		//
+		// 按 clientId 等而不是数总数：上一轮的发布者按设计还连着。
+		r.waitClientGone(cid)
 
 		// 离线期间发布一条 QoS 1。
 		pub := r.dial(ConnInfo{})
@@ -1259,7 +1266,10 @@ func TestTakeoverKeepsLiveSubscriptionState(t *testing.T) {
 		r.clk.advance(2 * time.Second)
 		third := r.dial(ConnInfo{})
 		third.connect("drop-sub", false)
+		// 这里**不能**等连接数降到 0：接管上来的 third 按设计还活着（这条用例
+		// 要的正是「被接管的那条断了、新的那条在」）。
 		second.expectClosed(testPatience)
+		r.waitConns(1)
 
 		// 设备明明退订了。接管之后又收到，就是订阅状态被回退——
 		// 这是记账分叉背后真正的问题。
@@ -1526,7 +1536,8 @@ func TestOfflineQueueIsBounded(t *testing.T) {
 		t.Fatalf("订阅失败: %s", rc)
 	}
 	c.send(&packet.Disconnect{Code: reason.NormalDisconnection})
-	c.expectClosed(time.Second)
+	c.expectClosed(testPatience)
+	r.waitClientGone(cid)
 
 	// 离线期间发布 limit+2 条，发布本身都应成功——配额拦的是入队，
 	// 不是发布：发布者没有理由因为某个订阅者的队列满了而被拒。
@@ -1622,7 +1633,8 @@ func TestOfflineQueueIsNotRedelivered(t *testing.T) {
 		t.Fatalf("订阅失败: %s", rc)
 	}
 	c.send(&packet.Disconnect{Code: reason.NormalDisconnection})
-	c.expectClosed(time.Second)
+	c.expectClosed(testPatience)
+	r.waitClientGone(cid)
 
 	pub := r.dial(ConnInfo{})
 	pub.connect("pub-redeliver", true)

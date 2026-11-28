@@ -85,6 +85,12 @@ cover:
 # 一起挡掉了——整个 gate 里最容易失败的就是这一步（它紧跟在 test-race 之后，
 # 整包再跑一遍而资源还没回落），而失败现场只剩一行
 # 「make: *** [cover-check] Error 1」，连哪个包哪条用例都看不到。
+#
+# 打印的正则也踩过一次：原先是 `^(FAIL|--- FAIL|panic)`，锚在行首，而 Go 把
+# **子用例的 --- FAIL 与断言消息都缩进输出**。于是 2026-11-28 的两轮门禁只留下
+# 一行「--- FAIL: TestOfflineQueueDeliversAcrossSessions (30.00s)」——连那条
+# 用例自己打的服务端状态（rig.diag）都被吃掉了，而那正是定位的全部线索。
+# 所以这里连 `_test.go:NN:` 的消息行一起打，上限也从 20 行提到 40 行。
 cover-check:
 	@for pkg in $(STRICT_PKGS); do \
 		$(GO) test -coverprofile=$(COVERFILE).strict -coverpkg=$$pkg $$pkg >/dev/null || exit 1; \
@@ -95,7 +101,7 @@ cover-check:
 	@out=$$(mktemp); \
 	if ! $(GO) test -coverprofile=$(COVERFILE) \
 		-coverpkg=$$(echo $(COVER_PKGS) | tr ' ' ,) $(COVER_PKGS) >$$out 2>&1; then \
-		grep -E "^(FAIL|--- FAIL|panic)" $$out | head -20; \
+		grep -E "^(FAIL|panic)|(--- FAIL)|_test\.go:[0-9]+:" $$out | head -40; \
 		echo "（完整输出：$$out）"; \
 		exit 1; \
 	fi; \

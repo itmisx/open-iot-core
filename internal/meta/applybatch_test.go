@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // 单机写入合批（CLU-190）的语义。
@@ -15,6 +17,15 @@ import (
 // newBatchStore 造一个注入了整批事务的存储，并记录事务次数。
 func newBatchStore(t *testing.T) (*LocalStore, map[string][]byte, *int) {
 	t.Helper()
+	return newBatchStoreHook(t, nil)
+}
+
+// newBatchStoreHook 同上，但允许在每个事务开始前插一个钩子。
+//
+// 合批用例需要它：押住第一个事务就能让后面的命令**必然**在合批队列里排着，
+// 于是「合批发生了」不再取决于调度运气（见 TestApplyBatchMergesConcurrentWrites）。
+func newBatchStoreHook(t *testing.T, beforeTx func()) (*LocalStore, map[string][]byte, *int) {
+	t.Helper()
 	vals := map[string][]byte{}
 	txCalls := 0
 	var mu sync.Mutex
@@ -23,6 +34,9 @@ func newBatchStore(t *testing.T) (*LocalStore, map[string][]byte, *int) {
 		Compile: stubCompile,
 		Cold:    &fakeCold{vals: vals},
 		InTransaction: func(fn func(Transaction) error) error {
+			if beforeTx != nil {
+				beforeTx()
+			}
 			mu.Lock()
 			txCalls++
 			mu.Unlock()
@@ -46,10 +60,28 @@ func recordCmd(id, key, val string) Command {
 // 确定的。没有这条判定，合批退化成「每条一个事务」时不会有任何用例失败：
 // 功能完全正常，只是慢回去了。
 func TestApplyBatchMergesConcurrentWrites(t *testing.T) {
-	s, vals, txCalls := newBatchStore(t)
+	const n = 64
+
+	// 押住第一个事务，直到 n 个调用方都已经发起 Apply。
+	//
+	// 不押住的话这条用例是机会性的：合批要求几条命令在时间上重叠，而
+	// 「一起起跑」只是让它们**有机会**重叠。CPU 被抢光时（CI 的 4 核 runner
+	// 上 `go test` 并行跑多个包、还带覆盖率插桩）64 个协程可以一次都不重叠，
+	// 于是退化成 64 个事务、判据当场红——而实现一点没坏。2026-11-28 的门禁
+	// 为此红过两轮。押住第一个事务之后，后面那些必然在合批队列里排着，
+	// 「合批发生了」就不再取决于调度运气。
+	var started atomic.Int64
+	var once sync.Once
+	s, vals, txCalls := newBatchStoreHook(t, func() {
+		once.Do(func() {
+			deadline := time.Now().Add(10 * time.Second)
+			for started.Load() < n && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+		})
+	})
 	ctx := context.Background()
 
-	const n = 64
 	var wg sync.WaitGroup
 	errs := make([]error, n)
 	revs := make([]Revision, n)
@@ -59,6 +91,7 @@ func TestApplyBatchMergesConcurrentWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start // 一起起跑，否则合批无从发生
+			started.Add(1)
 			revs[i], errs[i] = s.Apply(ctx, recordCmd("", keyOf(i), "v"))
 		}(i)
 	}
