@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -505,15 +506,42 @@ func httpPost(url string, body []byte) (string, error) {
 	return text, nil
 }
 
+// freeAddrMu 与 freeAddrSeen 保证同一个进程内不会把同一个端口发两次。
+//
+// 「listen :0、读端口、关掉、返回地址」这套办法有一个真实的碰撞窗口：端口
+// 关掉之后内核可以立刻把它再分配出去，于是连续两次调用拿到同一个号。平时
+// 看不见，而它一旦发生，后果是 dragonboat **自己 panic**：
+// `duplicated address found [{127.0.0.1:41669 1} {127.0.0.1:41669 2}]`
+// ——两个副本配了同一个地址。库 panic 就是进程死，整个包的测试一起没。
+// 2026-11-28 的门禁红在 TestDrainClosesInboundOwnConnections 正是这一下，
+// 而失败现场看上去像「排空那条路径有并发缺陷」。
+//
+// 去重只解决同进程内的重复；跨进程（`go test` 并行跑多个包）仍要靠内核不
+// 把正在监听的端口发出去，那一半由 listen :0 本身保证。
+var (
+	freeAddrMu   sync.Mutex
+	freeAddrSeen = map[string]bool{}
+)
+
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	freeAddrMu.Lock()
+	defer freeAddrMu.Unlock()
+	for i := 0; i < 64; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		if freeAddrSeen[addr] {
+			continue // 这个号本进程已经发过，换一个
+		}
+		freeAddrSeen[addr] = true
+		return addr
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	t.Fatal("连续 64 次都拿到已经用过的端口；本机临时端口范围是不是太窄了")
+	return ""
 }
 
 func mintCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {

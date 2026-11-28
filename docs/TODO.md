@@ -2928,3 +2928,31 @@ QoS 1 压 10 万零丢弃（p50 14.9 ms）、扇出 10 万条/秒、建连 7840 
 	  `fuzz-long` 只有 11 个，`FuzzGlobMatch`（策略通配符匹配）、
 	  `FuzzValidateName`、`FuzzClassify` 从来没进过深搜档——哪天手动深搜时要把
 	  它们一起跑。
+
+- [x] **门禁在 CI 上红的后两处：空闲端口被发两次，以及读 ci.yml 的用例没跟着改（2026-11-28）。**
+	  `race: 通过` 这一行在 11-28 凌晨首次出现——前两条修完之后，被它们挡在后面
+	  的两处才露出来：
+	  - **`freeAddr` 会把同一个端口发两次。** 「listen :0、读端口、关掉、返回」
+	    有一个真实的碰撞窗口：端口关掉后内核可以立刻再分配出去。一旦碰上，
+	    dragonboat **自己 panic**（`duplicated address found [{127.0.0.1:41669 1}
+	    {127.0.0.1:41669 2}]`，两个副本同一个地址），库 panic 就是进程死、整个包
+	    的测试一起没，而失败现场写着 `TestDrainClosesInboundOwnConnections`
+	    ——看上去像排空那条路径有并发缺陷。改为同进程内按已发出的地址去重
+	    （跨进程那一半仍由 listen :0 本身保证）。
+	  - **`TestNightlyFuzzIsScheduled` 读 `ci.yml` 并断言那个 fuzz job 存在。**
+	    删 job 的时候没有先查谁在读这个文件，于是门禁红了——这与第 6 节第 3 条
+	    记的「门禁测试会读取源码」是同一个形状，只是这次读的是 workflow。已改写
+	    为 `TestFuzzWiring`，按 TST-239 钉三件事：门禁必须跑 `fuzz-short`、四个包
+	    都要在它里面（少一个那个包的崩溃语料就不再被重放）、`make fuzz-long`
+	    不得回到 CI 但目标必须留着。顺带踩到一个判据过粗：第一版按整篇文本匹配
+	    `make fuzz-long`，把 ci.yml 注释里「要深搜时手动跑 make fuzz-long」那句
+	    说明判成了违规，改为只看非注释行。
+	  - **`cover-check` 的失败详情也补上了。** 它原先只打行首匹配
+	    `FAIL|--- FAIL|panic` 的行，而 Go 把子用例与断言消息都缩进输出，于是这一轮
+	    只留下一行「--- FAIL: TestRemoteFrameReachesOfflineQueue (0.00s)」，连
+	    「队列里有几条」都看不到。现在连 `_test.go:NN:` 的消息行一起打（TST-234）。
+	  - **那条 0.00 秒的用例本身也是测试的前提错了**：它用 `expectClosed` 等到
+	    客户端看见套接字关闭就断言离线队列，而服务端的断开清理跑在连接的读协程
+	    上、在关套接字**之后**；没走完时 `lookup(clientId)` 还返回那条将死的连接，
+	    于是远端帧走的是「投给在线连接」而不是「入离线队列」。补上装置里早就有的
+	    `r.waitConns(0)`。

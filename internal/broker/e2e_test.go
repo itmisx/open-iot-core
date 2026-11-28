@@ -1677,7 +1677,15 @@ func TestRemoteFrameReachesOfflineQueue(t *testing.T) {
 		t.Fatalf("订阅失败: %s", rc)
 	}
 	c.send(&packet.Disconnect{Code: reason.NormalDisconnection})
-	c.expectClosed(time.Second)
+	c.expectClosed(testPatience)
+	// 等服务端把断开处理完，别只等客户端看见套接字关闭。
+	//
+	// 清理跑在连接自己的读协程上、在关套接字**之后**：解绑 clientId 索引、
+	// 持久化会话都在那一步。不等的话 `b.lookup(cid)` 还返回这条将死的连接，
+	// 于是下面那一帧走的是「投给在线连接」而不是「入离线队列」，断言当场
+	// 看到队列里 0 条——而现象看上去像「远端帧没有入队」这个功能坏了。
+	// 2026-11-28 的门禁就红在这里（0.00 秒失败，覆盖率插桩把这个窗口拉宽了）。
+	r.waitConns(0)
 
 	// 断开之后订阅必须还在路由表里：兴趣通告读的就是它，掉了的话
 	// 别的节点根本不会把帧转过来——那时失败现象是"收不到"，而原因
