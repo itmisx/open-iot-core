@@ -649,6 +649,14 @@ func (c *conn) flushQueued() {
 	// 两个理由。一是**不能重投**：队列现在是独立的记录（PrefixQueued），
 	// 只从内存取走不删盘上的，下次重连会把同一批再投一遍——而断开时的
 	// Save 带的是 nil（约定：nil 表示不碰队列），正好不会清掉它们。
+	//
+	// 「断开时带 nil」这件事**到 MQTT-135 才真的成立**。在那之前
+	// persist 直接把 CloneState 交给 Save，而 State.Clone 无条件把 Queued
+	// 做成非 nil 切片，于是那次 Save 走的是「先清空再写回内存那份」——盘上
+	// 并发追加进来的消息会被静默抹掉。这段注释当时就写着现在这句话，而实现
+	// 并不是这样：**约定写对了，实现没照着做，而两者都没有判据**。现在
+	// persist 显式传 nil 并把内存那条尾巴逐条追加（见 conn.persist），
+	// 判据是 TestQueuedSurvivesDisconnectPersist。
 	// 二是**不能漏投**：CONNECT 读盘与这里之间还可能有新的入队（设备刚
 	// 连上、登记完成之前的那个窗口），盘上那份包含它们，内存那份不包含。
 	queued, terr := c.b.opt.Sessions.TakeQueued(c.clientID())

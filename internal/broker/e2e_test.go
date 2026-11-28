@@ -1730,3 +1730,119 @@ func TestRemoteFrameReachesOfflineQueue(t *testing.T) {
 		t.Fatalf("入队的载荷是 %q", got)
 	}
 }
+
+// TestQueuedSurvivesDisconnectPersist 钉住断开那一刻盘上的队列不被覆盖
+// （MQTT-135、TST-240）。
+//
+// 这一条是确定性的 A/B：不需要压中任何时序窗口。断开时的 persist 以前把
+// 内存里那份队列整份写回盘上（`State.Clone` 的 Queued 永远非 nil，而 Save
+// 对非 nil 是「先清空再写回」），于是**这期间落在盘上的任何一条都会被抹掉**
+// ——而「投给将死连接的消息」现在正好走这条路（见 deliverTo 的 MQTT-135）。
+//
+// 用例直接往存储里追加一条来代表那个并发追加：它在断开之前就在盘上，断开
+// 之后必须还在。退回旧实现时它当场失败。
+func TestQueuedSurvivesDisconnectPersist(t *testing.T) {
+	r := newPolicyRig(t, policyFull, nil)
+	const cid = "queue-survivor"
+
+	r.clk.advance(time.Minute)
+	c := r.dial(ConnInfo{})
+	c.send(&packet.Connect{
+		Version: packet.V5, ClientID: []byte(cid), CleanStart: false,
+		Props: func() packet.Properties {
+			var p packet.Properties
+			p.SessionExpiry = 3600
+			p.Set(packet.PropSessionExpiry)
+			return p
+		}(),
+	})
+	c.expect(packet.CONNACK)
+	if rc := c.subscribe("q/#", packet.QoS1); rc.IsError() {
+		t.Fatalf("订阅失败: %s", rc)
+	}
+
+	// 代表「发布者在断开窗口里把一条消息追加到了盘上」。
+	if err := r.sess.AppendQueued(cid, session.QueuedMsg{
+		QoS: 1, Topic: "q/x", Payload: []byte("raced-in"),
+	}); err != nil {
+		t.Fatalf("预置队列记录失败: %v", err)
+	}
+
+	c.send(&packet.Disconnect{Code: reason.NormalDisconnection})
+	c.expectClosed(testPatience)
+	r.waitClientGone(cid)
+
+	queued, err := r.sess.TakeQueued(cid)
+	if err != nil {
+		t.Fatalf("TakeQueued: %v", err)
+	}
+	if len(queued) != 1 {
+		t.Fatalf("断开时的 persist 把盘上的队列覆盖了，现在有 %d 条", len(queued))
+	}
+	if got := string(queued[0].Payload); got != "raced-in" {
+		t.Fatalf("留下来的是 %q", got)
+	}
+}
+
+// TestPublishDuringTeardownIsNotLost 钉住断开窗口里到达的消息不丢
+// （MQTT-135、TST-240）。
+//
+// 它刻意**不等**服务端清理完：DISCONNECT 之后立刻从另一条连接发布。三种
+// 交错都必须不丢，而三种的保全机制并不相同：
+//
+//   - 还完全在线：投给连接、QoS 1 登记在途，而在途表在 persist 里落盘，
+//     重连按原标识带 DUP 重投；
+//   - closedRC 已置位但索引还没摘：按 MQTT-135 当成离线，入队；
+//   - 已经摘掉索引：本来就走离线队列。
+//
+// 修复之前第二种会丢（投给将死的连接，而在途登记可能发生在 persist 之后，
+// 那条登记永远不落盘），而它正是 CI 上那三条用例红的原因。这条用例是概率
+// 性的——窗口很窄，所以跑多轮；确定性的那一半由
+// TestQueuedSurvivesDisconnectPersist 承担。
+func TestPublishDuringTeardownIsNotLost(t *testing.T) {
+	r := newPolicyRig(t, policyFull, nil)
+	for round := 0; round < 10; round++ {
+		cid := fmt.Sprintf("teardown-%d", round)
+		name := fmt.Sprintf("teardown/%d", round)
+		r.clk.advance(time.Minute)
+
+		connectPersistent := func() *testClient {
+			c := r.dial(ConnInfo{})
+			c.send(&packet.Connect{
+				Version: packet.V5, ClientID: []byte(cid), CleanStart: false,
+				Props: func() packet.Properties {
+					var p packet.Properties
+					p.SessionExpiry = 3600
+					p.Set(packet.PropSessionExpiry)
+					return p
+				}(),
+			})
+			c.expect(packet.CONNACK)
+			return c
+		}
+
+		c := connectPersistent()
+		if rc := c.subscribe(name, packet.QoS1); rc.IsError() {
+			t.Fatalf("第 %d 轮订阅失败: %s", round, rc)
+		}
+		// 不等 waitClientGone：这一轮要压的正是那个窗口。
+		c.send(&packet.Disconnect{Code: reason.NormalDisconnection})
+
+		pub := r.dial(ConnInfo{})
+		pub.connect(fmt.Sprintf("tpub-%d", round), true)
+		if rc := pub.publish(name, "in-window", packet.QoS1, false); rc.IsError() {
+			t.Fatalf("第 %d 轮发布失败: %s", round, rc)
+		}
+		_ = pub.nc.Close()
+
+		r.clk.advance(time.Minute)
+		r.waitClientGone(cid)
+		again := connectPersistent()
+		got := again.expectPublish()
+		if string(got.Payload) != "in-window" {
+			t.Fatalf("第 %d 轮收到 %q", round, got.Payload)
+		}
+		_ = again.nc.Close()
+		r.waitClientGone(cid)
+	}
+}

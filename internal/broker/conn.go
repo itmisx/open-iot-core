@@ -669,7 +669,30 @@ func (c *conn) persist(nowMs int64) {
 			c.b.opt.Router.RemoveClient(c.clientID()))
 		_ = c.b.opt.Owners.Release(ctx, c.clientID(), c.epoch)
 	} else {
+		// 队列交给存储时走**追加**，不让 Save 整份替换（MQTT-135）。
+		//
+		// Save 对非 nil 的 Queued 是「先清空再逐条写回」，而 CloneState 的
+		// Queued 永远非 nil（State.Clone 用的是 make）。于是断开这一刻盘上
+		// 的队列会被内存里那份覆盖——而发布者可能正好在 closedRC 置位之后、
+		// 这次 Save 之前往盘上追加了一条（投给将死连接的消息现在就走这条
+		// 路，见 deliverTo）。那一条会被静默抹掉。
+		//
+		// 分两步：先用 nil 存会话本身（nil 的约定是「这次不碰队列」），
+		// 再把内存里那条尾巴逐条追加。两者都是追加，谁也不会覆盖谁。
+		//
+		// 内存里那份为什么不在盘上：在途窗口满时 QoS 1 压进内存队列
+		// （conn.pushQueued），那条路径不碰存储；而恢复路径取走盘上那份时
+		// 会连内存一起清（connect.go 的 TakeQueued 两处），所以两边不会重。
+		//
+		// 代价写明：Save 与这几次追加不在同一个事务里，进程在中间死掉会丢
+		// 这条尾巴。换到的是不再静默覆盖并发追加的那一条——前者要重连后
+		// 少几条消息，后者是消息永久消失且无人知道。
+		tail := st.Queued
+		st.Queued = nil
 		_ = c.b.opt.Sessions.Save(ctx, st)
+		for i := range tail {
+			_ = c.b.opt.Sessions.AppendQueued(c.clientID(), tail[i])
+		}
 	}
 }
 

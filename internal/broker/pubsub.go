@@ -544,6 +544,20 @@ func (b *Broker) DeliverRemote(from cluster.NodeID, batch []cluster.Frame) {
 // deliverTo 把消息投给一个本地订阅者。
 func (b *Broker) deliverTo(ref router.SubRef, msg *router.Message) bool {
 	target := b.lookup(ref.ClientID)
+	// 已经进入关闭流程的连接**不算在线**（MQTT-135）。
+	//
+	// 索引里的条目要等那条连接自己的读循环跑完 cleanup 才摘掉，而
+	// closedRC 在 close 的最开头就置位了（conn.close / conn.evict）。两者
+	// 之间这条连接还查得到，可它的套接字即将关闭、会话也即将落盘：投给它
+	// 的消息**既不入离线队列也到不了设备**。QoS 1 也救不回来——在途登记
+	// 发生在内存里，而 persist 可能已经跑过了，于是那条登记永远不落盘。
+	//
+	// 判据是 TST-240：持久会话断开之后立刻发一条，重连必须收到。此前它
+	// 靠「清理跑得比发布快」侥幸通过，而 CI 上三条用例为此红过
+	// （现象是重连后收不到，等满整个耐心值）。
+	if target != nil && target.closedRC.Load() != 0 {
+		target = nil
+	}
 	if target == nil {
 		// 控制台测试客户端没有连接对象。先问它，再谈离线队列：
 		// 它在线，只是不占一条设备连接。

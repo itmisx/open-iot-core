@@ -41,13 +41,33 @@ func (m *MemStore) Load(_ context.Context, clientID string) (*State, bool, error
 	return st.Clone(), true, nil
 }
 
+// Save 写入会话状态。
+//
+// `st.Queued` 为 nil 表示**这次不碰队列**，空切片表示「队列应当是空的」
+// ——与 store.SessionStore.Save 同一条约定（那边的理由写在它自己的注释里：
+// 少了这个区别，任何一个只想改订阅的 Save 都会把离线队列静默清掉）。
+//
+// 这里原先没实现它：Clone 无条件把 Queued 做成**非 nil 的空切片**，于是
+// 一次带 nil 的 Save 在内存实现上等于清空队列，而在持久实现上等于不动。
+// 两个实现对同一个调用给出不同结果，而用例大多跑在内存那份上——于是
+// 「盘上会不会丢」这件事在测试里根本看不出来（MQTT-135 的修复撞上了它：
+// 按约定传 nil 之后，内存实现把队列清了，用例当场红）。
 func (m *MemStore) Save(_ context.Context, st *State) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.checkWriteEpoch(st); err != nil {
 		return err
 	}
-	m.byID[st.ClientID] = st.Clone()
+	next := st.Clone()
+	if st.Queued == nil {
+		// 接回原来那份；没有旧记录时保持 nil（空队列）。
+		if cur, ok := m.byID[st.ClientID]; ok {
+			next.Queued = cur.Queued
+		} else {
+			next.Queued = nil
+		}
+	}
+	m.byID[st.ClientID] = next
 	return nil
 }
 
